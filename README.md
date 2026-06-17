@@ -47,6 +47,80 @@ For kubectl plugin usage, make sure `kubectl-oke` is on `PATH`, then run:
 kubectl oke --help
 ```
 
+## Usage
+
+The tool can be invoked directly as `mgmt-oke` or as a kubectl plugin:
+
+```bash
+mgmt-oke [global options] <command> [command options]
+kubectl oke [global options] <command> [command options]
+```
+
+Display help:
+
+```bash
+mgmt-oke -h
+mgmt-oke pools -h
+mgmt-oke nodes -h
+kubectl oke -h
+```
+
+Global options:
+
+| Option | Description |
+| --- | --- |
+| `--version` | Print the tool version. |
+| `--compartment-id <ocid>` | OCI compartment OCID used for OCI discovery and mutations. |
+| `--cluster-id <ocid>` | OKE cluster OCID used to filter managed node pools. |
+| `--region <region>` | OCI region, for example `us-ashburn-1`. |
+| `--auth config_file\|instance_principal\|resource_principal\|none` | OCI authentication method. Use `none` for Kubernetes-only discovery. |
+| `--oci-config-file <path>` | OCI config file path when using config-file authentication. |
+| `--oci-profile <profile>` | OCI config profile when using config-file authentication. |
+| `--kubeconfig <path>` | kubeconfig path. |
+| `--context <name>` | kubeconfig context. |
+| `--in-cluster` | Use Kubernetes in-cluster configuration. |
+| `--skip-oci` | Skip OCI discovery. |
+| `--skip-kubernetes` | Skip Kubernetes discovery. |
+| `--format table\|json\|csv` | Output format. `table` is the default. |
+
+Command groups:
+
+| Command | Description |
+| --- | --- |
+| `pools list` | List discovered worker pools. |
+| `pools get <pool>` | Get one worker pool by name or OCID. |
+| `pools resize <pool> (--size <n> \| --delta <n>)` | Resize one managed OKE node pool. |
+| `nodes list` | List Kubernetes nodes. |
+| `nodes get <identifier...>` | Get nodes by name, internal IP, provider ID, or instance OCID. |
+| `nodes remove <node>` | Remove one specific managed OKE node. |
+| `topology list` | Group nodes by RDMA topology labels. |
+| `autoscaler status` | Show Cluster Autoscaler pool ownership. |
+| `reconcile` | Show a full discovery snapshot. |
+
+Resize options:
+
+| Option | Description |
+| --- | --- |
+| `--size <n>` | Set the node pool to an exact size. |
+| `--delta <n>` | Add or remove nodes from the current desired size. |
+| `--wait` | Wait until OCI and Kubernetes show the target size. |
+| `--timeout <seconds>` | Maximum seconds to wait. Default: `1800`. |
+| `--poll-interval <seconds>` | Wait polling interval. Default: `30`. |
+| `--yes` | Do not prompt for confirmation. |
+
+Node removal options:
+
+| Option | Description |
+| --- | --- |
+| `--keep-size` | Delete the node but keep the pool size so OKE can replace it. |
+| `--allow-workloads` | Allow removing a node that currently has non-system workload pods. |
+| `--eviction-grace <duration>` | OKE eviction grace duration. Default: `PT10M`. |
+| `--force-after-grace` | Force compute deletion if pods cannot be evicted before the grace duration expires. |
+| `--wait` | Wait until the node is absent and counts settle. |
+| `--timeout <seconds>` | Maximum seconds to wait. Default: `1800`. |
+| `--poll-interval <seconds>` | Wait polling interval. Default: `30`. |
+| `--yes` | Do not prompt for confirmation. |
+
 ## Authentication
 
 The tool has two discovery sources:
@@ -65,7 +139,7 @@ mgmt-oke \
   pools list
 ```
 
-For local development with kubeconfig only:
+For Kubernetes-only discovery:
 
 ```bash
 mgmt-oke --auth none nodes list
