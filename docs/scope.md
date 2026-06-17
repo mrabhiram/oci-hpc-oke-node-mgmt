@@ -14,7 +14,7 @@ Management Tool.
 - stdlib unit tests for model/provider-ID parsing
 - guarded managed OKE node pool resize through `node_config_details.size`
 - wait for OCI active count and Kubernetes Ready count after resize
-- guarded specific managed OKE node removal through OKE `delete_node`
+- guarded specific managed OKE node removal/termination through OKE `delete_node`
 
 ## Documentation
 
@@ -24,7 +24,6 @@ Management Tool.
 
 - RDMA cluster-network-backed instance pool resize
 - explicit Kubernetes cordon/drain workflow outside OKE delete-node eviction
-- node termination
 - boot volume replacement wrapper
 - Kueue quota sync
 - Cluster Autoscaler bounds updates
