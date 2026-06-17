@@ -102,7 +102,7 @@ Resize options:
 | Option | Description |
 | --- | --- |
 | `--size <n>` | Set the node pool to an exact size. |
-| `--delta <n>` | Add or remove nodes from the current desired size. |
+| `--delta <n>` | Change the current desired size by `n`. Positive values add nodes; negative values remove nodes. For example, `--delta 2` adds two nodes and `--delta -1` removes one node. |
 | `--wait` | Wait until OCI and Kubernetes show the target size. |
 | `--timeout <seconds>` | Maximum seconds to wait. Default: `1800`. |
 | `--poll-interval <seconds>` | Wait polling interval. Default: `30`. |
@@ -170,7 +170,23 @@ mgmt-oke --format json reconcile
 mgmt-oke pools list
 mgmt-oke pools get oke-rdma
 mgmt-oke --format json pools list
+```
+
+Add one node to a pool:
+
+```bash
 mgmt-oke pools resize oke-cpu --delta 1 --wait --yes
+```
+
+Remove one node from a pool:
+
+```bash
+mgmt-oke pools resize oke-cpu --delta -1 --wait --yes
+```
+
+Set a pool to an exact desired size:
+
+```bash
 mgmt-oke pools resize oke-cpu --size 3 --wait --yes
 ```
 
