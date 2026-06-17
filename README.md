@@ -1,0 +1,199 @@
+# OKE HPC Node Management Tool
+
+Management CLI for OCI HPC OKE clusters.
+
+This tool provides inventory, safety visibility, and guarded node-pool
+management for OCI HPC OKE clusters:
+
+- discover managed OKE node pools `[Implemented]`
+- discover RDMA cluster-network-backed instance pools `[Implemented]`
+- discover Kubernetes nodes `[Implemented]`
+- join Kubernetes nodes to OCI instances where possible `[Implemented]`
+- show GPU allocatable resources `[Implemented]`
+- show RDMA topology labels `[Implemented]`
+- show Cluster Autoscaler pool ownership `[Implemented]`
+- show Kueue resource counts and ResourceFlavor-to-pool matches `[Implemented]`
+- resize managed OKE node pools with explicit confirmation `[Implemented]`
+- remove a specific managed OKE node with explicit confirmation `[Implemented]`
+
+Discovery commands are read-only. `pools resize` and `nodes remove` mutate OCI resources and require OCI auth plus either `--yes` or an interactive confirmation.
+
+## Install
+
+For controller/operator node installation, use
+[`docs/controller-install.md`](docs/controller-install.md).
+
+From the project directory:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -e .
+```
+
+Python 3.9 or newer is supported.
+
+This installs two entrypoints backed by the same code:
+
+```bash
+mgmt-oke --help
+kubectl-oke --help
+```
+
+For kubectl plugin usage, make sure `kubectl-oke` is on `PATH`, then run:
+
+```bash
+kubectl oke --help
+```
+
+## Authentication
+
+The tool has two discovery sources:
+
+- Kubernetes API, using kubeconfig or in-cluster config
+- OCI API, using config-file auth, instance principals, or resource principals
+
+On an OKE HPC operator host, the normal command will look like:
+
+```bash
+mgmt-oke \
+  --auth instance_principal \
+  --region us-ashburn-1 \
+  --compartment-id ocid1.compartment.oc1..example \
+  --cluster-id ocid1.cluster.oc1.iad.example \
+  pools list
+```
+
+For local development with kubeconfig only:
+
+```bash
+mgmt-oke --auth none nodes list
+```
+
+Useful environment variables:
+
+```bash
+export OCI_COMPARTMENT_ID=ocid1.compartment.oc1..example
+export OKE_CLUSTER_ID=ocid1.cluster.oc1.iad.example
+export OCI_REGION=us-ashburn-1
+export OCI_AUTH=instance_principal
+export KUBECONFIG=$HOME/.kube/config
+```
+
+## Commands
+
+### Full snapshot
+
+```bash
+mgmt-oke reconcile
+mgmt-oke --format json reconcile
+```
+
+### Worker pools
+
+```bash
+mgmt-oke pools list
+mgmt-oke pools get oke-rdma
+mgmt-oke --format json pools list
+mgmt-oke pools resize oke-cpu --delta 1 --wait --yes
+mgmt-oke pools resize oke-cpu --size 3 --wait --yes
+```
+
+### Nodes
+
+```bash
+mgmt-oke nodes list
+mgmt-oke nodes list --pool oke-rdma
+mgmt-oke nodes list --rdma-only
+mgmt-oke nodes get 10.0.127.32
+mgmt-oke nodes get ocid1.instance.oc1.iad.example
+mgmt-oke nodes remove 10.0.127.32 --wait --yes
+mgmt-oke nodes remove 10.0.127.32 --keep-size --wait --yes
+```
+
+### RDMA topology
+
+```bash
+mgmt-oke topology list
+mgmt-oke topology list --pool oke-rdma
+```
+
+### Cluster Autoscaler
+
+```bash
+mgmt-oke autoscaler status
+```
+
+## Output Formats
+
+All commands support:
+
+```bash
+--format table
+--format json
+--format csv
+```
+
+`table` is the default.
+
+## Current Scope
+
+Implemented:
+
+- read-only discovery
+- OCI/Kubernetes node join
+- inferred Kubernetes-only pools when OCI is disabled or unavailable
+- pool, node, topology, autoscaler, and reconcile views
+- JSON/CSV/table output
+- graceful warnings when one discovery source is unavailable
+- stdlib unit tests for model/provider-ID parsing
+- guarded managed OKE node pool resize through `node_config_details.size`
+- wait for OCI active count and Kubernetes Ready count after resize
+- guarded specific managed OKE node removal through OKE `delete_node`
+
+Documentation:
+
+- [`docs/controller-install.md`](docs/controller-install.md)
+
+Not implemented yet:
+
+- RDMA cluster-network-backed instance pool resize
+- explicit Kubernetes cordon/drain workflow outside OKE delete-node eviction
+- node termination
+- boot volume replacement wrapper
+- Kueue quota sync
+- Cluster Autoscaler bounds updates
+- health check execution
+
+## Cluster Validation
+
+After installing the tool on a controller/operator node:
+
+1. Confirm kubeconfig:
+
+   ```bash
+   kubectl get nodes -o wide
+   ```
+
+2. Confirm OCI auth:
+
+   ```bash
+   oci iam region list --auth instance_principal
+   ```
+
+3. Run Kubernetes-only discovery:
+
+   ```bash
+   mgmt-oke --auth none reconcile
+   ```
+
+4. Run full OCI + Kubernetes discovery:
+
+   ```bash
+   mgmt-oke --auth instance_principal \
+     --region <region> \
+     --compartment-id <compartment_ocid> \
+     --cluster-id <oke_cluster_ocid> \
+     reconcile
+   ```

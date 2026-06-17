@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oke-hpc-node-mgmt"
+version = "0.1.0"
+description = "Node and worker-pool management CLI for OCI HPC OKE clusters."
+requires-python = ">=3.9"
+dependencies = [
+  "kubernetes>=29.0.0",
+  "oci>=2.120.0",
+]
+
+[project.scripts]
+mgmt-oke = "oke_hpc_mgmt.cli:main"
+kubectl-oke = "oke_hpc_mgmt.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
