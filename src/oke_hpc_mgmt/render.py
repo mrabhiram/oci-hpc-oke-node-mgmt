@@ -35,6 +35,15 @@ def print_snapshot(snapshot: DiscoverySnapshot, output: str) -> None:
     if output == "json":
         print(json.dumps(serializable(snapshot), indent=2, sort_keys=True))
         return
+    if output == "csv":
+        records = _snapshot_csv_records(snapshot)
+        columns = ["record_type"]
+        for record in records:
+            for key in record:
+                if key not in columns:
+                    columns.append(key)
+        print_csv(records, columns)
+        return
 
     print("Worker pools")
     print_table(pool_rows(snapshot.pools), POOL_COLUMNS)
@@ -201,6 +210,8 @@ def autoscaler_rows(snapshot: DiscoverySnapshot) -> list[dict[str, Any]]:
 def topology_rows(nodes: list[NodeInfo]) -> list[dict[str, Any]]:
     groups: dict[tuple[str, str, str], list[NodeInfo]] = {}
     for node in nodes:
+        if not node.has_rdma_labels:
+            continue
         labels = node.rdma_labels
         key = (
             labels.get("oci.oraclecloud.com/rdma.hpc_island_id", "-"),
@@ -223,6 +234,23 @@ def topology_rows(nodes: list[NodeInfo]) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def _snapshot_csv_records(snapshot: DiscoverySnapshot) -> list[dict[str, Any]]:
+    records = [
+        {"record_type": "pool", **row}
+        for row in pool_rows(snapshot.pools)
+    ]
+    records.extend(
+        {"record_type": "node", **row}
+        for row in node_rows(snapshot.nodes)
+    )
+    records.extend(
+        {"record_type": "autoscaler", **row}
+        for row in autoscaler_rows(snapshot)
+    )
+    records.append({"record_type": "kueue", **kueue_counts(snapshot)})
+    return records
 
 
 def kueue_counts(snapshot: DiscoverySnapshot) -> dict[str, int]:
