@@ -11,6 +11,11 @@ RDMA_LABEL_KEYS = (
     "oci.oraclecloud.com/rdma.host_id",
 )
 
+RDMA_CAPABILITY_LABEL_KEYS = (
+    "feature.node.kubernetes.io/rdma.available",
+    "feature.node.kubernetes.io/rdma.capable",
+)
+
 GPU_RESOURCES = ("nvidia.com/gpu", "amd.com/gpu")
 
 
@@ -39,7 +44,15 @@ class NodeInfo:
 
     @property
     def has_rdma_labels(self) -> bool:
-        return any(key in self.labels for key in RDMA_LABEL_KEYS)
+        if not self.rdma_labels:
+            return False
+        if self.labels.get("oci.oraclecloud.com/rdma.cluster_type") == "baremetalcluster":
+            return True
+        if self.shape and self.shape.startswith("BM") and any(
+            self.labels.get(key, "").lower() == "true" for key in RDMA_CAPABILITY_LABEL_KEYS
+        ):
+            return True
+        return bool(self.shape and self.shape.startswith("BM.GPU"))
 
     @property
     def gpu_allocatable(self) -> dict[str, str]:

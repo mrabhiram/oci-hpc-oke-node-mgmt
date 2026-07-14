@@ -39,7 +39,7 @@ Clone the public repository on the controller/operator node:
 
 ```bash
 cd /home/ubuntu
-git clone https://github.com/mrabhiram/oke-hpc-node-mgmt.git
+git clone https://github.com/mrabhiram/oci-hpc-oke-node-mgmt.git
 ```
 
 ## Install
@@ -47,11 +47,11 @@ git clone https://github.com/mrabhiram/oke-hpc-node-mgmt.git
 On the controller/operator node:
 
 ```bash
-cd /home/ubuntu/oke-hpc-node-mgmt
+cd /home/ubuntu/oci-hpc-oke-node-mgmt
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e .
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install .
 ```
 
 Verify the package entrypoints:
@@ -67,8 +67,8 @@ Create stable command links in `~/bin`:
 
 ```bash
 mkdir -p /home/ubuntu/bin
-ln -sf /home/ubuntu/oke-hpc-node-mgmt/.venv/bin/mgmt-oke /home/ubuntu/bin/mgmt-oke
-ln -sf /home/ubuntu/oke-hpc-node-mgmt/.venv/bin/kubectl-oke /home/ubuntu/bin/kubectl-oke
+ln -sf /home/ubuntu/oci-hpc-oke-node-mgmt/.venv/bin/mgmt-oke /home/ubuntu/bin/mgmt-oke
+ln -sf /home/ubuntu/oci-hpc-oke-node-mgmt/.venv/bin/kubectl-oke /home/ubuntu/bin/kubectl-oke
 ```
 
 Make sure `~/bin` is on the shell path:
@@ -145,7 +145,7 @@ Safety behavior:
 - `nodes remove` refuses nodes with non-system workload pods unless
   `--allow-workloads` is provided.
 
-Example managed-pool resize:
+Example managed or self-managed pool resize:
 
 ```bash
 mgmt-oke pools resize oke-cpu --delta 1 --wait
@@ -167,7 +167,7 @@ If `mgmt-oke` is not found:
 ```bash
 echo "$PATH"
 ls -l /home/ubuntu/bin/mgmt-oke
-/home/ubuntu/oke-hpc-node-mgmt/.venv/bin/mgmt-oke --help
+/home/ubuntu/oci-hpc-oke-node-mgmt/.venv/bin/mgmt-oke --help
 ```
 
 If `kubectl oke` is not found, confirm `kubectl-oke` is on `PATH`:

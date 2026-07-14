@@ -160,6 +160,62 @@ class OciBackend:
         response = self.container_engine.update_node_pool(node_pool_id, update_details)
         return response.headers.get("opc-work-request-id")
 
+    def resize_cluster_network(
+        self,
+        cluster_network_id: str,
+        instance_pool_id: str,
+        size: int,
+    ) -> str | None:
+        if size < 0:
+            raise OciDiscoveryError("Cluster network pool size cannot be negative.")
+
+        cluster_network = self.compute_mgmt.get_cluster_network(cluster_network_id).data
+        instance_pools = list(getattr(cluster_network, "instance_pools", None) or [])
+        if not instance_pools:
+            raise OciDiscoveryError("The cluster network does not contain an instance pool.")
+
+        update_pools = []
+        matched = False
+        model = self.oci.core.models.UpdateClusterNetworkInstancePoolDetails
+        for instance_pool in instance_pools:
+            pool_id = getattr(instance_pool, "id", None)
+            is_target = pool_id == instance_pool_id
+            matched = matched or is_target
+            update_pools.append(
+                model(
+                    id=pool_id,
+                    instance_configuration_id=getattr(
+                        instance_pool,
+                        "instance_configuration_id",
+                        None,
+                    ),
+                    display_name=getattr(instance_pool, "display_name", None),
+                    size=size if is_target else getattr(instance_pool, "size", None),
+                    defined_tags=getattr(instance_pool, "defined_tags", None),
+                    freeform_tags=getattr(instance_pool, "freeform_tags", None),
+                )
+            )
+        if not matched:
+            raise OciDiscoveryError(
+                f"Instance pool {instance_pool_id} is not part of cluster network {cluster_network_id}."
+            )
+
+        update_details = self.oci.core.models.UpdateClusterNetworkDetails(
+            display_name=getattr(cluster_network, "display_name", None),
+            defined_tags=getattr(cluster_network, "defined_tags", None),
+            freeform_tags=getattr(cluster_network, "freeform_tags", None),
+            instance_pools=update_pools,
+        )
+        response = self.compute_mgmt.update_cluster_network(cluster_network_id, update_details)
+        return response.headers.get("opc-work-request-id")
+
+    def resize_instance_pool(self, instance_pool_id: str, size: int) -> str | None:
+        if size < 0:
+            raise OciDiscoveryError("Instance pool size cannot be negative.")
+        update_details = self.oci.core.models.UpdateInstancePoolDetails(size=size)
+        response = self.compute_mgmt.update_instance_pool(instance_pool_id, update_details)
+        return response.headers.get("opc-work-request-id")
+
     def delete_node(
         self,
         node_pool_id: str,
@@ -175,6 +231,20 @@ class OciBackend:
         if override_eviction_grace_duration:
             kwargs["override_eviction_grace_duration"] = override_eviction_grace_duration
         response = self.container_engine.delete_node(node_pool_id, node_id, **kwargs)
+        return response.headers.get("opc-work-request-id")
+
+    def detach_instance_pool_node(
+        self,
+        instance_pool_id: str,
+        instance_id: str,
+        decrement_size: bool = True,
+    ) -> str | None:
+        details = self.oci.core.models.DetachInstancePoolInstanceDetails(
+            instance_id=instance_id,
+            is_decrement_size=decrement_size,
+            is_auto_terminate=True,
+        )
+        response = self.compute_mgmt.detach_instance_pool_instance(instance_pool_id, details)
         return response.headers.get("opc-work-request-id")
 
     def list_cluster_network_pools(self, compartment_id: str) -> list[WorkerPoolInfo]:

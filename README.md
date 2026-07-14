@@ -13,8 +13,9 @@ management for OCI HPC OKE clusters:
 - show RDMA topology labels `[Implemented]`
 - show Cluster Autoscaler pool ownership `[Implemented]`
 - show Kueue resource counts and ResourceFlavor-to-pool matches `[Implemented]`
-- resize managed OKE node pools with explicit confirmation `[Implemented]`
-- remove a specific managed OKE node with explicit confirmation `[Implemented]`
+- resize managed OKE node pools and self-managed cluster-network pools `[Implemented]`
+- remove or replace a specific managed or self-managed worker node `[Implemented]`
+- wait for OCI, Kubernetes, GPU, and RDMA readiness after pool changes `[Implemented]`
 
 Discovery commands are read-only. `pools resize` and `nodes remove` mutate OCI resources and require OCI auth plus either `--yes` or an interactive confirmation.
 
@@ -28,8 +29,8 @@ From the project directory:
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install -U pip
-python -m pip install -e .
+python -m pip install -U pip setuptools wheel
+python -m pip install .
 ```
 
 Python 3.9 or newer is supported.
@@ -89,10 +90,10 @@ Command groups:
 | --- | --- |
 | `pools list` | List discovered worker pools. |
 | `pools get <pool>` | Get one worker pool by name or OCID. |
-| `pools resize <pool> (--size <n> \| --delta <n>)` | Resize one managed OKE node pool. |
+| `pools resize <pool> (--size <n> \| --delta <n>)` | Resize a managed OKE node pool, cluster network, or instance pool. |
 | `nodes list` | List Kubernetes nodes. |
 | `nodes get <identifier...>` | Get nodes by name, internal IP, provider ID, or instance OCID. |
-| `nodes remove <node>` | Remove one specific managed OKE node. |
+| `nodes remove <node>` | Remove or replace one specific managed or self-managed worker node. |
 | `topology list` | Group nodes by RDMA topology labels. |
 | `autoscaler status` | Show Cluster Autoscaler pool ownership. |
 | `reconcile` | Show a full discovery snapshot. |
@@ -101,9 +102,9 @@ Resize options:
 
 | Option | Description |
 | --- | --- |
-| `--size <n>` | Set the node pool to an exact size. |
+| `--size <n>` | Set the worker pool to an exact desired size. |
 | `--delta <n>` | Change the current desired size by `n`. Positive values add nodes; negative values remove nodes. For example, `--delta 2` adds two nodes and `--delta -1` removes one node. |
-| `--wait` | Wait until OCI and Kubernetes show the target size. |
+| `--wait` | Wait for the target OCI and Kubernetes counts. GPU/RDMA pools also wait for allocatable GPUs and RDMA topology readiness. |
 | `--timeout <seconds>` | Maximum seconds to wait. Default: `1800`. |
 | `--poll-interval <seconds>` | Wait polling interval. Default: `30`. |
 | `--yes` | Do not prompt for confirmation. |
@@ -112,11 +113,11 @@ Node removal options:
 
 | Option | Description |
 | --- | --- |
-| `--keep-size` | Delete the node but keep the pool size so OKE can replace it. |
+| `--keep-size` | Delete the node but keep the pool size so the backing pool replaces it. |
 | `--allow-workloads` | Allow removing a node that currently has non-system workload pods. |
-| `--eviction-grace <duration>` | OKE eviction grace duration. Default: `PT10M`. |
-| `--force-after-grace` | Force compute deletion if pods cannot be evicted before the grace duration expires. |
-| `--wait` | Wait until the node is absent and counts settle. |
+| `--eviction-grace <duration>` | Managed OKE node eviction grace duration. Default: `PT10M`. |
+| `--force-after-grace` | For managed OKE pools, force compute deletion if pods cannot be evicted before the grace duration expires. |
+| `--wait` | Wait until the selected node is absent and the pool has converged. GPU/RDMA pools also wait for resource readiness. |
 | `--timeout <seconds>` | Maximum seconds to wait. Default: `1800`. |
 | `--poll-interval <seconds>` | Wait polling interval. Default: `30`. |
 | `--yes` | Do not prompt for confirmation. |
@@ -159,6 +160,10 @@ export KUBECONFIG=$HOME/.kube/config
 
 ### Full snapshot
 
+`reconcile` is read-only. It combines worker-pool and Kubernetes node inventory,
+Cluster Autoscaler ownership, GPU/RDMA capability status, and Kueue resource
+counts in one snapshot.
+
 ```bash
 mgmt-oke reconcile
 mgmt-oke --format json reconcile
@@ -190,6 +195,12 @@ Set a pool to an exact desired size:
 mgmt-oke pools resize oke-cpu --size 3 --wait --yes
 ```
 
+The same resize command applies to a self-managed RDMA cluster-network pool:
+
+```bash
+mgmt-oke pools resize oke-rdma --delta 1 --wait --yes
+```
+
 ### Nodes
 
 ```bash
@@ -200,6 +211,12 @@ mgmt-oke nodes get 10.0.127.32
 mgmt-oke nodes get ocid1.instance.oc1.iad.example
 mgmt-oke nodes remove 10.0.127.32 --wait --yes
 mgmt-oke nodes remove 10.0.127.32 --keep-size --wait --yes
+```
+
+Replace a specific RDMA worker while keeping the pool at its current size:
+
+```bash
+mgmt-oke nodes remove <rdma-node-name> --keep-size --wait --yes
 ```
 
 ### RDMA topology
@@ -226,6 +243,14 @@ All commands support:
 ```
 
 `table` is the default.
+
+## Tests
+
+After installing the package, run the unit-test suite from the project root:
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## Current Scope
 

@@ -117,12 +117,20 @@ def add_pools(subparsers: argparse._SubParsersAction) -> None:
     add_output_option(get_cmd)
     get_cmd.set_defaults(handler=cmd_pools_get)
 
-    resize_cmd = sub.add_parser("resize", help="Resize one managed OKE node pool.")
-    resize_cmd.add_argument("pool", help="Pool name or node pool OCID.")
+    resize_cmd = sub.add_parser("resize", help="Resize one discovered worker pool.")
+    resize_cmd.add_argument("pool", help="Pool name or backing OCI resource OCID.")
     size = resize_cmd.add_mutually_exclusive_group(required=True)
-    size.add_argument("--size", type=int, help="Set the node pool to this exact size.")
-    size.add_argument("--delta", type=int, help="Add or remove this many nodes from the current desired size.")
-    resize_cmd.add_argument("--wait", action="store_true", help="Wait until OCI and Kubernetes show the target size.")
+    size.add_argument("--size", type=int, help="Set the worker pool to this exact desired size.")
+    size.add_argument(
+        "--delta",
+        type=int,
+        help="Change the desired size by this amount. Positive values add nodes; negative values remove nodes.",
+    )
+    resize_cmd.add_argument(
+        "--wait",
+        action="store_true",
+        help="Wait for pool counts and applicable GPU/RDMA resource readiness.",
+    )
     resize_cmd.add_argument("--timeout", type=int, default=1800, help="Maximum seconds to wait. Default: 1800.")
     resize_cmd.add_argument("--poll-interval", type=int, default=30, help="Wait polling interval in seconds. Default: 30.")
     resize_cmd.add_argument("--yes", action="store_true", help="Do not prompt for confirmation.")
@@ -149,12 +157,12 @@ def add_nodes(subparsers: argparse._SubParsersAction) -> None:
     add_output_option(get_cmd)
     get_cmd.set_defaults(handler=cmd_nodes_get)
 
-    remove_cmd = sub.add_parser("remove", help="Remove one specific managed OKE node.")
+    remove_cmd = sub.add_parser("remove", help="Remove one specific worker node.")
     remove_cmd.add_argument("node", help="Node name, internal IP, provider ID, or instance OCID.")
     remove_cmd.add_argument(
         "--keep-size",
         action="store_true",
-        help="Delete the node but keep the pool size, allowing OKE to replace it.",
+        help="Delete the node but keep the pool size, allowing the pool to replace it.",
     )
     remove_cmd.add_argument(
         "--allow-workloads",
@@ -164,14 +172,18 @@ def add_nodes(subparsers: argparse._SubParsersAction) -> None:
     remove_cmd.add_argument(
         "--eviction-grace",
         default="PT10M",
-        help="OKE eviction grace duration for the delete operation. Default: PT10M.",
+        help="Managed OKE node eviction grace duration. Default: PT10M.",
     )
     remove_cmd.add_argument(
         "--force-after-grace",
         action="store_true",
-        help="Force compute deletion if pods cannot be evicted before the grace duration expires.",
+        help="For managed OKE pools, force compute deletion after the eviction grace duration.",
     )
-    remove_cmd.add_argument("--wait", action="store_true", help="Wait until the node is absent and counts settle.")
+    remove_cmd.add_argument(
+        "--wait",
+        action="store_true",
+        help="Wait for node removal, pool convergence, and applicable GPU/RDMA resource readiness.",
+    )
     remove_cmd.add_argument("--timeout", type=int, default=1800, help="Maximum seconds to wait. Default: 1800.")
     remove_cmd.add_argument("--poll-interval", type=int, default=30, help="Wait polling interval in seconds. Default: 30.")
     remove_cmd.add_argument("--yes", action="store_true", help="Do not prompt for confirmation.")
@@ -264,8 +276,9 @@ def cmd_pools_resize(args: argparse.Namespace) -> int:
         print(f"Pool not found: {args.pool}", file=sys.stderr)
         print_warnings(snapshot.warnings)
         return 1
-    if pool.kind != "node-pool" or not pool.node_pool_id:
-        print(f"Resize for pool kind '{pool.kind}' is not implemented yet: {pool.name}", file=sys.stderr)
+    supported_kinds = {"node-pool", "cluster-network", "instance-pool"}
+    if pool.kind not in supported_kinds:
+        print(f"Resize for pool kind '{pool.kind}' is not supported: {pool.name}", file=sys.stderr)
         return 2
     if pool.autoscaler_owned:
         print(f"Refusing to resize autoscaler-owned pool: {pool.name}", file=sys.stderr)
@@ -280,7 +293,11 @@ def cmd_pools_resize(args: argparse.Namespace) -> int:
         print(f"Target size cannot be negative: {target_size}", file=sys.stderr)
         return 2
     if target_size == pool.desired_size:
-        print_records([_resize_row(pool, pool.desired_size, target_size, None, "unchanged")], args.output)
+        status = "unchanged"
+        if args.wait:
+            pool = _wait_for_pool_size(args, pool.name, target_size)
+            status = "ready"
+        print_records([_resize_row(pool, pool.desired_size, target_size, None, status)], args.output)
         print_warnings(snapshot.warnings)
         return 0
 
@@ -289,7 +306,19 @@ def cmd_pools_resize(args: argparse.Namespace) -> int:
         return 130
 
     backend = DiscoveryService(options_from_args(args))._oci()
-    work_request_id = backend.resize_managed_node_pool(pool.node_pool_id, target_size)
+    if pool.kind == "node-pool" and pool.node_pool_id:
+        work_request_id = backend.resize_managed_node_pool(pool.node_pool_id, target_size)
+    elif pool.kind == "cluster-network" and pool.cluster_network_id and pool.instance_pool_id:
+        work_request_id = backend.resize_cluster_network(
+            pool.cluster_network_id,
+            pool.instance_pool_id,
+            target_size,
+        )
+    elif pool.kind == "instance-pool" and pool.instance_pool_id:
+        work_request_id = backend.resize_instance_pool(pool.instance_pool_id, target_size)
+    else:
+        print(f"Pool is missing the OCI backing resource required for resize: {pool.name}", file=sys.stderr)
+        return 2
     status = "submitted"
     if args.wait:
         pool = _wait_for_pool_size(args, pool.name, target_size)
@@ -351,12 +380,20 @@ def cmd_nodes_remove(args: argparse.Namespace) -> int:
     if not pool:
         print(f"Cannot determine pool for node: {node.k8s_name}", file=sys.stderr)
         return 2
-    if pool.kind != "node-pool" or not pool.node_pool_id:
-        print(f"Specific node removal for pool kind '{pool.kind}' is not implemented yet: {pool.name}", file=sys.stderr)
+    supported_kinds = {"node-pool", "cluster-network", "instance-pool"}
+    if pool.kind not in supported_kinds:
+        print(f"Specific node removal for pool kind '{pool.kind}' is not supported: {pool.name}", file=sys.stderr)
         return 2
     if pool.autoscaler_owned:
         print(f"Refusing to remove node from autoscaler-owned pool: {pool.name}", file=sys.stderr)
         return 2
+    if pool.kind in {"cluster-network", "instance-pool"}:
+        if args.force_after_grace:
+            print("--force-after-grace applies only to managed OKE node pools.", file=sys.stderr)
+            return 2
+        if args.eviction_grace != "PT10M":
+            print("--eviction-grace applies only to managed OKE node pools.", file=sys.stderr)
+            return 2
     if node.running_workload_pods and not args.allow_workloads:
         print(
             f"Refusing to remove {node.k8s_name}: {node.running_workload_pods} workload pod(s) are running. "
@@ -379,13 +416,23 @@ def cmd_nodes_remove(args: argparse.Namespace) -> int:
         return 130
 
     backend = DiscoveryService(options_from_args(args))._oci()
-    work_request_id = backend.delete_node(
-        pool.node_pool_id,
-        node.instance_ocid,
-        decrement_size=decrement_size,
-        override_eviction_grace_duration=args.eviction_grace,
-        force_after_grace=args.force_after_grace,
-    )
+    if pool.kind == "node-pool" and pool.node_pool_id:
+        work_request_id = backend.delete_node(
+            pool.node_pool_id,
+            node.instance_ocid,
+            decrement_size=decrement_size,
+            override_eviction_grace_duration=args.eviction_grace,
+            force_after_grace=args.force_after_grace,
+        )
+    elif pool.kind in {"cluster-network", "instance-pool"} and pool.instance_pool_id:
+        work_request_id = backend.detach_instance_pool_node(
+            pool.instance_pool_id,
+            node.instance_ocid,
+            decrement_size=decrement_size,
+        )
+    else:
+        print(f"Pool is missing the OCI backing resource required for node removal: {pool.name}", file=sys.stderr)
+        return 2
     status = "submitted"
     if args.wait:
         pool = _wait_for_node_removed(args, pool.name, node, target_size)
@@ -449,6 +496,11 @@ def _wait_for_pool_size(args: argparse.Namespace, pool_name: str, target_size: i
             f"{pool.name}: desired={pool.desired_size} "
             f"oci_active={pool.active_oci_instances} k8s_ready={pool.ready_k8s_nodes}"
         )
+        gpu_ready, rdma_ready = _pool_resource_readiness(snapshot, pool)
+        if gpu_ready is not None:
+            status += f" gpu_ready={gpu_ready}"
+        if rdma_ready is not None:
+            status += f" rdma_ready={rdma_ready}"
         if status != last_status:
             print(f"Waiting: {status}", file=sys.stderr)
             last_status = status
@@ -456,7 +508,9 @@ def _wait_for_pool_size(args: argparse.Namespace, pool_name: str, target_size: i
         desired_ok = pool.desired_size == target_size
         active_ok = pool.active_oci_instances is None or pool.active_oci_instances == target_size
         ready_ok = pool.ready_k8s_nodes == target_size
-        if desired_ok and active_ok and ready_ok:
+        gpu_ok = gpu_ready is None or gpu_ready == target_size
+        rdma_ok = rdma_ready is None or rdma_ready == target_size
+        if desired_ok and active_ok and ready_ok and gpu_ok and rdma_ok:
             return pool
         if time.monotonic() >= deadline:
             raise TimeoutError(f"Timed out waiting for {pool_name} to reach size {target_size}. Last status: {status}")
@@ -478,6 +532,11 @@ def _wait_for_node_removed(args: argparse.Namespace, pool_name: str, original_no
             f"oci_active={pool.active_oci_instances} k8s_ready={pool.ready_k8s_nodes} "
             f"node_present={node_present}"
         )
+        gpu_ready, rdma_ready = _pool_resource_readiness(snapshot, pool)
+        if gpu_ready is not None:
+            status += f" gpu_ready={gpu_ready}"
+        if rdma_ready is not None:
+            status += f" rdma_ready={rdma_ready}"
         if status != last_status:
             print(f"Waiting: {status}", file=sys.stderr)
             last_status = status
@@ -485,13 +544,39 @@ def _wait_for_node_removed(args: argparse.Namespace, pool_name: str, original_no
         desired_ok = pool.desired_size == target_size
         active_ok = pool.active_oci_instances is None or pool.active_oci_instances == target_size
         ready_ok = pool.ready_k8s_nodes == target_size
-        if not node_present and desired_ok and active_ok and ready_ok:
+        gpu_ok = gpu_ready is None or gpu_ready == target_size
+        rdma_ok = rdma_ready is None or rdma_ready == target_size
+        if not node_present and desired_ok and active_ok and ready_ok and gpu_ok and rdma_ok:
             return pool
         if time.monotonic() >= deadline:
             raise TimeoutError(
                 f"Timed out waiting for {original_node.k8s_name} to be removed. Last status: {status}"
             )
         time.sleep(args.poll_interval)
+
+
+def _pool_resource_readiness(snapshot, pool) -> tuple[int | None, int | None]:
+    pool_nodes = [node for node in snapshot.nodes if node.pool_name == pool.name and node.ready]
+    gpu_ready = None
+    if pool.gpu_resource:
+        gpu_ready = sum(
+            1
+            for node in pool_nodes
+            if _positive_resource(node.allocatable.get(pool.gpu_resource))
+        )
+    rdma_ready = None
+    if pool.rdma_enabled:
+        rdma_ready = sum(1 for node in pool_nodes if node.has_rdma_labels)
+    return gpu_ready, rdma_ready
+
+
+def _positive_resource(value: str | None) -> bool:
+    if value is None:
+        return False
+    try:
+        return int(value) > 0
+    except ValueError:
+        return False
 
 
 def _resize_row(pool, old_size: int, target_size: int, work_request_id: str | None, status: str):
@@ -527,4 +612,4 @@ def _program_name() -> str:
     executable = os.path.basename(sys.argv[0])
     if executable == "kubectl-oke":
         return "kubectl oke"
-    return "mgmt oke"
+    return "mgmt-oke"
