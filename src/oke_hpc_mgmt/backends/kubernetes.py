@@ -104,6 +104,17 @@ def _is_running_or_pending(pod: Any) -> bool:
     return pod.status.phase in {"Running", "Pending", "Unknown"}
 
 
+def _is_slinky_worker_pod(pod: Any) -> bool:
+    labels = pod.metadata.labels or {}
+    return bool(
+        labels.get("slinky.slurm.net/nodeset")
+        or (
+            labels.get("app.kubernetes.io/name") == "slurmd"
+            and labels.get("app.kubernetes.io/component") == "worker"
+        )
+    )
+
+
 def _pod_counts_by_node(pods: list[Any]) -> dict[str, dict[str, int]]:
     counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     system_namespaces = {"kube-system", "kueue-system", "cert-manager", "monitoring"}
@@ -111,6 +122,8 @@ def _pod_counts_by_node(pods: list[Any]) -> dict[str, dict[str, int]]:
         node_name = pod.spec.node_name
         if not node_name or not _is_running_or_pending(pod):
             continue
+        if _is_slinky_worker_pod(pod):
+            counts[node_name]["slinky"] += 1
         if _is_daemonset_pod(pod) or _is_mirror_pod(pod):
             counts[node_name]["daemonset"] += 1
         elif pod.metadata.namespace in system_namespaces:
@@ -163,7 +176,7 @@ class KubernetesBackend:
         client = self.client
         core = client.CoreV1Api()
         k8s_nodes = core.list_node().items
-        pod_counts = defaultdict(_empty_pod_count)
+        pod_counts: dict[str, dict[str, int]] = defaultdict(_empty_pod_count)
         if include_pod_counts:
             try:
                 pods = core.list_pod_for_all_namespaces().items
@@ -174,6 +187,7 @@ class KubernetesBackend:
         nodes: list[NodeInfo] = []
         for node in k8s_nodes:
             labels = dict(node.metadata.labels or {})
+            annotations = dict(node.metadata.annotations or {})
             allocatable = dict(node.status.allocatable or {})
             counts = pod_counts[node.metadata.name]
             provider_id = node.spec.provider_id
@@ -190,10 +204,12 @@ class KubernetesBackend:
                     schedulable=not bool(node.spec.unschedulable),
                     allocatable=allocatable,
                     labels=labels,
+                    annotations=annotations,
                     taints=_taints(node),
                     running_workload_pods=counts["workload"],
                     daemonset_pods=counts["daemonset"],
                     system_pods=counts["system"],
+                    slinky_workload_pods=counts["slinky"],
                 )
             )
         return nodes
@@ -230,7 +246,10 @@ class KubernetesBackend:
         custom = client.CustomObjectsApi()
         summary = KueueSummary()
 
-        def list_first_available(plural: str, versions: tuple[str, ...] = ("v1beta1", "v1beta2")) -> list[dict[str, Any]]:
+        def list_first_available(
+            plural: str,
+            versions: tuple[str, ...] = ("v1beta1", "v1beta2"),
+        ) -> list[dict[str, Any]]:
             for version in versions:
                 try:
                     response = custom.list_cluster_custom_object("kueue.x-k8s.io", version, plural)

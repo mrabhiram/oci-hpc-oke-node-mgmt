@@ -6,11 +6,11 @@ import sys
 from dataclasses import asdict, is_dataclass
 from typing import Any, Iterable
 
-from oke_hpc_mgmt.models import DiscoverySnapshot, NodeInfo, WorkerPoolInfo
+from oke_hpc_mgmt.models import AddonInfo, DiscoverySnapshot, NodeInfo, WorkerPoolInfo
 
 
 def serializable(value: Any) -> Any:
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return {key: serializable(item) for key, item in asdict(value).items()}
     if isinstance(value, dict):
         return {str(key): serializable(item) for key, item in value.items()}
@@ -50,6 +50,9 @@ def print_snapshot(snapshot: DiscoverySnapshot, output: str) -> None:
     print()
     print("Nodes")
     print_table(node_rows(snapshot.nodes), NODE_COLUMNS)
+    print()
+    print("OKE add-ons")
+    print_table(addon_rows(snapshot.addons), ADDON_COLUMNS)
     print()
     print("Cluster Autoscaler")
     print_table(autoscaler_rows(snapshot), AUTOSCALER_COLUMNS)
@@ -112,30 +115,38 @@ def _cell(value: Any) -> str:
 POOL_COLUMNS = [
     "name",
     "kind",
+    "placement",
     "shape",
     "desired",
     "oci_active",
     "k8s_ready",
     "gpu",
     "rdma",
+    "rdma_vf_required",
+    "slinky",
     "autoscaler",
     "kueue_flavor",
 ]
 
 NODE_COLUMNS = [
     "name",
+    "slurm_name",
     "ip",
     "status",
     "pool",
     "shape",
     "gpu",
     "rdma",
+    "rdma_vf",
     "workload_pods",
+    "slurm_pods",
     "system_pods",
     "daemonsets",
 ]
 
 AUTOSCALER_COLUMNS = ["deployment", "namespace", "min", "max", "target", "pool"]
+
+ADDON_COLUMNS = ["name", "state", "version", "active", "error"]
 
 TOPOLOGY_COLUMNS = [
     "hpc_island",
@@ -152,17 +163,22 @@ def pool_rows(pools: list[WorkerPoolInfo]) -> list[dict[str, Any]]:
         {
             "name": pool.name,
             "kind": pool.kind,
+            "placement": pool.placement_type,
             "shape": pool.shape,
             "desired": pool.desired_size,
             "oci_active": pool.active_oci_instances,
             "k8s_ready": pool.ready_k8s_nodes,
             "gpu": pool.gpu_resource,
             "rdma": pool.rdma_enabled,
+            "rdma_vf_required": pool.rdma_vf_required,
+            "slinky": pool.slinky_managed,
             "autoscaler": _autoscaler_label(pool),
             "kueue_flavor": pool.kueue_flavor,
             "node_pool_id": pool.node_pool_id,
             "cluster_network_id": pool.cluster_network_id,
             "instance_pool_id": pool.instance_pool_id,
+            "compute_cluster_id": pool.compute_cluster_id,
+            "host_group_ids": pool.host_group_ids,
         }
         for pool in sorted(pools, key=lambda item: (item.kind, item.name))
     ]
@@ -172,19 +188,35 @@ def node_rows(nodes: list[NodeInfo]) -> list[dict[str, Any]]:
     return [
         {
             "name": node.k8s_name,
+            "slurm_name": node.slurm_name,
             "ip": node.internal_ip,
             "status": node.status,
             "pool": node.pool_name,
             "shape": node.shape,
             "gpu": node.gpu_allocatable or node.gpu_resource,
             "rdma": node.has_rdma_labels,
+            "rdma_vf": node.rdma_vf_allocatable,
             "workload_pods": node.running_workload_pods,
+            "slurm_pods": node.slinky_workload_pods,
             "system_pods": node.system_pods,
             "daemonsets": node.daemonset_pods,
             "instance_ocid": node.instance_ocid,
             "node_pool_id": node.node_pool_id,
         }
         for node in sorted(nodes, key=lambda item: item.k8s_name)
+    ]
+
+
+def addon_rows(addons: list[AddonInfo]) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": addon.name,
+            "state": addon.lifecycle_state,
+            "version": addon.version,
+            "active": addon.active,
+            "error": addon.error,
+        }
+        for addon in sorted(addons, key=lambda item: item.name.lower())
     ]
 
 
@@ -244,6 +276,10 @@ def _snapshot_csv_records(snapshot: DiscoverySnapshot) -> list[dict[str, Any]]:
     records.extend(
         {"record_type": "node", **row}
         for row in node_rows(snapshot.nodes)
+    )
+    records.extend(
+        {"record_type": "addon", **row}
+        for row in addon_rows(snapshot.addons)
     )
     records.extend(
         {"record_type": "autoscaler", **row}

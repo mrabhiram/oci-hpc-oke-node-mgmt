@@ -19,6 +19,7 @@ entrypoint is on `PATH`.
 The controller/operator node must have:
 
 - Python 3.9 or newer
+- OCI Python SDK 2.181.1 or newer; package installation installs this dependency
 - `kubectl` configured for the target OKE cluster
 - OCI CLI or OCI SDK dependencies able to use instance principal auth
 - IAM policy allowing the instance principal to inspect and manage the target
@@ -123,6 +124,7 @@ mgmt-oke pools list
 mgmt-oke nodes list
 mgmt-oke topology list
 mgmt-oke autoscaler status
+mgmt-oke addons status
 mgmt-oke reconcile
 ```
 
@@ -144,6 +146,12 @@ Safety behavior:
   by default.
 - `nodes remove` refuses nodes with non-system workload pods unless
   `--allow-workloads` is provided.
+- Compute Cluster-backed OKE pools are resized and modified through OKE APIs;
+  their internal backing instance pools are not mutation targets.
+- Slinky-managed pools refuse node removal, replacement, and pool scale-down
+  until a Slurm-aware drain workflow is available. Scale-up remains supported.
+- When the NVIDIA Network Operator add-on is active, RDMA convergence also
+  requires allocatable `nvidia.com/rdma-vf` resources.
 
 Example managed or self-managed pool resize:
 

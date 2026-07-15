@@ -32,13 +32,22 @@ warnings.filterwarnings(
     module=r"urllib3\.poolmanager",
 )
 
-from oke_hpc_mgmt import __version__
-from oke_hpc_mgmt.discovery import DiscoveryOptions, DiscoveryService
-from oke_hpc_mgmt.render import (
+from oke_hpc_mgmt import __version__  # noqa: E402
+from oke_hpc_mgmt.backends.oci import OciDiscoveryError  # noqa: E402
+from oke_hpc_mgmt.discovery import DiscoveryOptions, DiscoveryService  # noqa: E402
+from oke_hpc_mgmt.models import (  # noqa: E402
+    DiscoverySnapshot,
+    NodeInfo,
+    PoolResourceReadiness,
+    WorkerPoolInfo,
+)
+from oke_hpc_mgmt.render import (  # noqa: E402
+    ADDON_COLUMNS,
     AUTOSCALER_COLUMNS,
     NODE_COLUMNS,
     POOL_COLUMNS,
     TOPOLOGY_COLUMNS,
+    addon_rows,
     autoscaler_rows,
     node_rows,
     pool_rows,
@@ -60,6 +69,13 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
         return 130
+    except (CliOperationError, OciDiscoveryError, TimeoutError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+
+class CliOperationError(RuntimeError):
+    """Raised when an asynchronous CLI operation cannot be completed safely."""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -98,6 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_nodes(subparsers)
     add_topology(subparsers)
     add_autoscaler(subparsers)
+    add_addons(subparsers)
     reconcile = subparsers.add_parser("reconcile", help="Show a full discovery snapshot.")
     add_output_option(reconcile)
     reconcile.set_defaults(handler=cmd_reconcile)
@@ -132,7 +149,12 @@ def add_pools(subparsers: argparse._SubParsersAction) -> None:
         help="Wait for pool counts and applicable GPU/RDMA resource readiness.",
     )
     resize_cmd.add_argument("--timeout", type=int, default=1800, help="Maximum seconds to wait. Default: 1800.")
-    resize_cmd.add_argument("--poll-interval", type=int, default=30, help="Wait polling interval in seconds. Default: 30.")
+    resize_cmd.add_argument(
+        "--poll-interval",
+        type=int,
+        default=30,
+        help="Wait polling interval in seconds. Default: 30.",
+    )
     resize_cmd.add_argument("--yes", action="store_true", help="Do not prompt for confirmation.")
     add_output_option(resize_cmd)
     resize_cmd.set_defaults(handler=cmd_pools_resize)
@@ -152,13 +174,19 @@ def add_nodes(subparsers: argparse._SubParsersAction) -> None:
     add_output_option(list_cmd)
     list_cmd.set_defaults(handler=cmd_nodes_list)
 
-    get_cmd = sub.add_parser("get", help="Get nodes by name, internal IP, provider ID, or instance OCID.")
+    get_cmd = sub.add_parser(
+        "get",
+        help="Get nodes by Kubernetes name, Slurm name, internal IP, provider ID, or instance OCID.",
+    )
     get_cmd.add_argument("identifiers", nargs="+")
     add_output_option(get_cmd)
     get_cmd.set_defaults(handler=cmd_nodes_get)
 
     remove_cmd = sub.add_parser("remove", help="Remove one specific worker node.")
-    remove_cmd.add_argument("node", help="Node name, internal IP, provider ID, or instance OCID.")
+    remove_cmd.add_argument(
+        "node",
+        help="Kubernetes name, Slurm name, internal IP, provider ID, or instance OCID.",
+    )
     remove_cmd.add_argument(
         "--keep-size",
         action="store_true",
@@ -185,7 +213,12 @@ def add_nodes(subparsers: argparse._SubParsersAction) -> None:
         help="Wait for node removal, pool convergence, and applicable GPU/RDMA resource readiness.",
     )
     remove_cmd.add_argument("--timeout", type=int, default=1800, help="Maximum seconds to wait. Default: 1800.")
-    remove_cmd.add_argument("--poll-interval", type=int, default=30, help="Wait polling interval in seconds. Default: 30.")
+    remove_cmd.add_argument(
+        "--poll-interval",
+        type=int,
+        default=30,
+        help="Wait polling interval in seconds. Default: 30.",
+    )
     remove_cmd.add_argument("--yes", action="store_true", help="Do not prompt for confirmation.")
     add_output_option(remove_cmd)
     remove_cmd.set_defaults(handler=cmd_nodes_remove)
@@ -208,6 +241,15 @@ def add_autoscaler(subparsers: argparse._SubParsersAction) -> None:
     status_cmd = sub.add_parser("status", help="Show autoscaler --nodes bindings.")
     add_output_option(status_cmd)
     status_cmd.set_defaults(handler=cmd_autoscaler_status)
+
+
+def add_addons(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("addons", help="Read-only OKE add-on discovery.")
+    sub = parser.add_subparsers(dest="addons_command", required=True)
+
+    status_cmd = sub.add_parser("status", help="Show OKE add-on lifecycle and installed versions.")
+    add_output_option(status_cmd)
+    status_cmd.set_defaults(handler=cmd_addons_status)
 
 
 def options_from_args(args: argparse.Namespace, **overrides) -> DiscoveryOptions:
@@ -239,7 +281,7 @@ def add_output_option(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def discover(args: argparse.Namespace, **overrides):
+def discover(args: argparse.Namespace, **overrides) -> DiscoverySnapshot:
     return DiscoveryService(options_from_args(args, **overrides)).discover()
 
 
@@ -270,7 +312,7 @@ def cmd_pools_resize(args: argparse.Namespace) -> int:
         print("Resize requires --compartment-id or OCI_COMPARTMENT_ID.", file=sys.stderr)
         return 2
 
-    snapshot = discover(args, include_pod_counts=False, include_autoscaler=True, include_kueue=False)
+    snapshot = discover(args, include_pod_counts=True, include_autoscaler=True, include_kueue=False)
     pool = snapshot.pool_by_name(args.pool)
     if not pool:
         print(f"Pool not found: {args.pool}", file=sys.stderr)
@@ -288,18 +330,28 @@ def cmd_pools_resize(args: argparse.Namespace) -> int:
         return 2
 
     original_size = pool.desired_size
-    target_size = args.size if args.size is not None else original_size + args.delta
+    delta = args.delta if args.delta is not None else 0
+    target_size = args.size if args.size is not None else original_size + delta
     if target_size < 0:
         print(f"Target size cannot be negative: {target_size}", file=sys.stderr)
         return 2
     if target_size == pool.desired_size:
         status = "unchanged"
         if args.wait:
-            pool = _wait_for_pool_size(args, pool.name, target_size)
+            pool = _wait_for_pool_size(
+                args,
+                pool.name,
+                target_size,
+                require_rdma_vf=pool.rdma_vf_required,
+            )
             status = "ready"
-        print_records([_resize_row(pool, pool.desired_size, target_size, None, status)], args.output)
+        print_records([_resize_row(pool, original_size, target_size, None, status)], args.output)
         print_warnings(snapshot.warnings)
         return 0
+
+    if target_size < original_size and pool.slinky_managed:
+        print(_slinky_pool_mutation_error(pool.name), file=sys.stderr)
+        return 2
 
     if not args.yes and not _confirm_resize(pool.name, original_size, target_size):
         print("Resize cancelled.", file=sys.stderr)
@@ -321,7 +373,12 @@ def cmd_pools_resize(args: argparse.Namespace) -> int:
         return 2
     status = "submitted"
     if args.wait:
-        pool = _wait_for_pool_size(args, pool.name, target_size)
+        pool = _wait_for_pool_size(
+            args,
+            pool.name,
+            target_size,
+            require_rdma_vf=pool.rdma_vf_required,
+        )
         status = "ready"
     print_records([_resize_row(pool, original_size, target_size, work_request_id, status)], args.output)
     print_warnings(snapshot.warnings)
@@ -359,7 +416,10 @@ def cmd_nodes_get(args: argparse.Namespace) -> int:
 
 def cmd_nodes_remove(args: argparse.Namespace) -> int:
     if args.auth == "none" or args.skip_oci:
-        print("Node removal requires OCI discovery. Use --auth instance_principal on the operator host.", file=sys.stderr)
+        print(
+            "Node removal requires OCI discovery. Use --auth instance_principal on the operator host.",
+            file=sys.stderr,
+        )
         return 2
     if not args.compartment_id:
         print("Node removal requires --compartment-id or OCI_COMPARTMENT_ID.", file=sys.stderr)
@@ -386,6 +446,9 @@ def cmd_nodes_remove(args: argparse.Namespace) -> int:
         return 2
     if pool.autoscaler_owned:
         print(f"Refusing to remove node from autoscaler-owned pool: {pool.name}", file=sys.stderr)
+        return 2
+    if pool.slinky_managed or node.slinky_managed:
+        print(_slinky_node_mutation_error(node.k8s_name, pool.name), file=sys.stderr)
         return 2
     if pool.kind in {"cluster-network", "instance-pool"}:
         if args.force_after_grace:
@@ -435,7 +498,13 @@ def cmd_nodes_remove(args: argparse.Namespace) -> int:
         return 2
     status = "submitted"
     if args.wait:
-        pool = _wait_for_node_removed(args, pool.name, node, target_size)
+        pool = _wait_for_node_removed(
+            args,
+            pool.name,
+            node,
+            target_size,
+            require_rdma_vf=pool.rdma_vf_required,
+        )
         status = "removed"
     print_records([_node_remove_row(pool, node, target_size, decrement_size, work_request_id, status)], args.output)
     print_warnings(snapshot.warnings)
@@ -459,6 +528,26 @@ def cmd_autoscaler_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_addons_status(args: argparse.Namespace) -> int:
+    if args.auth == "none" or args.skip_oci:
+        print("OKE add-on discovery requires OCI auth.", file=sys.stderr)
+        return 2
+    if not args.cluster_id:
+        print("OKE add-on discovery requires --cluster-id or OKE_CLUSTER_ID.", file=sys.stderr)
+        return 2
+    snapshot = discover(
+        args,
+        include_pod_counts=False,
+        include_autoscaler=False,
+        include_kueue=False,
+        include_pools=False,
+        skip_kubernetes=True,
+    )
+    print_records(addon_rows(snapshot.addons), args.output, ADDON_COLUMNS)
+    print_warnings(snapshot.warnings)
+    return 0
+
+
 def cmd_reconcile(args: argparse.Namespace) -> int:
     snapshot = discover(args)
     print_snapshot(snapshot, args.output)
@@ -467,7 +556,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
 
 def _confirm_resize(pool_name: str, current_size: int, target_size: int) -> bool:
     print(f"About to resize {pool_name}: {current_size} -> {target_size}", file=sys.stderr)
-    print(f"Type the pool name to continue: ", end="", file=sys.stderr, flush=True)
+    print("Type the pool name to continue: ", end="", file=sys.stderr, flush=True)
     try:
         return input().strip() == pool_name
     except EOFError:
@@ -477,30 +566,33 @@ def _confirm_resize(pool_name: str, current_size: int, target_size: int) -> bool
 def _confirm_node_remove(node_name: str, pool_name: str, decrement_size: bool) -> bool:
     size_text = "and decrement pool size" if decrement_size else "and allow replacement"
     print(f"About to remove node {node_name} from {pool_name} {size_text}.", file=sys.stderr)
-    print(f"Type the node name to continue: ", end="", file=sys.stderr, flush=True)
+    print("Type the node name to continue: ", end="", file=sys.stderr, flush=True)
     try:
         return input().strip() == node_name
     except EOFError:
         return False
 
 
-def _wait_for_pool_size(args: argparse.Namespace, pool_name: str, target_size: int):
+def _wait_for_pool_size(
+    args: argparse.Namespace,
+    pool_name: str,
+    target_size: int,
+    require_rdma_vf: bool = False,
+) -> WorkerPoolInfo:
     deadline = time.monotonic() + args.timeout
     last_status = ""
     while True:
         snapshot = discover(args, include_pod_counts=False, include_autoscaler=False, include_kueue=False)
         pool = snapshot.pool_by_name(pool_name)
         if pool is None:
-            raise RuntimeError(f"Pool disappeared while waiting: {pool_name}")
+            raise CliOperationError(f"Pool disappeared while waiting: {pool_name}")
+        pool.rdma_vf_required = pool.rdma_vf_required or require_rdma_vf
         status = (
             f"{pool.name}: desired={pool.desired_size} "
             f"oci_active={pool.active_oci_instances} k8s_ready={pool.ready_k8s_nodes}"
         )
-        gpu_ready, rdma_ready = _pool_resource_readiness(snapshot, pool)
-        if gpu_ready is not None:
-            status += f" gpu_ready={gpu_ready}"
-        if rdma_ready is not None:
-            status += f" rdma_ready={rdma_ready}"
+        readiness = _pool_resource_readiness(snapshot, pool)
+        status += _readiness_status(readiness)
         if status != last_status:
             print(f"Waiting: {status}", file=sys.stderr)
             last_status = status
@@ -508,23 +600,29 @@ def _wait_for_pool_size(args: argparse.Namespace, pool_name: str, target_size: i
         desired_ok = pool.desired_size == target_size
         active_ok = pool.active_oci_instances is None or pool.active_oci_instances == target_size
         ready_ok = pool.ready_k8s_nodes == target_size
-        gpu_ok = gpu_ready is None or gpu_ready == target_size
-        rdma_ok = rdma_ready is None or rdma_ready == target_size
-        if desired_ok and active_ok and ready_ok and gpu_ok and rdma_ok:
+        resources_ok = _resource_counts_match(readiness, target_size)
+        if desired_ok and active_ok and ready_ok and resources_ok:
             return pool
         if time.monotonic() >= deadline:
             raise TimeoutError(f"Timed out waiting for {pool_name} to reach size {target_size}. Last status: {status}")
         time.sleep(args.poll_interval)
 
 
-def _wait_for_node_removed(args: argparse.Namespace, pool_name: str, original_node, target_size: int):
+def _wait_for_node_removed(
+    args: argparse.Namespace,
+    pool_name: str,
+    original_node: NodeInfo,
+    target_size: int,
+    require_rdma_vf: bool = False,
+) -> WorkerPoolInfo:
     deadline = time.monotonic() + args.timeout
     last_status = ""
     while True:
         snapshot = discover(args, include_pod_counts=False, include_autoscaler=False, include_kueue=False)
         pool = snapshot.pool_by_name(pool_name)
         if pool is None:
-            raise RuntimeError(f"Pool disappeared while waiting: {pool_name}")
+            raise CliOperationError(f"Pool disappeared while waiting: {pool_name}")
+        pool.rdma_vf_required = pool.rdma_vf_required or require_rdma_vf
         node_present = snapshot.node_by_identifier(original_node.k8s_name) is not None
         node_present = node_present or snapshot.node_by_identifier(original_node.instance_ocid or "") is not None
         status = (
@@ -532,11 +630,8 @@ def _wait_for_node_removed(args: argparse.Namespace, pool_name: str, original_no
             f"oci_active={pool.active_oci_instances} k8s_ready={pool.ready_k8s_nodes} "
             f"node_present={node_present}"
         )
-        gpu_ready, rdma_ready = _pool_resource_readiness(snapshot, pool)
-        if gpu_ready is not None:
-            status += f" gpu_ready={gpu_ready}"
-        if rdma_ready is not None:
-            status += f" rdma_ready={rdma_ready}"
+        readiness = _pool_resource_readiness(snapshot, pool)
+        status += _readiness_status(readiness)
         if status != last_status:
             print(f"Waiting: {status}", file=sys.stderr)
             last_status = status
@@ -544,9 +639,8 @@ def _wait_for_node_removed(args: argparse.Namespace, pool_name: str, original_no
         desired_ok = pool.desired_size == target_size
         active_ok = pool.active_oci_instances is None or pool.active_oci_instances == target_size
         ready_ok = pool.ready_k8s_nodes == target_size
-        gpu_ok = gpu_ready is None or gpu_ready == target_size
-        rdma_ok = rdma_ready is None or rdma_ready == target_size
-        if not node_present and desired_ok and active_ok and ready_ok and gpu_ok and rdma_ok:
+        resources_ok = _resource_counts_match(readiness, target_size)
+        if not node_present and desired_ok and active_ok and ready_ok and resources_ok:
             return pool
         if time.monotonic() >= deadline:
             raise TimeoutError(
@@ -555,7 +649,10 @@ def _wait_for_node_removed(args: argparse.Namespace, pool_name: str, original_no
         time.sleep(args.poll_interval)
 
 
-def _pool_resource_readiness(snapshot, pool) -> tuple[int | None, int | None]:
+def _pool_resource_readiness(
+    snapshot: DiscoverySnapshot,
+    pool: WorkerPoolInfo,
+) -> PoolResourceReadiness:
     pool_nodes = [node for node in snapshot.nodes if node.pool_name == pool.name and node.ready]
     gpu_ready = None
     if pool.gpu_resource:
@@ -566,8 +663,49 @@ def _pool_resource_readiness(snapshot, pool) -> tuple[int | None, int | None]:
         )
     rdma_ready = None
     if pool.rdma_enabled:
-        rdma_ready = sum(1 for node in pool_nodes if node.has_rdma_labels)
-    return gpu_ready, rdma_ready
+        rdma_ready = sum(1 for node in pool_nodes if node.rdma_topology_ready)
+    rdma_vf_ready = None
+    if pool.rdma_vf_required:
+        rdma_vf_ready = sum(
+            1 for node in pool_nodes if _positive_resource(node.rdma_vf_allocatable)
+        )
+    return PoolResourceReadiness(
+        gpu_ready=gpu_ready,
+        rdma_topology_ready=rdma_ready,
+        rdma_vf_ready=rdma_vf_ready,
+    )
+
+
+def _readiness_status(readiness: PoolResourceReadiness) -> str:
+    fields = (
+        ("gpu_ready", readiness.gpu_ready),
+        ("rdma_ready", readiness.rdma_topology_ready),
+        ("rdma_vf_ready", readiness.rdma_vf_ready),
+    )
+    return "".join(f" {name}={value}" for name, value in fields if value is not None)
+
+
+def _resource_counts_match(readiness: PoolResourceReadiness, target_size: int) -> bool:
+    counts = (
+        readiness.gpu_ready,
+        readiness.rdma_topology_ready,
+        readiness.rdma_vf_ready,
+    )
+    return all(count is None or count == target_size for count in counts)
+
+
+def _slinky_pool_mutation_error(pool_name: str) -> str:
+    return (
+        f"Refusing to scale down Slinky-managed pool {pool_name}: Slurm-aware drain is required "
+        "before OKE capacity is removed. Scale-up remains supported."
+    )
+
+
+def _slinky_node_mutation_error(node_name: str, pool_name: str) -> str:
+    return (
+        f"Refusing to remove Slinky-managed node {node_name} from {pool_name}: "
+        "Slurm-aware drain is required before node deletion or replacement."
+    )
 
 
 def _positive_resource(value: str | None) -> bool:
@@ -579,7 +717,13 @@ def _positive_resource(value: str | None) -> bool:
         return False
 
 
-def _resize_row(pool, old_size: int, target_size: int, work_request_id: str | None, status: str):
+def _resize_row(
+    pool: WorkerPoolInfo,
+    old_size: int,
+    target_size: int,
+    work_request_id: str | None,
+    status: str,
+) -> dict[str, object]:
     return {
         "name": pool.name,
         "kind": pool.kind,
@@ -593,9 +737,17 @@ def _resize_row(pool, old_size: int, target_size: int, work_request_id: str | No
     }
 
 
-def _node_remove_row(pool, node, target_size: int, decrement_size: bool, work_request_id: str | None, status: str):
+def _node_remove_row(
+    pool: WorkerPoolInfo,
+    node: NodeInfo,
+    target_size: int,
+    decrement_size: bool,
+    work_request_id: str | None,
+    status: str,
+) -> dict[str, object]:
     return {
         "node": node.k8s_name,
+        "slurm_name": node.slurm_name,
         "ip": node.internal_ip,
         "pool": pool.name,
         "shape": node.shape,
