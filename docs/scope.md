@@ -15,7 +15,7 @@ Management Tool.
   kubeconfig context
 - automatic compartment discovery from the resolved cluster through the OCI OKE
   `GetCluster` API
-- explicit CLI and environment target overrides with deterministic precedence
+- explicit CLI and environment resource-target overrides with deterministic precedence
 - multi-file kubeconfig loading and explicit, current, or unambiguous single-context
   selection
 - instance and resource principal propagation to the kubeconfig OCI CLI exec plugin
@@ -38,6 +38,7 @@ Management Tool.
 
 ## Documentation
 
+- [`README.md`](README.md)
 - [`architecture.md`](architecture.md)
 - [`controller-install.md`](controller-install.md)
 

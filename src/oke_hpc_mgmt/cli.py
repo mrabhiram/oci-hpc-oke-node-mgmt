@@ -125,8 +125,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--context",
-        default=os.getenv("KUBE_CONTEXT"),
-        help="kubeconfig context used for Kubernetes access and automatic OKE target discovery.",
+        help=(
+            "Explicit kubeconfig context override for troubleshooting. By default the "
+            "current or only unambiguous context is used."
+        ),
     )
     parser.add_argument(
         "--in-cluster",

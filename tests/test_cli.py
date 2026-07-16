@@ -25,6 +25,19 @@ from oke_hpc_mgmt.models import (
 
 
 class CliTests(unittest.TestCase):
+    def test_kube_context_environment_variable_is_not_used(self):
+        with patch.dict(os.environ, {"KUBE_CONTEXT": "unexpected-context"}):
+            args = build_parser().parse_args(["pools", "list"])
+
+        self.assertIsNone(args.context)
+
+    def test_explicit_context_override_is_supported(self):
+        args = build_parser().parse_args(
+            ["--context", "operator-context", "pools", "list"]
+        )
+
+        self.assertEqual("operator-context", args.context)
+
     def test_global_help_describes_target_discovery_modes(self):
         help_text = " ".join(build_parser().format_help().split())
 

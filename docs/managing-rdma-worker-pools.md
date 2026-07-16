@@ -1,0 +1,138 @@
+# Managing RDMA Worker Pools
+
+This guide explains how to identify and operate the two RDMA worker-pool models
+used by OCI HPC OKE deployments.
+
+## Overview
+
+OCI HPC OKE v26.7 deploys GPU with RDMA workers as managed OKE node pools placed
+in OCI Compute Clusters by default. Earlier deployments and deployments using
+the legacy option can expose a self-managed Cluster Network with an embedded
+Instance Pool.
+
+The same `mgmt-oke` commands work with both models, but the owning OCI API is
+different.
+
+## Prerequisites
+
+- an OCI HPC OKE cluster with an RDMA worker pool
+- working OCI and Kubernetes discovery
+- IAM permission to read and, for mutations, manage the owning pool resource
+- GPU and network device plug-ins initialized on the workers
+
+## Identify the RDMA Ownership Model
+
+```bash
+mgmt-oke --auth instance_principal pools get oke-rdma
+```
+
+Interpret `kind` and `placement`:
+
+| Output | Model |
+| --- | --- |
+| `kind=node-pool`, `placement=compute-cluster` | Managed OKE RDMA node pool placed in a Compute Cluster. |
+| `kind=cluster-network`, `placement=cluster-network` | Legacy self-managed Cluster Network. |
+
+Use JSON to inspect backing identifiers:
+
+```bash
+mgmt-oke --auth instance_principal --format json pools get oke-rdma
+```
+
+A managed pool exposes `node_pool_id` and `compute_cluster_id`. A legacy pool
+exposes `cluster_network_id` and `instance_pool_id`.
+
+## Add an RDMA Worker
+
+```bash
+mgmt-oke --auth instance_principal pools resize oke-rdma --delta 1 --wait
+```
+
+For the managed model, OKE increases `node_config_details.size` and places the
+new node in the existing Compute Cluster. The tool does not update the Compute
+Cluster or its internal backing Instance Pool.
+
+For the legacy model, Compute Management increases the embedded Instance Pool
+size through `UpdateClusterNetwork`. Its existing Instance Configuration
+already contains cloud-init and OKE bootstrap configuration.
+
+## Remove RDMA Capacity
+
+Reduce desired pool size by one without choosing a specific worker:
+
+```bash
+mgmt-oke --auth instance_principal pools resize oke-rdma --delta -1 --wait
+```
+
+Choose a specific worker and decrement desired size:
+
+```bash
+mgmt-oke --auth instance_principal nodes remove <rdma-node-name-or-ip> --wait
+```
+
+For predictable maintenance, selecting a node is preferable when one worker is
+known to be unhealthy. Review workload and topology data before removal.
+
+## Replace a Specific RDMA Worker
+
+```bash
+mgmt-oke --auth instance_principal nodes remove <rdma-node-name-or-ip> \
+  --keep-size --wait
+```
+
+Managed pools use OKE `DeleteNode`. Legacy pools detach and automatically
+terminate the selected Instance Pool instance. `--keep-size` preserves desired
+capacity in both cases.
+
+## Verify Topology and Resources
+
+```bash
+mgmt-oke --auth instance_principal nodes list --pool oke-rdma
+mgmt-oke --auth instance_principal nodes list --rdma-only
+mgmt-oke --auth instance_principal topology list --pool oke-rdma
+mgmt-oke --auth instance_principal addons status
+```
+
+Every Ready RDMA worker should have valid values for:
+
+- `oci.oraclecloud.com/rdma.hpc_island_id`
+- `oci.oraclecloud.com/rdma.network_block_id`
+- `oci.oraclecloud.com/rdma.local_block_id`
+
+When the NVIDIA Network Operator add-on is active, every Ready RDMA worker must
+also advertise a positive `nvidia.com/rdma-vf` allocatable resource before
+`--wait` succeeds.
+
+## Compute Cluster Inventory Protection
+
+OKE can expose an internal Instance Pool backing a managed Compute Cluster node
+pool. The CLI correlates Compute Cluster and instance membership and suppresses
+that internal pool from standalone inventory.
+
+The expected output contains one `oke-rdma` worker pool, not both an OKE node
+pool and its internal Instance Pool. Mutations always target the OKE node pool.
+
+## Slinky Slurm Pools
+
+The tool detects Slinky ownership from upstream labels, annotations, and slurmd
+worker pods. Scale-up remains available. Scale-down, specific removal, and
+replacement are refused until a Slurm-aware drain workflow is implemented.
+
+```bash
+mgmt-oke --auth instance_principal pools get oke-rdma
+```
+
+If `slinky=yes`, do not attempt to bypass the refusal by changing Kubernetes
+labels. Use the Slurm control plane to coordinate node state.
+
+## Infrastructure-As-Code Ownership
+
+Record live size changes in the corresponding Terraform or Resource Manager
+input. A later apply can otherwise replace the live size and, when ownership
+mode variables change, can replace the RDMA worker architecture itself.
+
+## Troubleshooting
+
+If a new worker reaches OCI ACTIVE but not Kubernetes Ready, inspect node join,
+GPU device plug-in, and network operator state. If topology remains absent,
+verify the OCI topology labeler and IMDS data before submitting another resize.

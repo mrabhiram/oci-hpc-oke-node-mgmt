@@ -56,10 +56,14 @@ without setting `OKE_CLUSTER_ID`, `OCI_REGION`, or `OCI_COMPARTMENT_ID`.
 
 The tool applies the following context selection order:
 
-1. The context supplied with `--context` or `KUBE_CONTEXT`.
+1. The context supplied explicitly with `--context`.
 2. The kubeconfig `current-context`.
 3. The only unambiguous context when the kubeconfig identifies one cluster and
    one user selection.
+
+Stack operator nodes normally contain one cluster and do not need
+`--context`. The option is retained only as a visible troubleshooting override;
+there is no environment-variable context selector.
 
 The kubeconfig path comes from `--kubeconfig`, then `KUBECONFIG`, then
 `~/.kube/config`. Multiple paths in `KUBECONFIG` are merged using kubeconfig

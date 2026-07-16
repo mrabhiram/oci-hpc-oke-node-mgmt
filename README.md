@@ -88,7 +88,7 @@ Global options:
 | `--oci-config-file <path>` | OCI config file path when using config-file authentication. |
 | `--oci-profile <profile>` | OCI config profile when using config-file authentication. |
 | `--kubeconfig <path>` | kubeconfig path used for Kubernetes access and OKE target discovery. |
-| `--context <name>` | kubeconfig context used for Kubernetes access and OKE target discovery. |
+| `--context <name>` | Explicit kubeconfig context override for troubleshooting. The current or only unambiguous context is used by default. |
 | `--in-cluster` | Use Kubernetes in-cluster configuration. |
 | `--skip-oci` | Skip OCI discovery. |
 | `--skip-kubernetes` | Skip Kubernetes discovery. |
@@ -167,9 +167,10 @@ When `--auth instance_principal` or `--auth resource_principal` is selected, the
 tool also supplies that authentication method to the kubeconfig OCI CLI exec
 plugin unless `OCI_CLI_AUTH` is already set explicitly.
 
-Explicit command-line options and environment variables take precedence over
-automatic discovery. They remain available for multi-cluster kubeconfigs,
-in-cluster execution, and other nonstandard environments.
+Explicit resource-target options and their environment-variable equivalents
+take precedence over automatic discovery. They remain available for in-cluster
+execution and other nonstandard environments. Kubeconfig context selection has
+no environment-variable override.
 
 For Kubernetes-only discovery on an operator host, retain authentication for
 the kubeconfig exec plugin and skip OCI inventory calls:
@@ -345,6 +346,7 @@ mypy src
 
 ## Documentation
 
+- [`docs/README.md`](docs/README.md): task-oriented documentation index
 - [`docs/architecture.md`](docs/architecture.md): target discovery, ownership
   classification, mutation API routing, readiness, and safety boundaries
 - [`docs/controller-install.md`](docs/controller-install.md): operator node

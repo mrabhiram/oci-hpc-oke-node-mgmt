@@ -4,7 +4,8 @@ This guide installs the OKE HPC node management tool on an OKE HPC controller,
 operator, or bastion-style admin node where `kubectl` is already configured for
 the target cluster.
 
-For implementation details, see [`architecture.md`](architecture.md).
+For the complete guide index, see [`README.md`](README.md). For implementation
+details, see [`architecture.md`](architecture.md).
 
 The tool provides two entrypoints backed by the same code:
 
@@ -131,11 +132,10 @@ kubeconfig context -> cluster OCID and region -> OKE GetCluster -> compartment O
 
 Explicit command-line values take precedence over environment variables, which
 take precedence over automatic discovery. The optional overrides below are
-therefore intended for multi-cluster kubeconfigs, in-cluster execution, or
-nonstandard environments rather than normal stack operator nodes.
+therefore intended for in-cluster execution or other nonstandard environments
+rather than normal stack operator nodes.
 
-The following optional overrides are available for multi-cluster or nonstandard
-environments:
+The following optional overrides are available for nonstandard environments:
 
 ```bash
 export OCI_REGION=<region>
@@ -255,8 +255,9 @@ kubectl config view --minify -o jsonpath='{.users[0].user.exec.command}{"\n"}{.u
 
 An OCI-generated OKE kubeconfig should invoke `oci ce cluster generate-token`
 with `--cluster-id` and `--region`, and that `oci` executable must be on `PATH`.
-Select another context with `--context`, or provide `--cluster-id`, `--region`,
-and `--compartment-id` as explicit overrides.
+For a nonstandard kubeconfig, select its context explicitly with `--context`, or
+provide `--cluster-id`, `--region`, and `--compartment-id` as explicit
+overrides.
 
 If cluster discovery succeeds but compartment discovery fails, verify that the
 selected OCI identity can read the OKE cluster. Compartment discovery uses OKE
