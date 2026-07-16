@@ -1,19 +1,37 @@
 import unittest
+from unittest.mock import patch
 
+from oke_hpc_mgmt.backends.kubeconfig import KubeconfigDiscoveryError, OkeKubeconfigContext
+from oke_hpc_mgmt.backends.oci import OciDiscoveryError
 from oke_hpc_mgmt.discovery import DiscoveryOptions, DiscoveryService
 from oke_hpc_mgmt.models import AddonInfo, NodeInfo, WorkerPoolInfo
 
 
 class _OciBackend:
-    def __init__(self, managed=None, cluster_networks=None, standalone=None, addons=None):
+    def __init__(
+        self,
+        managed=None,
+        cluster_networks=None,
+        standalone=None,
+        addons=None,
+        discovered_compartment="discovered-compartment",
+    ):
         self.managed = managed or []
         self.cluster_networks = cluster_networks or []
         self.standalone = standalone or []
         self.addons = addons or []
         self.instance_pool_call = None
+        self.managed_pool_call = None
+        self.cluster_lookups = []
+        self.discovered_compartment = discovered_compartment
 
     def list_managed_node_pools(self, compartment_id, cluster_id=None):
+        self.managed_pool_call = (compartment_id, cluster_id)
         return self.managed
+
+    def get_cluster_compartment_id(self, cluster_id):
+        self.cluster_lookups.append(cluster_id)
+        return self.discovered_compartment
 
     def list_cluster_network_pools(self, compartment_id):
         return self.cluster_networks
@@ -66,6 +84,122 @@ def _service(oci_backend=None, kubernetes_backend=None, **overrides):
 
 
 class DiscoveryTests(unittest.TestCase):
+    @patch("oke_hpc_mgmt.discovery.load_oke_kubeconfig_context")
+    def test_cluster_region_and_compartment_are_discovered_automatically(self, load_context):
+        load_context.return_value = OkeKubeconfigContext(
+            context_name="london",
+            cluster_name="london-cluster",
+            cluster_id="cluster-from-kubeconfig",
+            region="uk-london-1",
+        )
+        pool = WorkerPoolInfo(name="oke-cpu", kind="node-pool")
+        backend = _OciBackend(managed=[pool])
+        service = _service(
+            backend,
+            _KubernetesBackend(),
+            compartment_id=None,
+            cluster_id=None,
+            region=None,
+        )
+
+        snapshot = service.discover()
+
+        self.assertEqual([pool], snapshot.pools)
+        self.assertEqual("cluster-from-kubeconfig", service.options.cluster_id)
+        self.assertEqual("uk-london-1", service.options.region)
+        self.assertEqual("discovered-compartment", service.options.compartment_id)
+        self.assertEqual(["cluster-from-kubeconfig"], backend.cluster_lookups)
+        self.assertEqual(
+            ("discovered-compartment", "cluster-from-kubeconfig"),
+            backend.managed_pool_call,
+        )
+
+    @patch("oke_hpc_mgmt.discovery.load_oke_kubeconfig_context")
+    def test_explicit_target_values_take_precedence(self, load_context):
+        backend = _OciBackend()
+        service = _service(backend, _KubernetesBackend(), region="uk-london-1")
+
+        target = service.resolve_oci_target(require_compartment=True, require_cluster=True)
+
+        self.assertEqual("compartment-1", target.compartment_id)
+        self.assertEqual("cluster-1", target.cluster_id)
+        self.assertEqual("uk-london-1", target.region)
+        self.assertIs(backend, service.oci_backend())
+        load_context.assert_not_called()
+        self.assertEqual([], backend.cluster_lookups)
+
+    @patch("oke_hpc_mgmt.discovery.load_oke_kubeconfig_context")
+    def test_explicit_compartment_uses_kubeconfig_cluster_without_oci_lookup(self, load_context):
+        load_context.return_value = OkeKubeconfigContext(
+            context_name="london",
+            cluster_name="london-cluster",
+            cluster_id="cluster-from-kubeconfig",
+            region="uk-london-1",
+        )
+        backend = _OciBackend()
+        service = _service(
+            backend,
+            _KubernetesBackend(),
+            cluster_id=None,
+            region=None,
+        )
+
+        service.discover()
+
+        self.assertEqual([], backend.cluster_lookups)
+        self.assertEqual(
+            ("compartment-1", "cluster-from-kubeconfig"),
+            backend.managed_pool_call,
+        )
+
+    @patch("oke_hpc_mgmt.discovery.load_oke_kubeconfig_context")
+    def test_kubeconfig_failure_preserves_kubernetes_only_inventory(self, load_context):
+        load_context.side_effect = KubeconfigDiscoveryError("config unavailable")
+        node = NodeInfo(k8s_name="node-1", pool_name="oke-cpu", ready=True)
+        service = _service(
+            _OciBackend(),
+            _KubernetesBackend([node]),
+            compartment_id=None,
+            cluster_id=None,
+            region=None,
+        )
+
+        snapshot = service.discover()
+
+        self.assertEqual([node], snapshot.nodes)
+        self.assertEqual("oke-cpu", snapshot.pools[0].name)
+        self.assertTrue(
+            any("Automatic OKE target discovery" in warning for warning in snapshot.warnings)
+        )
+
+    def test_required_compartment_reports_in_cluster_discovery_limit(self):
+        service = _service(
+            _OciBackend(),
+            _KubernetesBackend(),
+            compartment_id=None,
+            cluster_id=None,
+            region=None,
+            in_cluster=True,
+        )
+
+        with self.assertRaisesRegex(OciDiscoveryError, "--in-cluster"):
+            service.resolve_oci_target(require_compartment=True)
+
+    @patch("oke_hpc_mgmt.discovery.load_oke_kubeconfig_context")
+    def test_skip_oci_does_not_read_kubeconfig(self, load_context):
+        service = _service(
+            None,
+            _KubernetesBackend(),
+            compartment_id=None,
+            cluster_id=None,
+            region=None,
+            skip_oci=True,
+        )
+
+        service.discover()
+
+        load_context.assert_not_called()
+
     def test_managed_compute_cluster_metadata_is_used_to_filter_instance_pools(self):
         managed = WorkerPoolInfo(
             name="oke-rdma",

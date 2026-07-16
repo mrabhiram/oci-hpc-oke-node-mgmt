@@ -3,8 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections import defaultdict
 
+from oke_hpc_mgmt.backends.kubeconfig import (
+    KubeconfigDiscoveryError,
+    load_oke_kubeconfig_context,
+)
 from oke_hpc_mgmt.backends.kubernetes import KubernetesBackend
-from oke_hpc_mgmt.backends.oci import OciBackend
+from oke_hpc_mgmt.backends.oci import OciBackend, OciDiscoveryError
 from oke_hpc_mgmt.models import (
     SLINKY_HOSTNAME_PREFIX_LABEL,
     AddonInfo,
@@ -34,14 +38,24 @@ class DiscoveryOptions:
     include_pools: bool = True
 
 
+@dataclass(frozen=True)
+class ResolvedOciTarget:
+    compartment_id: str | None
+    cluster_id: str | None
+    region: str | None
+
+
 class DiscoveryService:
     def __init__(self, options: DiscoveryOptions) -> None:
         self.options = options
         self._k8s_backend: KubernetesBackend | None = None
         self._oci_backend: OciBackend | None = None
+        self._oci_target_resolved = False
+        self._oci_target_error: str | None = None
 
     def discover(self) -> DiscoverySnapshot:
         snapshot = DiscoverySnapshot()
+        self.resolve_oci_target()
         nodes = self._discover_kubernetes(snapshot)
         pools = self._discover_oci(snapshot)
         addons = self._discover_addons(snapshot)
@@ -68,6 +82,100 @@ class DiscoveryService:
         self._apply_addon_expectations(snapshot)
         return snapshot
 
+    def resolve_oci_target(
+        self,
+        require_compartment: bool = False,
+        require_cluster: bool = False,
+    ) -> ResolvedOciTarget:
+        if not self._oci_target_resolved:
+            self._resolve_oci_target()
+
+        target = ResolvedOciTarget(
+            compartment_id=self.options.compartment_id,
+            cluster_id=self.options.cluster_id,
+            region=self.options.region,
+        )
+        if require_compartment and not target.compartment_id:
+            raise OciDiscoveryError(
+                self._oci_target_error
+                or "Unable to determine the OCI compartment. Use --compartment-id as an override."
+            )
+        if require_cluster and not target.cluster_id:
+            raise OciDiscoveryError(
+                self._oci_target_error
+                or "Unable to determine the OKE cluster OCID. Use --cluster-id as an override."
+            )
+        return target
+
+    def _resolve_oci_target(self) -> None:
+        self._oci_target_resolved = True
+        if self.options.skip_oci:
+            self._oci_target_error = "OCI discovery is disabled by --skip-oci."
+            return
+        if self.options.auth == "none":
+            self._oci_target_error = "OCI authentication is disabled."
+            return
+
+        context_error: str | None = None
+        if not self.options.in_cluster and (
+            not self.options.cluster_id or not self.options.region
+        ):
+            try:
+                kube_context = load_oke_kubeconfig_context(
+                    kubeconfig=self.options.kubeconfig,
+                    context=self.options.context,
+                )
+            except KubeconfigDiscoveryError as exc:
+                context_error = f"Automatic OKE target discovery from kubeconfig failed: {exc}"
+            else:
+                if (
+                    self.options.cluster_id
+                    and self.options.cluster_id != kube_context.cluster_id
+                ):
+                    context_error = (
+                        "The explicit OKE cluster OCID does not match the selected kubeconfig "
+                        "context; provide --region for the explicit cluster."
+                    )
+                else:
+                    self.options.cluster_id = self.options.cluster_id or kube_context.cluster_id
+                    self.options.region = self.options.region or kube_context.region
+        elif self.options.in_cluster and not self.options.cluster_id:
+            context_error = (
+                "Automatic OKE target discovery is unavailable with --in-cluster; "
+                "provide --cluster-id and --region."
+            )
+
+        if self.options.compartment_id:
+            self._oci_target_error = context_error
+            return
+        if not self.options.cluster_id:
+            self._oci_target_error = context_error or (
+                "Unable to determine the OKE cluster OCID from kubeconfig. "
+                "Use --cluster-id or --compartment-id as an override."
+            )
+            return
+        if (
+            not self.options.region
+            and self.options.auth in {"instance_principal", "resource_principal"}
+        ):
+            self._oci_target_error = context_error or (
+                "Unable to determine the OCI region from kubeconfig. "
+                "Use --region or --compartment-id as an override."
+            )
+            return
+
+        try:
+            self.options.compartment_id = self._oci().get_cluster_compartment_id(
+                self.options.cluster_id
+            )
+        except Exception as exc:
+            self._oci_target_error = (
+                "Automatic compartment discovery from the OKE cluster failed: "
+                f"{exc}. Use --compartment-id as an override."
+            )
+        else:
+            self._oci_target_error = context_error
+
     def _k8s(self) -> KubernetesBackend:
         if self._k8s_backend is None:
             self._k8s_backend = KubernetesBackend(
@@ -87,6 +195,12 @@ class DiscoveryService:
             )
         return self._oci_backend
 
+    def oci_backend(self) -> OciBackend:
+        """Return the OCI backend configured with the resolved target region."""
+
+        self.resolve_oci_target()
+        return self._oci()
+
     def _discover_kubernetes(self, snapshot: DiscoverySnapshot) -> list[NodeInfo]:
         if self.options.skip_kubernetes:
             return []
@@ -105,7 +219,11 @@ class DiscoveryService:
             return []
         if not self.options.compartment_id:
             snapshot.warnings.append(
-                "OCI discovery skipped: --compartment-id or OCI_COMPARTMENT_ID is required."
+                "OCI worker-pool discovery skipped: "
+                + (
+                    self._oci_target_error
+                    or "the compartment could not be determined; use --compartment-id as an override."
+                )
             )
             return []
 
@@ -160,6 +278,10 @@ class DiscoveryService:
         ):
             return []
         if not self.options.cluster_id:
+            if self._oci_target_error:
+                snapshot.warnings.append(
+                    f"OKE add-on discovery skipped: {self._oci_target_error}"
+                )
             return []
         try:
             return self._oci().list_cluster_addons(self.options.cluster_id)

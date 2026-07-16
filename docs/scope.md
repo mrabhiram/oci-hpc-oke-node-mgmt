@@ -11,8 +11,19 @@ Management Tool.
 - pool, node, topology, add-on, autoscaler, and reconcile views
 - JSON/CSV/table output
 - graceful warnings when one discovery source is unavailable
+- automatic OKE cluster OCID and region discovery from the selected OCI-generated
+  kubeconfig context
+- automatic compartment discovery from the resolved cluster through the OCI OKE
+  `GetCluster` API
+- explicit CLI and environment target overrides with deterministic precedence
+- multi-file kubeconfig loading and explicit, current, or unambiguous single-context
+  selection
+- instance and resource principal propagation to the kubeconfig OCI CLI exec plugin
+- consistent process exit status from console-script and Python module entrypoints
 - managed OKE Compute Cluster placement and host-group discovery
 - suppression of OKE-internal Compute Cluster backing instance pools
+- ownership-aware mutation routing between OKE node pools, legacy Cluster
+  Networks, and standalone Instance Pools
 - read-only OKE add-on lifecycle and installed-version discovery
 - strict RDMA topology validation that rejects missing and sentinel IMDS values
 - RDMA VF readiness when `NvidiaNetworkOperator` is active
@@ -27,6 +38,7 @@ Management Tool.
 
 ## Documentation
 
+- [`architecture.md`](architecture.md)
 - [`controller-install.md`](controller-install.md)
 
 ## Not Implemented Yet

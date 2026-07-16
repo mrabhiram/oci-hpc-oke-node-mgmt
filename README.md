@@ -6,6 +6,8 @@ This tool provides inventory, safety visibility, and guarded node-pool
 management for OCI HPC OKE clusters:
 
 - discover managed OKE node pools, including Compute Cluster placement `[Implemented]`
+- discover the OKE cluster OCID and region from kubeconfig, then resolve the
+  compartment through OKE `GetCluster` `[Implemented]`
 - discover RDMA cluster-network-backed instance pools `[Implemented]`
 - suppress OKE-internal backing instance pools from standalone pool inventory `[Implemented]`
 - discover Kubernetes nodes `[Implemented]`
@@ -38,6 +40,10 @@ python -m pip install .
 ```
 
 Python 3.9 or newer is supported.
+
+See [`docs/architecture.md`](docs/architecture.md) for the target-discovery
+algorithm and the API routing used for managed Compute Cluster and legacy
+Cluster Network worker pools.
 
 This installs two entrypoints backed by the same code:
 
@@ -75,14 +81,14 @@ Global options:
 | Option | Description |
 | --- | --- |
 | `--version` | Print the tool version. |
-| `--compartment-id <ocid>` | OCI compartment OCID used for OCI discovery and mutations. |
-| `--cluster-id <ocid>` | OKE cluster OCID used to filter managed node pools. |
-| `--region <region>` | OCI region, for example `us-ashburn-1`. |
-| `--auth config_file\|instance_principal\|resource_principal\|none` | OCI authentication method. Use `none` for Kubernetes-only discovery. |
+| `--compartment-id <ocid>` | Optional compartment override. By default, the compartment is read from the OKE cluster. |
+| `--cluster-id <ocid>` | Optional OKE cluster override. By default, the cluster OCID is read from kubeconfig. |
+| `--region <region>` | Optional region override. By default, the region is read from kubeconfig. |
+| `--auth config_file\|instance_principal\|resource_principal\|none` | OCI API authentication method. Use `none` to disable OCI API calls; kubeconfig authentication remains independent. |
 | `--oci-config-file <path>` | OCI config file path when using config-file authentication. |
 | `--oci-profile <profile>` | OCI config profile when using config-file authentication. |
-| `--kubeconfig <path>` | kubeconfig path. |
-| `--context <name>` | kubeconfig context. |
+| `--kubeconfig <path>` | kubeconfig path used for Kubernetes access and OKE target discovery. |
+| `--context <name>` | kubeconfig context used for Kubernetes access and OKE target discovery. |
 | `--in-cluster` | Use Kubernetes in-cluster configuration. |
 | `--skip-oci` | Skip OCI discovery. |
 | `--skip-kubernetes` | Skip Kubernetes discovery. |
@@ -134,31 +140,56 @@ The tool has two discovery sources:
 - Kubernetes API, using kubeconfig or in-cluster config
 - OCI API, using config-file auth, instance principals, or resource principals
 
-On an OKE HPC operator host, the normal command will look like:
+On an OKE HPC operator host with `kubectl` configured for the cluster, no OCI
+resource OCIDs are required on the command line:
 
 ```bash
-mgmt-oke \
-  --auth instance_principal \
-  --region us-ashburn-1 \
-  --compartment-id ocid1.compartment.oc1..example \
-  --cluster-id ocid1.cluster.oc1.iad.example \
-  pools list
+mgmt-oke --auth instance_principal pools list
 ```
 
-For Kubernetes-only discovery:
+The tool reads the OKE cluster OCID and region from the OCI CLI exec arguments
+in the selected kubeconfig context. It then calls the OCI OKE `GetCluster` API
+and reads the cluster's compartment OCID. Selection uses `--context` when
+provided, then `current-context`, then the only unambiguous cluster in
+kubeconfig.
 
-```bash
-mgmt-oke --auth none nodes list
+The resulting flow is:
+
+```text
+selected kubeconfig context
+  -> cluster OCID and region
+  -> OKE GetCluster(cluster OCID)
+  -> compartment OCID
+  -> worker-pool and add-on discovery
 ```
 
-Useful environment variables:
+When `--auth instance_principal` or `--auth resource_principal` is selected, the
+tool also supplies that authentication method to the kubeconfig OCI CLI exec
+plugin unless `OCI_CLI_AUTH` is already set explicitly.
+
+Explicit command-line options and environment variables take precedence over
+automatic discovery. They remain available for multi-cluster kubeconfigs,
+in-cluster execution, and other nonstandard environments.
+
+For Kubernetes-only discovery on an operator host, retain authentication for
+the kubeconfig exec plugin and skip OCI inventory calls:
 
 ```bash
+mgmt-oke --auth instance_principal --skip-oci nodes list
+```
+
+Use `--auth none` when OCI API discovery is disabled and the selected
+kubeconfig does not need the tool to supply an OCI CLI authentication method.
+
+Optional environment defaults and overrides:
+
+```bash
+export OCI_AUTH=instance_principal
+export OCI_CLI_AUTH=instance_principal
+export KUBECONFIG=$HOME/.kube/config
 export OCI_COMPARTMENT_ID=ocid1.compartment.oc1..example
 export OKE_CLUSTER_ID=ocid1.cluster.oc1.iad.example
 export OCI_REGION=us-ashburn-1
-export OCI_AUTH=instance_principal
-export KUBECONFIG=$HOME/.kube/config
 ```
 
 ## Commands
@@ -182,15 +213,22 @@ mgmt-oke pools get oke-rdma
 mgmt-oke --format json pools list
 ```
 
-OCI HPC OKE v26.7 supports two RDMA worker ownership models:
+OCI HPC OKE v26.7 deploys GPU with RDMA workers as managed OKE node pools
+placed in Compute Clusters by default. Legacy deployments can expose a
+self-managed Cluster Network with an embedded Instance Pool. The tool supports
+both ownership models:
 
 | Pool model | Inventory | Resize operation | Specific node removal |
 | --- | --- | --- | --- |
+| Standard managed OKE node pool | `kind=node-pool`, `placement=standard` | OKE `UpdateNodePool` with only the desired size | OKE `DeleteNode` |
 | Managed OKE node pool placed in a Compute Cluster | `kind=node-pool`, `placement=compute-cluster` | OKE `UpdateNodePool` with only the desired size | OKE `DeleteNode` |
 | Self-managed Cluster Network instance pool | `kind=cluster-network`, `placement=cluster-network` | Compute Management `UpdateClusterNetwork` | Instance-pool detach with automatic termination |
+| Standalone Instance Pool | `kind=instance-pool` | Compute Management `UpdateInstancePool` | Instance-pool detach with automatic termination |
 
 The Compute Cluster is placement metadata for a managed OKE pool. The tool does
-not resize or detach its OKE-internal backing instance pool directly.
+not resize or detach its OKE-internal backing Instance Pool directly. Discovery
+suppresses that internal resource from standalone pool output, preventing one
+managed RDMA pool from appearing twice.
 
 Add one node to a pool:
 
@@ -217,6 +255,11 @@ OCI API from the pool ownership metadata:
 ```bash
 mgmt-oke pools resize oke-rdma --delta 1 --wait --yes
 ```
+
+For a managed Compute Cluster-backed pool, OKE creates the new node and places
+it in the existing Compute Cluster. For a legacy Cluster Network pool, Compute
+Management increases the size of the existing embedded Instance Pool; its
+existing Instance Configuration supplies cloud-init and bootstrap data.
 
 ### Nodes
 
@@ -292,10 +335,21 @@ After installing the package, run the unit-test suite from the project root:
 python -m unittest discover -s tests -v
 ```
 
-## Current Scope
+For lint and type checks, install the development tools and run:
 
-See [`docs/scope.md`](docs/scope.md) for implemented features and planned
-items.
+```bash
+python -m pip install ".[dev]"
+ruff check src tests
+mypy src
+```
+
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md): target discovery, ownership
+  classification, mutation API routing, readiness, and safety boundaries
+- [`docs/controller-install.md`](docs/controller-install.md): operator node
+  prerequisites, installation, authentication, validation, and troubleshooting
+- [`docs/scope.md`](docs/scope.md): implemented features and planned items
 
 ## Cluster Validation
 
@@ -316,21 +370,18 @@ After installing the tool on a controller/operator node:
 3. Run Kubernetes-only discovery:
 
    ```bash
-   mgmt-oke --auth none reconcile
+   mgmt-oke --auth instance_principal --skip-oci reconcile
    ```
 
 4. Confirm OKE add-on status:
 
    ```bash
-   mgmt-oke addons status
+   mgmt-oke --auth instance_principal addons status
    ```
 
-5. Run full OCI + Kubernetes discovery:
+5. Run full OCI + Kubernetes discovery. The cluster, region, and compartment
+   are resolved automatically:
 
    ```bash
-   mgmt-oke --auth instance_principal \
-     --region <region> \
-     --compartment-id <compartment_ocid> \
-     --cluster-id <oke_cluster_ocid> \
-     reconcile
+   mgmt-oke --auth instance_principal reconcile
    ```

@@ -10,6 +10,14 @@ requires-python = ">=3.9"
 dependencies = [
   "kubernetes>=29.0.0",
   "oci>=2.181.1",
+  "PyYAML>=5.4.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.11",
+  "ruff>=0.8",
+  "types-PyYAML>=6.0",
 ]
 
 [project.scripts]
@@ -18,3 +26,7 @@ kubectl-oke = "oke_hpc_mgmt.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.mypy]
+python_version = "3.9"
+ignore_missing_imports = true

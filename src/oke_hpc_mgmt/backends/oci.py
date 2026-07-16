@@ -151,6 +151,19 @@ class OciBackend:
             )
         return pools
 
+    def get_cluster_compartment_id(self, cluster_id: str) -> str:
+        response = self._call(
+            "OKE cluster lookup",
+            self.container_engine.get_cluster,
+            cluster_id,
+        )
+        compartment_id = getattr(response.data, "compartment_id", None)
+        if not isinstance(compartment_id, str) or not compartment_id:
+            raise OciDiscoveryError(
+                f"OKE cluster {cluster_id} did not return a compartment OCID."
+            )
+        return compartment_id
+
     def list_cluster_addons(self, cluster_id: str) -> list[AddonInfo]:
         response = self.oci.pagination.list_call_get_all_results(
             self.container_engine.list_addons,

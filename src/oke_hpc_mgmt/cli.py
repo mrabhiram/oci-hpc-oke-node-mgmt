@@ -64,6 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     if not hasattr(args, "handler"):
         parser.print_help()
         return 0
+    _configure_oci_cli_auth(args.auth)
     try:
         return args.handler(args)
     except KeyboardInterrupt:
@@ -78,28 +79,73 @@ class CliOperationError(RuntimeError):
     """Raised when an asynchronous CLI operation cannot be completed safely."""
 
 
+def _configure_oci_cli_auth(auth: str) -> None:
+    if auth in {"instance_principal", "resource_principal"} and not os.environ.get(
+        "OCI_CLI_AUTH"
+    ):
+        os.environ["OCI_CLI_AUTH"] = auth
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=_program_name(),
         description="Management CLI for OCI HPC OKE worker pools and nodes.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    parser.add_argument("--compartment-id", default=os.getenv("OCI_COMPARTMENT_ID"))
-    parser.add_argument("--cluster-id", default=os.getenv("OKE_CLUSTER_ID"))
-    parser.add_argument("--region", default=os.getenv("OCI_REGION"))
+    parser.add_argument(
+        "--compartment-id",
+        default=os.getenv("OCI_COMPARTMENT_ID"),
+        help="OCI compartment OCID override. By default it is resolved from the OKE cluster.",
+    )
+    parser.add_argument(
+        "--cluster-id",
+        default=os.getenv("OKE_CLUSTER_ID"),
+        help="OKE cluster OCID override. By default it is read from the selected kubeconfig context.",
+    )
+    parser.add_argument(
+        "--region",
+        default=os.getenv("OCI_REGION"),
+        help="OCI region override. By default it is read from the selected kubeconfig context.",
+    )
     parser.add_argument(
         "--auth",
         choices=("config_file", "instance_principal", "resource_principal", "none"),
         default=os.getenv("OCI_AUTH", "config_file"),
-        help="OCI authentication method. Use 'none' for Kubernetes-only discovery.",
+        help=(
+            "OCI API authentication method. Use 'none' to disable OCI API calls; "
+            "kubeconfig authentication remains independent."
+        ),
     )
     parser.add_argument("--oci-config-file", default=os.getenv("OCI_CONFIG_FILE"))
     parser.add_argument("--oci-profile", default=os.getenv("OCI_PROFILE"))
-    parser.add_argument("--kubeconfig", default=os.getenv("KUBECONFIG"))
-    parser.add_argument("--context", default=os.getenv("KUBE_CONTEXT"))
-    parser.add_argument("--in-cluster", action="store_true")
-    parser.add_argument("--skip-oci", action="store_true")
-    parser.add_argument("--skip-kubernetes", action="store_true")
+    parser.add_argument(
+        "--kubeconfig",
+        default=os.getenv("KUBECONFIG"),
+        help="kubeconfig path used for Kubernetes access and automatic OKE target discovery.",
+    )
+    parser.add_argument(
+        "--context",
+        default=os.getenv("KUBE_CONTEXT"),
+        help="kubeconfig context used for Kubernetes access and automatic OKE target discovery.",
+    )
+    parser.add_argument(
+        "--in-cluster",
+        action="store_true",
+        help=(
+            "Use Kubernetes in-cluster configuration. Automatic kubeconfig target "
+            "discovery is unavailable."
+        ),
+    )
+    parser.add_argument(
+        "--skip-oci",
+        action="store_true",
+        help="Skip OCI inventory and disable OCI-backed mutations.",
+    )
+    parser.add_argument(
+        "--skip-kubernetes",
+        action="store_true",
+        help="Skip Kubernetes node, workload, topology, autoscaler, and Kueue discovery.",
+    )
     parser.add_argument(
         "--format",
         "--output",
@@ -308,11 +354,16 @@ def cmd_pools_resize(args: argparse.Namespace) -> int:
     if args.auth == "none" or args.skip_oci:
         print("Resize requires OCI discovery. Use --auth instance_principal on the operator host.", file=sys.stderr)
         return 2
-    if not args.compartment_id:
-        print("Resize requires --compartment-id or OCI_COMPARTMENT_ID.", file=sys.stderr)
-        return 2
-
-    snapshot = discover(args, include_pod_counts=True, include_autoscaler=True, include_kueue=False)
+    service = DiscoveryService(
+        options_from_args(
+            args,
+            include_pod_counts=True,
+            include_autoscaler=True,
+            include_kueue=False,
+        )
+    )
+    service.resolve_oci_target(require_compartment=True)
+    snapshot = service.discover()
     pool = snapshot.pool_by_name(args.pool)
     if not pool:
         print(f"Pool not found: {args.pool}", file=sys.stderr)
@@ -340,6 +391,7 @@ def cmd_pools_resize(args: argparse.Namespace) -> int:
         if args.wait:
             pool = _wait_for_pool_size(
                 args,
+                service,
                 pool.name,
                 target_size,
                 require_rdma_vf=pool.rdma_vf_required,
@@ -357,7 +409,7 @@ def cmd_pools_resize(args: argparse.Namespace) -> int:
         print("Resize cancelled.", file=sys.stderr)
         return 130
 
-    backend = DiscoveryService(options_from_args(args))._oci()
+    backend = service.oci_backend()
     if pool.kind == "node-pool" and pool.node_pool_id:
         work_request_id = backend.resize_managed_node_pool(pool.node_pool_id, target_size)
     elif pool.kind == "cluster-network" and pool.cluster_network_id and pool.instance_pool_id:
@@ -375,6 +427,7 @@ def cmd_pools_resize(args: argparse.Namespace) -> int:
     if args.wait:
         pool = _wait_for_pool_size(
             args,
+            service,
             pool.name,
             target_size,
             require_rdma_vf=pool.rdma_vf_required,
@@ -421,11 +474,11 @@ def cmd_nodes_remove(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    if not args.compartment_id:
-        print("Node removal requires --compartment-id or OCI_COMPARTMENT_ID.", file=sys.stderr)
-        return 2
-
-    snapshot = discover(args, include_autoscaler=True, include_kueue=False)
+    service = DiscoveryService(
+        options_from_args(args, include_autoscaler=True, include_kueue=False)
+    )
+    service.resolve_oci_target(require_compartment=True)
+    snapshot = service.discover()
     node = snapshot.node_by_identifier(args.node)
     if not node:
         print(f"Node not found: {args.node}", file=sys.stderr)
@@ -478,7 +531,7 @@ def cmd_nodes_remove(args: argparse.Namespace) -> int:
         print("Node removal cancelled.", file=sys.stderr)
         return 130
 
-    backend = DiscoveryService(options_from_args(args))._oci()
+    backend = service.oci_backend()
     if pool.kind == "node-pool" and pool.node_pool_id:
         work_request_id = backend.delete_node(
             pool.node_pool_id,
@@ -500,6 +553,7 @@ def cmd_nodes_remove(args: argparse.Namespace) -> int:
     if args.wait:
         pool = _wait_for_node_removed(
             args,
+            service,
             pool.name,
             node,
             target_size,
@@ -532,17 +586,18 @@ def cmd_addons_status(args: argparse.Namespace) -> int:
     if args.auth == "none" or args.skip_oci:
         print("OKE add-on discovery requires OCI auth.", file=sys.stderr)
         return 2
-    if not args.cluster_id:
-        print("OKE add-on discovery requires --cluster-id or OKE_CLUSTER_ID.", file=sys.stderr)
-        return 2
-    snapshot = discover(
-        args,
-        include_pod_counts=False,
-        include_autoscaler=False,
-        include_kueue=False,
-        include_pools=False,
-        skip_kubernetes=True,
+    service = DiscoveryService(
+        options_from_args(
+            args,
+            include_pod_counts=False,
+            include_autoscaler=False,
+            include_kueue=False,
+            include_pools=False,
+            skip_kubernetes=True,
+        )
     )
+    service.resolve_oci_target(require_cluster=True)
+    snapshot = service.discover()
     print_records(addon_rows(snapshot.addons), args.output, ADDON_COLUMNS)
     print_warnings(snapshot.warnings)
     return 0
@@ -575,14 +630,19 @@ def _confirm_node_remove(node_name: str, pool_name: str, decrement_size: bool) -
 
 def _wait_for_pool_size(
     args: argparse.Namespace,
+    service: DiscoveryService,
     pool_name: str,
     target_size: int,
     require_rdma_vf: bool = False,
 ) -> WorkerPoolInfo:
     deadline = time.monotonic() + args.timeout
     last_status = ""
+    service.options.include_pod_counts = False
+    service.options.include_autoscaler = False
+    service.options.include_kueue = False
+    service.options.include_addons = False
     while True:
-        snapshot = discover(args, include_pod_counts=False, include_autoscaler=False, include_kueue=False)
+        snapshot = service.discover()
         pool = snapshot.pool_by_name(pool_name)
         if pool is None:
             raise CliOperationError(f"Pool disappeared while waiting: {pool_name}")
@@ -610,6 +670,7 @@ def _wait_for_pool_size(
 
 def _wait_for_node_removed(
     args: argparse.Namespace,
+    service: DiscoveryService,
     pool_name: str,
     original_node: NodeInfo,
     target_size: int,
@@ -617,8 +678,12 @@ def _wait_for_node_removed(
 ) -> WorkerPoolInfo:
     deadline = time.monotonic() + args.timeout
     last_status = ""
+    service.options.include_pod_counts = False
+    service.options.include_autoscaler = False
+    service.options.include_kueue = False
+    service.options.include_addons = False
     while True:
-        snapshot = discover(args, include_pod_counts=False, include_autoscaler=False, include_kueue=False)
+        snapshot = service.discover()
         pool = snapshot.pool_by_name(pool_name)
         if pool is None:
             raise CliOperationError(f"Pool disappeared while waiting: {pool_name}")

@@ -42,10 +42,15 @@ class _ComputeManagement:
 
 
 class _ContainerEngine:
-    def __init__(self, node_pools=None, addons=None):
+    def __init__(self, node_pools=None, addons=None, cluster=None):
         self.node_pools = node_pools or []
         self.addons = addons or []
+        self.cluster = cluster
         self.calls = []
+
+    def get_cluster(self, cluster_id):
+        self.calls.append(("get_cluster", cluster_id))
+        return SimpleNamespace(data=self.cluster)
 
     def list_node_pools(self, **kwargs):
         self.calls.append(("list_node_pools", kwargs))
@@ -189,6 +194,24 @@ class OciBackendMutationTests(unittest.TestCase):
 
 
 class OciBackendDiscoveryTests(unittest.TestCase):
+    def test_get_cluster_compartment_id(self):
+        backend = _backend()
+        backend._container_engine = _ContainerEngine(
+            cluster=SimpleNamespace(compartment_id="compartment-1")
+        )
+
+        compartment_id = backend.get_cluster_compartment_id("cluster-1")
+
+        self.assertEqual("compartment-1", compartment_id)
+        self.assertEqual(("get_cluster", "cluster-1"), backend._container_engine.calls[-1])
+
+    def test_get_cluster_compartment_id_requires_response_field(self):
+        backend = _backend()
+        backend._container_engine = _ContainerEngine(cluster=SimpleNamespace())
+
+        with self.assertRaisesRegex(OciDiscoveryError, "did not return a compartment"):
+            backend.get_cluster_compartment_id("cluster-1")
+
     def test_managed_compute_cluster_pool_preserves_placement_metadata(self):
         node_config = SimpleNamespace(
             size=2,
