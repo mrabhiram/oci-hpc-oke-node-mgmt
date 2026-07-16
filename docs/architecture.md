@@ -204,6 +204,9 @@ places new RDMA workers in the associated Compute Cluster.
 The tool does not resize the Compute Cluster and does not directly resize its
 OKE-internal backing Instance Pool.
 
+Pool-level size reduction delegates instance selection to OKE. The specific
+node API described below is used when the operator must select the worker.
+
 ### Managed Node Removal Or Replacement
 
 For a node owned by a managed OKE pool, including a Compute Cluster-backed RDMA
@@ -229,6 +232,9 @@ To add or remove capacity, the CLI reads the current Cluster Network, preserves
 its other embedded pool fields, changes only the selected pool size, and calls
 `UpdateClusterNetwork`. It does not recreate the Instance Configuration or
 rerun a separate worker-pool creation workflow.
+
+Pool-level size reduction delegates instance selection to Compute Management.
+Use specific node removal when worker identity matters.
 
 ### Legacy Node Removal Or Replacement
 

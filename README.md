@@ -214,6 +214,10 @@ mgmt-oke pools get oke-rdma
 mgmt-oke --format json pools list
 ```
 
+`pools list` and `pools get` use a fast inventory path. They do not scan
+workload pod counts, Cluster Autoscaler deployments, or Kueue resources. Use
+`reconcile` when those cross-system correlations are required.
+
 OCI HPC OKE v26.7 deploys GPU with RDMA workers as managed OKE node pools
 placed in Compute Clusters by default. Legacy deployments can expose a
 self-managed Cluster Network with an embedded Instance Pool. The tool supports
@@ -242,6 +246,9 @@ Remove one node from a pool:
 ```bash
 mgmt-oke pools resize oke-cpu --delta -1 --wait --yes
 ```
+
+Pool-level scale-down changes desired capacity but does not select which worker
+OCI removes. Use `nodes remove` when a particular worker must be removed.
 
 Set a pool to an exact desired size:
 
@@ -280,6 +287,10 @@ Replace a specific RDMA worker while keeping the pool at its current size:
 ```bash
 mgmt-oke nodes remove <rdma-node-name> --keep-size --wait --yes
 ```
+
+Without `--keep-size`, the selected worker is removed and desired pool size is
+decremented. With `--keep-size`, the selected worker is removed and the owning
+service launches a replacement at the existing desired size.
 
 For Slinky-managed pools, node removal, replacement, and pool scale-down are
 refused because they require a Slurm-aware drain. Pool scale-up remains

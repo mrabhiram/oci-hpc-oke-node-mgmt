@@ -121,8 +121,10 @@ mgmt-oke --auth instance_principal autoscaler status
 ```
 
 Use this command or the full `reconcile` view before manual mutation. The fast
-`pools list` view does not scan Cluster Autoscaler deployments, while resize and
-node-removal preflight always performs the ownership check.
+`pools list` and `pools get` views do not scan workload pod counts, Cluster
+Autoscaler deployments, or Kueue resources. Their autoscaler and Kueue fields
+are therefore not authoritative. Resize and node-removal preflight always
+performs the required ownership and workload checks.
 
 ## Full Reconciliation
 
@@ -130,8 +132,9 @@ node-removal preflight always performs the ownership check.
 mgmt-oke --auth instance_principal reconcile
 ```
 
-Use full reconciliation when comparing pool counts, autoscaler ownership,
-add-ons, and Kueue resources in one operation.
+Use full reconciliation when comparing pool counts, workload state, autoscaler
+ownership, add-ons, Kueue resources, and ResourceFlavor-to-pool matches in one
+operation.
 
 ## Partial Discovery Modes
 

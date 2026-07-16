@@ -56,6 +56,10 @@ For the legacy model, Compute Management increases the embedded Instance Pool
 size through `UpdateClusterNetwork`. Its existing Instance Configuration
 already contains cloud-init and OKE bootstrap configuration.
 
+No worker-pool creation command or per-instance bootstrap step is performed by
+`mgmt-oke`. The owning service launches capacity from the existing pool
+configuration.
+
 ## Remove RDMA Capacity
 
 Reduce desired pool size by one without choosing a specific worker:
@@ -63,6 +67,10 @@ Reduce desired pool size by one without choosing a specific worker:
 ```bash
 mgmt-oke --auth instance_principal pools resize oke-rdma --delta -1 --wait
 ```
+
+This operation delegates worker selection to OKE or Compute Management. It is
+appropriate when any healthy capacity unit can leave; it is not a way to pick a
+particular A100 or other RDMA worker.
 
 Choose a specific worker and decrement desired size:
 
@@ -83,6 +91,27 @@ mgmt-oke --auth instance_principal nodes remove <rdma-node-name-or-ip> \
 Managed pools use OKE `DeleteNode`. Legacy pools detach and automatically
 terminate the selected Instance Pool instance. `--keep-size` preserves desired
 capacity in both cases.
+
+For the legacy model, default removal sends `is_decrement_size=true` to the
+embedded Instance Pool. Replacement sends `is_decrement_size=false` together
+with automatic termination, so the selected instance is terminated and the
+pool launches another instance from its existing Instance Configuration.
+
+## Understand RDMA Convergence
+
+OCI instance state, Kubernetes registration, topology labels, and allocatable
+GPU resources can become ready in separate polling intervals. A scale-up can
+therefore progress through states such as:
+
+```text
+desired=3 oci_active=2 k8s_ready=2 gpu_ready=2 rdma_ready=2
+desired=3 oci_active=3 k8s_ready=2 gpu_ready=2 rdma_ready=2
+desired=3 oci_active=3 k8s_ready=3 gpu_ready=2 rdma_ready=3
+desired=3 oci_active=3 k8s_ready=3 gpu_ready=3 rdma_ready=3
+```
+
+`--wait` continues until every applicable value reaches the target. When the
+NVIDIA Network Operator is active, `rdma_vf_ready` must also reach the target.
 
 ## Verify Topology and Resources
 

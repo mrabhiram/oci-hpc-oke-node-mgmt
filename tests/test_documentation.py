@@ -135,6 +135,36 @@ class DocumentationTests(unittest.TestCase):
         self.assertGreater(parsed_commands, 40)
         self.assertEqual([], failures, "Invalid documented commands:\n" + "\n".join(failures))
 
+    def test_pool_inventory_docs_describe_fast_path_limits(self):
+        discovery_guide = (
+            PROJECT_ROOT / "docs" / "discovering-worker-pools-and-nodes.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("do not scan workload pod counts", discovery_guide)
+        self.assertIn("Kueue resources", discovery_guide)
+        self.assertIn("full `reconcile`", discovery_guide)
+
+    def test_lifecycle_docs_distinguish_capacity_from_node_selection(self):
+        resize_guide = (PROJECT_ROOT / "docs" / "resizing-worker-pools.md").read_text(
+            encoding="utf-8"
+        )
+        removal_guide = (
+            PROJECT_ROOT / "docs" / "removing-and-replacing-worker-nodes.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("Pool-level scale-down does not select a worker", resize_guide)
+        self.assertIn("use `nodes remove`", resize_guide)
+        self.assertIn("always targets a specific Kubernetes worker", removal_guide)
+
+    def test_wait_docs_cover_layered_resource_convergence(self):
+        readiness_guide = (
+            PROJECT_ROOT / "docs" / "verifying-gpu-and-rdma-readiness.md"
+        ).read_text(encoding="utf-8")
+
+        for field in ("oci_active", "k8s_ready", "gpu_ready", "rdma_ready"):
+            self.assertIn(field, readiness_guide)
+        self.assertIn("node_present=False", readiness_guide)
+
 
 if __name__ == "__main__":
     unittest.main()

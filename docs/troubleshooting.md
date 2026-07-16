@@ -29,7 +29,20 @@ kubectl get nodes
 ```
 
 A minimal non-interactive shell might not include `/home/ubuntu/bin` even when
-an interactive login does. Set the documented `PATH` before invoking the tool.
+an interactive login does. It might also omit the auth selection used by the
+kubeconfig exec plugin. Set both values explicitly for cron, SSH one-liners,
+and other non-interactive execution:
+
+```bash
+export PATH=/home/ubuntu/bin:/usr/local/bin:/usr/bin:/bin
+export OCI_CLI_AUTH=instance_principal
+kubectl get nodes
+```
+
+When `mgmt-oke --auth instance_principal` starts the Kubernetes client, it
+supplies `OCI_CLI_AUTH=instance_principal` to the exec plugin unless that
+variable is already set. Direct `kubectl` does not receive that setting from
+`mgmt-oke`.
 
 ## Kubernetes Unauthorized
 
@@ -170,6 +183,12 @@ mgmt-oke --auth instance_principal nodes list --pool <pool-name>
 
 Inspect the OCI work request and avoid submitting a duplicate mutation until
 the original state is understood.
+
+Some Compute Management responses do not expose a work request identifier. In
+that case, use the Cluster Network or Instance Pool lifecycle state together
+with `pools get` and `nodes list` as the authoritative progress view. Repeating
+the current exact target with `--wait` is non-mutating and can be used as a
+convergence barrier.
 
 ## GPU or RDMA Readiness Is Incomplete
 

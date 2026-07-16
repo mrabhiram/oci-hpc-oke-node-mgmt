@@ -9,6 +9,10 @@ replace it while preserving the pool's desired size.
 identified by Kubernetes name, Slinky name, internal IP, provider ID, or OCI
 instance OCID.
 
+Use `nodes remove` instead of pool-level scale-down when the identity of the
+departing worker matters. `pools resize --delta -1` reduces capacity but leaves
+worker selection to the owning OCI service.
+
 Default behavior removes the selected node and decrements desired pool size.
 `--keep-size` removes the selected node without decrementing desired size, so
 the owning service launches a replacement.
@@ -87,6 +91,10 @@ mgmt-oke --auth instance_principal nodes list --pool <pool-name>
 For replacement, verify that the original node is absent and a new Ready node
 has joined. For GPU or RDMA pools, `--wait` also checks applicable resource
 readiness.
+
+The replacement wait does not finish merely because the selected node has
+disappeared. It also requires desired size, active OCI membership, Kubernetes
+Ready count, and applicable GPU, RDMA topology, and RDMA VF counts to converge.
 
 ## Managed OKE Eviction Options
 

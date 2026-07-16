@@ -102,6 +102,15 @@ To persist it for future SSH sessions:
 printf '\nexport PATH=/home/ubuntu/bin:$PATH\n' >> /home/ubuntu/.bashrc
 ```
 
+For cron, remote one-liners, and other non-interactive shells, set a complete
+path explicitly. OCI-generated kubeconfig also needs the OCI CLI authentication
+method when `kubectl` is invoked directly:
+
+```bash
+export PATH=/home/ubuntu/bin:/usr/local/bin:/usr/bin:/bin
+export OCI_CLI_AUTH=instance_principal
+```
+
 Validate both command shapes:
 
 ```bash
@@ -208,6 +217,9 @@ Example managed or self-managed pool resize:
 ```bash
 mgmt-oke pools resize oke-cpu --delta 1 --wait
 ```
+
+A negative delta reduces capacity but does not select the departing worker. Use
+`nodes remove` when a particular worker must be removed.
 
 Example specific node replacement while keeping pool size:
 

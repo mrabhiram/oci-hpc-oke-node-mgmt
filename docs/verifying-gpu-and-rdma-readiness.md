@@ -126,11 +126,23 @@ mgmt-oke --auth instance_principal nodes remove <node-name-or-ip> \
 ```
 
 Wait status is printed only when a value changes. For a GPU with RDMA pool it
-can include:
+can progress through:
 
 ```text
-desired=2 oci_active=2 k8s_ready=2 gpu_ready=2 rdma_ready=2 rdma_vf_ready=2
+desired=3 oci_active=2 k8s_ready=2 gpu_ready=2 rdma_ready=2
+desired=3 oci_active=3 k8s_ready=2 gpu_ready=2 rdma_ready=2
+desired=3 oci_active=3 k8s_ready=3 gpu_ready=2 rdma_ready=3
+desired=3 oci_active=3 k8s_ready=3 gpu_ready=3 rdma_ready=3
 ```
+
+This ordering is not fixed. The important condition is that all applicable
+counts equal the target before the operation reports `ready` or `removed`.
+When RDMA VF readiness is required, the status also includes
+`rdma_vf_ready=<count>`.
+
+For `nodes remove --keep-size`, the waiter additionally requires
+`node_present=False` for the selected worker before accepting the replacement
+as complete.
 
 ## Troubleshooting
 
