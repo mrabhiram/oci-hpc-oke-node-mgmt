@@ -5,19 +5,38 @@ Management CLI for OCI HPC OKE clusters.
 This tool provides inventory, safety visibility, and guarded node-pool
 management for OCI HPC OKE clusters:
 
-- discover managed OKE node pools `[Implemented]`
+- discover managed OKE node pools, including Compute Cluster placement `[Implemented]`
+- discover the OKE cluster OCID and region from kubeconfig, then resolve the
+  compartment through OKE `GetCluster` `[Implemented]`
 - discover RDMA cluster-network-backed instance pools `[Implemented]`
+- suppress OKE-internal backing instance pools from standalone pool inventory `[Implemented]`
 - discover Kubernetes nodes `[Implemented]`
 - join Kubernetes nodes to OCI instances where possible `[Implemented]`
 - show GPU allocatable resources `[Implemented]`
-- show RDMA topology labels `[Implemented]`
+- validate OCI RDMA topology labels and reject missing or sentinel values `[Implemented]`
+- show OKE add-on lifecycle state and installed versions `[Implemented]`
+- require `nvidia.com/rdma-vf` readiness when the NVIDIA Network Operator add-on is active `[Implemented]`
 - show Cluster Autoscaler pool ownership `[Implemented]`
 - show Kueue resource counts and ResourceFlavor-to-pool matches `[Implemented]`
-- resize managed OKE node pools and self-managed cluster-network pools `[Implemented]`
-- remove or replace a specific managed or self-managed worker node `[Implemented]`
-- wait for OCI, Kubernetes, GPU, and RDMA readiness after pool changes `[Implemented]`
+- discover Slinky Slurm node aliases and protect Slinky workers from unsafe removal `[Implemented]`
+- resize standard and Compute Cluster-backed OKE node pools and self-managed cluster-network pools `[Implemented]`
+- add or remove pool capacity with explicit `pools add` and `pools remove` commands `[Implemented]`
+- preview every mutation as a validated operation plan with `--dry-run` `[Implemented]`
+- serialize concurrent mutations with a Kubernetes Lease `[Implemented]`
+- cordon, drain, and uncordon selected Kubernetes workers `[Implemented]`
+- remove, replace, or terminate one or more managed or self-managed workers `[Implemented]`
+- select nodes by identifiers or exact operational fields `[Implemented]`
+- project and sort node output for shell and automation workflows `[Implemented]`
+- wait for OCI, Kubernetes, GPU, RDMA topology, and applicable RDMA VF readiness `[Implemented]`
+- report concise cluster status and deterministic node, pool, GPU, RDMA, add-on, and scheduler health `[Implemented]`
+- derive actionable recommendations from failed or degraded health checks `[Implemented]`
+- validate OKE accelerator add-ons against discovered GPU and RDMA capacity `[Implemented]`
 
-Discovery commands are read-only. `pools resize` and `nodes remove` mutate OCI resources and require OCI auth plus either `--yes` or an interactive confirmation.
+Inventory, status, health, recommendation, topology, autoscaler, add-on status,
+and reconciliation commands are read-only. Pool capacity commands and node
+termination mutate OCI resources. Node maintenance commands mutate Kubernetes.
+Every mutation supports `--dry-run`, uses a Kubernetes Lease by default, and
+requires either `--yes` or an interactive typed confirmation.
 
 ## Install
 
@@ -34,6 +53,10 @@ python -m pip install .
 ```
 
 Python 3.9 or newer is supported.
+
+See [`docs/architecture.md`](docs/architecture.md) for the target-discovery
+algorithm and the API routing used for managed Compute Cluster and legacy
+Cluster Network worker pools.
 
 This installs two entrypoints backed by the same code:
 
@@ -71,18 +94,19 @@ Global options:
 | Option | Description |
 | --- | --- |
 | `--version` | Print the tool version. |
-| `--compartment-id <ocid>` | OCI compartment OCID used for OCI discovery and mutations. |
-| `--cluster-id <ocid>` | OKE cluster OCID used to filter managed node pools. |
-| `--region <region>` | OCI region, for example `us-ashburn-1`. |
-| `--auth config_file\|instance_principal\|resource_principal\|none` | OCI authentication method. Use `none` for Kubernetes-only discovery. |
+| `--compartment-id <ocid>` | Optional compartment override. By default, the compartment is read from the OKE cluster. |
+| `--cluster-id <ocid>` | Optional OKE cluster override. By default, the cluster OCID is read from kubeconfig. |
+| `--region <region>` | Optional region override. By default, the region is read from kubeconfig. |
+| `--auth config_file\|instance_principal\|resource_principal\|none` | OCI API authentication method. Use `none` to disable OCI API calls; kubeconfig authentication remains independent. |
 | `--oci-config-file <path>` | OCI config file path when using config-file authentication. |
 | `--oci-profile <profile>` | OCI config profile when using config-file authentication. |
-| `--kubeconfig <path>` | kubeconfig path. |
-| `--context <name>` | kubeconfig context. |
+| `--kubeconfig <path>` | kubeconfig path used for Kubernetes access and OKE target discovery. |
+| `--context <name>` | Explicit kubeconfig context override for troubleshooting. The current or only unambiguous context is used by default. |
 | `--in-cluster` | Use Kubernetes in-cluster configuration. |
 | `--skip-oci` | Skip OCI discovery. |
 | `--skip-kubernetes` | Skip Kubernetes discovery. |
 | `--format table\|json\|csv` | Output format. `table` is the default. |
+| `--debug` | Print an exception traceback when troubleshooting a failed command. |
 
 Command groups:
 
@@ -91,11 +115,22 @@ Command groups:
 | `pools list` | List discovered worker pools. |
 | `pools get <pool>` | Get one worker pool by name or OCID. |
 | `pools resize <pool> (--size <n> \| --delta <n>)` | Resize a managed OKE node pool, cluster network, or instance pool. |
-| `nodes list` | List Kubernetes nodes. |
-| `nodes get <identifier...>` | Get nodes by name, internal IP, provider ID, or instance OCID. |
-| `nodes remove <node>` | Remove or replace one specific managed or self-managed worker node. |
+| `pools add <pool> --count <n>` | Add `n` workers to desired pool capacity. |
+| `pools remove <pool> --count <n>` | Remove `n` workers from desired pool capacity; OCI selects the workers. |
+| `nodes list` | List and filter Kubernetes nodes. |
+| `nodes get <identifier...>` | Get nodes by Kubernetes name, Slurm name, internal IP, provider ID, or instance OCID. |
+| `nodes terminate <identifier...>` | Drain and terminate selected managed or self-managed workers. |
+| `nodes remove <identifier...>` | Compatibility alias for `nodes terminate`. |
+| `nodes cordon <identifier...>` | Mark selected workers unschedulable. |
+| `nodes drain <identifier...>` | Cordon workers and evict non-DaemonSet pods through the Eviction API. |
+| `nodes uncordon <identifier...>` | Mark selected workers schedulable. |
 | `topology list` | Group nodes by RDMA topology labels. |
 | `autoscaler status` | Show Cluster Autoscaler pool ownership. |
+| `addons status` | Show OKE add-on lifecycle state and installed versions. |
+| `addons validate` | Validate NFD, GPU Operator, Network Operator, GPU, and RDMA readiness. |
+| `status` | Show concise cluster capacity and health. |
+| `health run` | Run deterministic health checks by category or pool. |
+| `recommendations list` | Show actionable warnings and failures. |
 | `reconcile` | Show a full discovery snapshot. |
 
 Resize options:
@@ -104,9 +139,11 @@ Resize options:
 | --- | --- |
 | `--size <n>` | Set the worker pool to an exact desired size. |
 | `--delta <n>` | Change the current desired size by `n`. Positive values add nodes; negative values remove nodes. For example, `--delta 2` adds two nodes and `--delta -1` removes one node. |
-| `--wait` | Wait for the target OCI and Kubernetes counts. GPU/RDMA pools also wait for allocatable GPUs and RDMA topology readiness. |
+| `--wait` | Monitor the submitted OCI work request and wait for target OCI and Kubernetes counts. OCI failures are reported immediately. GPU/RDMA pools also wait for allocatable GPUs and valid RDMA topology; when `NvidiaNetworkOperator` is active, RDMA pools also wait for `nvidia.com/rdma-vf`. |
 | `--timeout <seconds>` | Maximum seconds to wait. Default: `1800`. |
 | `--poll-interval <seconds>` | Wait polling interval. Default: `30`. |
+| `--dry-run` | Validate ownership and safety, then print the operation plan without mutation. |
+| `--lock` / `--no-lock` | Use or bypass the Kubernetes mutation Lease. Locking is enabled by default. |
 | `--yes` | Do not prompt for confirmation. |
 
 Node removal options:
@@ -114,12 +151,19 @@ Node removal options:
 | Option | Description |
 | --- | --- |
 | `--keep-size` | Delete the node but keep the pool size so the backing pool replaces it. |
-| `--allow-workloads` | Allow removing a node that currently has non-system workload pods. |
+| `--drain` / `--no-drain` | Cordon and evict pods before termination. Drain is enabled by default. |
+| `--allow-workloads` | Allow `--no-drain` termination when workload pods are present. |
+| `--delete-emptydir-data` | Acknowledge deletion of pod-local `emptyDir` data during drain. |
+| `--force` | Allow drain of pods without a controller. |
+| `--grace-period <seconds>` | Pod termination grace period. Default: `30`. |
+| `--drain-timeout <seconds>` | Maximum time for Kubernetes eviction. Default: `600`. |
 | `--eviction-grace <duration>` | Managed OKE node eviction grace duration. Default: `PT10M`. |
 | `--force-after-grace` | For managed OKE pools, force compute deletion if pods cannot be evicted before the grace duration expires. |
-| `--wait` | Wait until the selected node is absent and the pool has converged. GPU/RDMA pools also wait for resource readiness. |
+| `--wait` | Monitor submitted OCI work requests, then wait until the selected node is absent and the pool has converged, including applicable GPU, RDMA topology, and RDMA VF readiness. |
 | `--timeout <seconds>` | Maximum seconds to wait. Default: `1800`. |
 | `--poll-interval <seconds>` | Wait polling interval. Default: `30`. |
+| `--dry-run` | Validate selection, ownership, drain constraints, and eviction admission without mutation. |
+| `--lock` / `--no-lock` | Use or bypass the Kubernetes mutation Lease. Locking is enabled by default. |
 | `--yes` | Do not prompt for confirmation. |
 
 ## Authentication
@@ -129,31 +173,57 @@ The tool has two discovery sources:
 - Kubernetes API, using kubeconfig or in-cluster config
 - OCI API, using config-file auth, instance principals, or resource principals
 
-On an OKE HPC operator host, the normal command will look like:
+On an OKE HPC operator host with `kubectl` configured for the cluster, no OCI
+resource OCIDs are required on the command line:
 
 ```bash
-mgmt-oke \
-  --auth instance_principal \
-  --region us-ashburn-1 \
-  --compartment-id ocid1.compartment.oc1..example \
-  --cluster-id ocid1.cluster.oc1.iad.example \
-  pools list
+mgmt-oke --auth instance_principal pools list
 ```
 
-For Kubernetes-only discovery:
+The tool reads the OKE cluster OCID and region from the OCI CLI exec arguments
+in the selected kubeconfig context. It then calls the OCI OKE `GetCluster` API
+and reads the cluster's compartment OCID. Selection uses `--context` when
+provided, then `current-context`, then the only unambiguous cluster in
+kubeconfig.
 
-```bash
-mgmt-oke --auth none nodes list
+The resulting flow is:
+
+```text
+selected kubeconfig context
+  -> cluster OCID and region
+  -> OKE GetCluster(cluster OCID)
+  -> compartment OCID
+  -> worker-pool and add-on discovery
 ```
 
-Useful environment variables:
+When `--auth instance_principal` or `--auth resource_principal` is selected, the
+tool also supplies that authentication method to the kubeconfig OCI CLI exec
+plugin unless `OCI_CLI_AUTH` is already set explicitly.
+
+Explicit resource-target options and their environment-variable equivalents
+take precedence over automatic discovery. They remain available for in-cluster
+execution and other nonstandard environments. Kubeconfig context selection has
+no environment-variable override.
+
+For Kubernetes-only discovery on an operator host, retain authentication for
+the kubeconfig exec plugin and skip OCI inventory calls:
 
 ```bash
+mgmt-oke --auth instance_principal --skip-oci nodes list
+```
+
+Use `--auth none` when OCI API discovery is disabled and the selected
+kubeconfig does not need the tool to supply an OCI CLI authentication method.
+
+Optional environment defaults and overrides:
+
+```bash
+export OCI_AUTH=instance_principal
+export OCI_CLI_AUTH=instance_principal
+export KUBECONFIG=$HOME/.kube/config
 export OCI_COMPARTMENT_ID=ocid1.compartment.oc1..example
 export OKE_CLUSTER_ID=ocid1.cluster.oc1.iad.example
 export OCI_REGION=us-ashburn-1
-export OCI_AUTH=instance_principal
-export KUBECONFIG=$HOME/.kube/config
 ```
 
 ## Commands
@@ -161,8 +231,8 @@ export KUBECONFIG=$HOME/.kube/config
 ### Full snapshot
 
 `reconcile` is read-only. It combines worker-pool and Kubernetes node inventory,
-Cluster Autoscaler ownership, GPU/RDMA capability status, and Kueue resource
-counts in one snapshot.
+OKE add-on status, Cluster Autoscaler ownership, GPU/RDMA capability status,
+Slinky aliases, and Kueue resource counts in one snapshot.
 
 ```bash
 mgmt-oke reconcile
@@ -177,17 +247,72 @@ mgmt-oke pools get oke-rdma
 mgmt-oke --format json pools list
 ```
 
+`pools list` and `pools get` use a fast inventory path. They do not scan
+workload pod counts, Cluster Autoscaler deployments, or Kueue resources. Use
+`reconcile` when those cross-system correlations are required.
+
+OCI HPC OKE v26.7 deploys GPU with RDMA workers as managed OKE node pools
+placed in Compute Clusters by default. Legacy deployments can expose a
+self-managed Cluster Network with an embedded Instance Pool. The tool supports
+both ownership models:
+
+| Pool model | Inventory | Resize operation | Specific node removal |
+| --- | --- | --- | --- |
+| Standard managed OKE node pool | `kind=node-pool`, `placement=standard` | OKE `UpdateNodePool` with only the desired size | OKE `DeleteNode` |
+| Managed OKE node pool placed in a Compute Cluster | `kind=node-pool`, `placement=compute-cluster` | OKE `UpdateNodePool` with only the desired size | OKE `DeleteNode` |
+| Self-managed Cluster Network instance pool | `kind=cluster-network`, `placement=cluster-network` | Compute Management `UpdateClusterNetwork` | Instance-pool detach with automatic termination |
+| Standalone Instance Pool | `kind=instance-pool` | Compute Management `UpdateInstancePool` | Instance-pool detach with automatic termination |
+
+The Compute Cluster is placement metadata for a managed OKE pool. The tool does
+not resize or detach its OKE-internal backing Instance Pool directly. Discovery
+suppresses that internal resource from standalone pool output, preventing one
+managed RDMA pool from appearing twice.
+
 Add one node to a pool:
 
 ```bash
-mgmt-oke pools resize oke-cpu --delta 1 --wait --yes
+mgmt-oke pools add oke-cpu --count 1 --wait --yes
 ```
 
 Remove one node from a pool:
 
 ```bash
-mgmt-oke pools resize oke-cpu --delta -1 --wait --yes
+mgmt-oke pools remove oke-cpu --count 1 --wait --yes
 ```
+
+The signed `--delta` form remains available: positive values add capacity and
+negative values remove capacity.
+
+Preview the same change without mutating OCI:
+
+```bash
+mgmt-oke pools resize oke-cpu --delta 1 --dry-run --format json
+```
+
+Example output:
+
+```json
+[
+  {
+    "current_size": 1,
+    "decrement_size": null,
+    "operation": "pool-resize",
+    "owner": "oke",
+    "pool": "oke-cpu",
+    "status": "planned",
+    "steps": ["update the managed OKE node-pool desired size"],
+    "target": "oke-cpu",
+    "target_size": 2,
+    "warnings": [
+      "This direct OCI mutation does not update Terraform or OCI Resource Manager input values; reconcile the declared pool size before the next apply."
+    ],
+    "workload_pods": 0
+  }
+]
+```
+
+Pool-level scale-down changes desired capacity but does not select which worker
+OCI removes. Use `nodes terminate` when a particular worker must be removed.
 
 Set a pool to an exact desired size:
 
@@ -195,11 +320,18 @@ Set a pool to an exact desired size:
 mgmt-oke pools resize oke-cpu --size 3 --wait --yes
 ```
 
-The same resize command applies to a self-managed RDMA cluster-network pool:
+The same resize command applies to managed Compute Cluster-backed RDMA pools and
+legacy self-managed RDMA Cluster Network pools. Discovery selects the correct
+OCI API from the pool ownership metadata:
 
 ```bash
 mgmt-oke pools resize oke-rdma --delta 1 --wait --yes
 ```
+
+For a managed Compute Cluster-backed pool, OKE creates the new node and places
+it in the existing Compute Cluster. For a legacy Cluster Network pool, Compute
+Management increases the size of the existing embedded Instance Pool; its
+existing Instance Configuration supplies cloud-init and bootstrap data.
 
 ### Nodes
 
@@ -209,15 +341,80 @@ mgmt-oke nodes list --pool oke-rdma
 mgmt-oke nodes list --rdma-only
 mgmt-oke nodes get 10.0.127.32
 mgmt-oke nodes get ocid1.instance.oc1.iad.example
-mgmt-oke nodes remove 10.0.127.32 --wait --yes
-mgmt-oke nodes remove 10.0.127.32 --keep-size --wait --yes
+mgmt-oke nodes get <slurm-node-name>
+mgmt-oke nodes terminate 10.0.127.32 --wait --yes
+mgmt-oke nodes terminate 10.0.127.32 --keep-size --wait --yes
+```
+
+`nodes remove` is an alias for `nodes terminate`.
+
+Node termination drains by default. Preflight lists pods, checks eviction
+admission, rejects unacknowledged `emptyDir` data and unmanaged pods, then the
+execution path cordons the node and uses the Kubernetes Eviction API before
+calling the owning OCI service. Use `--no-drain` only for an intentionally
+pre-drained node.
+
+Preview a replacement plan:
+
+```bash
+mgmt-oke nodes terminate <node-name> --keep-size --dry-run
+```
+
+Operate on several explicitly selected nodes or an exact field selection:
+
+```bash
+mgmt-oke nodes cordon node-a node-b
+mgmt-oke nodes drain --fields pool=oke-cpu,ready=true
+mgmt-oke nodes uncordon --nodes node-a,node-b
+```
+
+Filter and shape inventory output:
+
+```bash
+mgmt-oke nodes list --not-ready
+mgmt-oke nodes list --workloads --sort workload_pods,name
+mgmt-oke nodes list --fields pool=oke-rdma,rdma=true \
+  --columns name,status,shape,gpu,rdma_vf
+mgmt-oke nodes list --pool oke-gpu --one-line
 ```
 
 Replace a specific RDMA worker while keeping the pool at its current size:
 
 ```bash
-mgmt-oke nodes remove <rdma-node-name> --keep-size --wait --yes
+mgmt-oke nodes terminate <rdma-node-name> --keep-size --wait --yes
 ```
+
+Without `--keep-size`, the selected worker is removed and desired pool size is
+decremented. With `--keep-size`, the selected worker is removed and the owning
+service launches a replacement at the existing desired size.
+
+For Slinky-managed pools, node removal, replacement, and pool scale-down are
+refused because they require a Slurm-aware drain. Pool scale-up remains
+available. `--allow-workloads` does not bypass this protection.
+
+### Status, health, and recommendations
+
+```bash
+mgmt-oke status
+mgmt-oke health run
+mgmt-oke health run --type discovery
+mgmt-oke health run --type rdma --pool oke-rdma
+mgmt-oke recommendations list
+```
+
+Example `mgmt-oke status` output:
+
+```text
+overall  pools  nodes  ready  not_ready  gpu_nodes  rdma_nodes  addons_active  addons_total  autoscaler_pools  slinky_nodes  kueue_flavors
+-------  -----  -----  -----  ---------  ---------  ----------  -------------  ------------  ----------------  ------------  -------------
+HEALTHY  4      6      6      0          3          2           7              7             0                 0             2
+```
+
+Health checks are deterministic evaluations of the discovered control-plane
+and node state. They do not run arbitrary commands on workers. `status`,
+`health run`, and `addons validate` return `0` when healthy, `1` when degraded,
+and `2` when a check fails or the command cannot complete. A partial OCI or
+Kubernetes discovery is degraded rather than being presented as healthy.
 
 ### RDMA topology
 
@@ -232,6 +429,32 @@ mgmt-oke topology list --pool oke-rdma
 mgmt-oke autoscaler status
 ```
 
+### OKE add-ons
+
+```bash
+mgmt-oke addons status
+mgmt-oke --format json addons status
+mgmt-oke addons validate --target gpu
+mgmt-oke addons validate --target rdma --pool oke-rdma
+```
+
+The add-on view is read-only. When `NvidiaNetworkOperator` is active, readiness
+checks for RDMA pools include the `nvidia.com/rdma-vf` allocatable resource in
+addition to GPU and OCI RDMA topology readiness.
+
+## Resource Ownership
+
+Pool capacity changes and node termination update live OCI resources. Before
+confirmation, the CLI reports that these direct mutations do not update
+Terraform or OCI Resource Manager input values. Reconcile the corresponding
+stack variables before a later apply so the declared size does not replace the
+live value.
+
+All mutations acquire the `kube-system/mgmt-oke-mutation` Lease by default.
+This prevents two tool processes from changing cluster capacity or node state
+concurrently. `--no-lock` is available for recovery when Kubernetes Lease
+access is intentionally unavailable.
+
 ## Output Formats
 
 All commands support:
@@ -244,6 +467,10 @@ All commands support:
 
 `table` is the default.
 
+Node inventory also supports `--fields`, `--columns`, `--sort`, `--no-header`,
+and `--one-line`. Machine-readable row schemas are versioned as `v1`; field
+changes that break automation require a new schema version.
+
 ## Tests
 
 After installing the package, run the unit-test suite from the project root:
@@ -252,10 +479,24 @@ After installing the package, run the unit-test suite from the project root:
 python -m unittest discover -s tests -v
 ```
 
-## Current Scope
+For lint and type checks, install the development tools and run:
 
-See [`docs/scope.md`](docs/scope.md) for implemented features and planned
-items.
+```bash
+python -m pip install ".[dev]"
+ruff check src tests
+mypy src
+```
+
+## Documentation
+
+- [`docs/README.md`](docs/README.md): task-oriented documentation index
+- [`docs/architecture.md`](docs/architecture.md): target discovery, ownership
+  classification, mutation API routing, readiness, and safety boundaries
+- [`docs/controller-install.md`](docs/controller-install.md): operator node
+  prerequisites, installation, authentication, validation, and troubleshooting
+- [`docs/command-reference.md`](docs/command-reference.md): complete command,
+  selector, mutation-option, output, and exit-status reference
+- [`docs/scope.md`](docs/scope.md): implemented features and planned items
 
 ## Cluster Validation
 
@@ -276,15 +517,18 @@ After installing the tool on a controller/operator node:
 3. Run Kubernetes-only discovery:
 
    ```bash
-   mgmt-oke --auth none reconcile
+   mgmt-oke --auth instance_principal --skip-oci reconcile
    ```
 
-4. Run full OCI + Kubernetes discovery:
+4. Confirm OKE add-on status:
 
    ```bash
-   mgmt-oke --auth instance_principal \
-     --region <region> \
-     --compartment-id <compartment_ocid> \
-     --cluster-id <oke_cluster_ocid> \
-     reconcile
+   mgmt-oke --auth instance_principal addons status
+   ```
+
+5. Run full OCI + Kubernetes discovery. The cluster, region, and compartment
+   are resolved automatically:
+
+   ```bash
+   mgmt-oke --auth instance_principal reconcile
    ```

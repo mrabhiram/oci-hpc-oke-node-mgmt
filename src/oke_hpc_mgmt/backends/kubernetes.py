@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import os
 import re
+import socket
+import time
+import uuid
 from collections import defaultdict
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from oke_hpc_mgmt.models import AutoscalerEntry, KueueSummary, NodeInfo
+from oke_hpc_mgmt.models import AutoscalerEntry, DrainPod, KueueSummary, NodeInfo
 
 
 INSTANCE_OCID_RE = re.compile(r"(ocid1\.instance[.\w-]+)")
@@ -104,6 +111,17 @@ def _is_running_or_pending(pod: Any) -> bool:
     return pod.status.phase in {"Running", "Pending", "Unknown"}
 
 
+def _is_slinky_worker_pod(pod: Any) -> bool:
+    labels = pod.metadata.labels or {}
+    return bool(
+        labels.get("slinky.slurm.net/nodeset")
+        or (
+            labels.get("app.kubernetes.io/name") == "slurmd"
+            and labels.get("app.kubernetes.io/component") == "worker"
+        )
+    )
+
+
 def _pod_counts_by_node(pods: list[Any]) -> dict[str, dict[str, int]]:
     counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     system_namespaces = {"kube-system", "kueue-system", "cert-manager", "monitoring"}
@@ -111,6 +129,8 @@ def _pod_counts_by_node(pods: list[Any]) -> dict[str, dict[str, int]]:
         node_name = pod.spec.node_name
         if not node_name or not _is_running_or_pending(pod):
             continue
+        if _is_slinky_worker_pod(pod):
+            counts[node_name]["slinky"] += 1
         if _is_daemonset_pod(pod) or _is_mirror_pod(pod):
             counts[node_name]["daemonset"] += 1
         elif pod.metadata.namespace in system_namespaces:
@@ -122,6 +142,32 @@ def _pod_counts_by_node(pods: list[Any]) -> dict[str, dict[str, int]]:
 
 def _empty_pod_count() -> dict[str, int]:
     return defaultdict(int)
+
+
+def _pod_controller(pod: Any) -> str | None:
+    owners = list(pod.metadata.owner_references or [])
+    owner = next((item for item in owners if getattr(item, "controller", False)), None)
+    if owner is None and owners:
+        owner = owners[0]
+    if owner is None:
+        return None
+    return f"{getattr(owner, 'kind', 'Unknown')}/{getattr(owner, 'name', 'unknown')}"
+
+
+def _has_empty_dir(pod: Any) -> bool:
+    return any(getattr(volume, "empty_dir", None) is not None for volume in (pod.spec.volumes or []))
+
+
+def _api_error_text(exc: Exception) -> str:
+    status = getattr(exc, "status", None)
+    reason = getattr(exc, "reason", None) or str(exc)
+    return f"HTTP {status}: {reason}" if status else str(reason)
+
+
+def _utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 class KubernetesBackend:
@@ -163,7 +209,7 @@ class KubernetesBackend:
         client = self.client
         core = client.CoreV1Api()
         k8s_nodes = core.list_node().items
-        pod_counts = defaultdict(_empty_pod_count)
+        pod_counts: dict[str, dict[str, int]] = defaultdict(_empty_pod_count)
         if include_pod_counts:
             try:
                 pods = core.list_pod_for_all_namespaces().items
@@ -174,6 +220,7 @@ class KubernetesBackend:
         nodes: list[NodeInfo] = []
         for node in k8s_nodes:
             labels = dict(node.metadata.labels or {})
+            annotations = dict(node.metadata.annotations or {})
             allocatable = dict(node.status.allocatable or {})
             counts = pod_counts[node.metadata.name]
             provider_id = node.spec.provider_id
@@ -190,13 +237,236 @@ class KubernetesBackend:
                     schedulable=not bool(node.spec.unschedulable),
                     allocatable=allocatable,
                     labels=labels,
+                    annotations=annotations,
                     taints=_taints(node),
                     running_workload_pods=counts["workload"],
                     daemonset_pods=counts["daemonset"],
                     system_pods=counts["system"],
+                    slinky_workload_pods=counts["slinky"],
                 )
             )
         return nodes
+
+    def set_node_schedulable(self, node_name: str, schedulable: bool) -> None:
+        core = self.client.CoreV1Api()
+        core.patch_node(
+            node_name,
+            {"spec": {"unschedulable": not schedulable}},
+        )
+
+    def cordon_node(self, node_name: str) -> None:
+        self.set_node_schedulable(node_name, schedulable=False)
+
+    def uncordon_node(self, node_name: str) -> None:
+        self.set_node_schedulable(node_name, schedulable=True)
+
+    def list_drain_pods(
+        self,
+        node_name: str,
+        grace_period_seconds: int = 30,
+        check_evictions: bool = True,
+    ) -> list[DrainPod]:
+        client = self.client
+        core = client.CoreV1Api()
+        pods = core.list_pod_for_all_namespaces(
+            field_selector=f"spec.nodeName={node_name}"
+        ).items
+        results: list[DrainPod] = []
+        for pod in pods:
+            if getattr(pod.status, "phase", None) in {"Succeeded", "Failed"}:
+                continue
+            daemonset = _is_daemonset_pod(pod)
+            mirror = _is_mirror_pod(pod)
+            blocker = None
+            if check_evictions and not daemonset and not mirror:
+                blocker = self._dry_run_eviction(pod, grace_period_seconds)
+            results.append(
+                DrainPod(
+                    namespace=pod.metadata.namespace,
+                    name=pod.metadata.name,
+                    phase=getattr(pod.status, "phase", None),
+                    controller=_pod_controller(pod),
+                    daemonset=daemonset,
+                    mirror=mirror,
+                    has_empty_dir=_has_empty_dir(pod),
+                    eviction_blocker=blocker,
+                )
+            )
+        return sorted(results, key=lambda item: (item.namespace, item.name))
+
+    def _dry_run_eviction(self, pod: Any, grace_period_seconds: int) -> str | None:
+        client = self.client
+        core = client.CoreV1Api()
+        body = client.V1Eviction(
+            metadata=client.V1ObjectMeta(
+                name=pod.metadata.name,
+                namespace=pod.metadata.namespace,
+            ),
+            delete_options=client.V1DeleteOptions(
+                grace_period_seconds=grace_period_seconds,
+            ),
+        )
+        try:
+            core.create_namespaced_pod_eviction(
+                pod.metadata.name,
+                pod.metadata.namespace,
+                body,
+                dry_run="All",
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                return None
+            return _api_error_text(exc)
+        return None
+
+    def evict_drain_pods(
+        self,
+        pods: list[DrainPod],
+        grace_period_seconds: int = 30,
+        timeout_seconds: int = 600,
+        poll_interval_seconds: int = 2,
+    ) -> None:
+        client = self.client
+        core = client.CoreV1Api()
+        deadline = time.monotonic() + timeout_seconds
+        pending = {(pod.namespace, pod.name): pod for pod in pods if pod.evictable}
+        blockers: dict[tuple[str, str], str] = {}
+        requested: set[tuple[str, str]] = set()
+
+        while pending:
+            for key, pod in list(pending.items()):
+                namespace, name = key
+                try:
+                    current = core.read_namespaced_pod(name, namespace)
+                except Exception as exc:
+                    if getattr(exc, "status", None) == 404:
+                        pending.pop(key, None)
+                        blockers.pop(key, None)
+                        requested.discard(key)
+                        continue
+                    raise KubernetesDiscoveryError(
+                        f"Unable to inspect pod {namespace}/{name}: {_api_error_text(exc)}"
+                    ) from exc
+
+                if getattr(current.metadata, "deletion_timestamp", None) or key in requested:
+                    continue
+                body = client.V1Eviction(
+                    metadata=client.V1ObjectMeta(name=name, namespace=namespace),
+                    delete_options=client.V1DeleteOptions(
+                        grace_period_seconds=grace_period_seconds,
+                    ),
+                )
+                try:
+                    core.create_namespaced_pod_eviction(name, namespace, body)
+                    blockers.pop(key, None)
+                    requested.add(key)
+                except Exception as exc:
+                    status = getattr(exc, "status", None)
+                    if status == 404:
+                        pending.pop(key, None)
+                        blockers.pop(key, None)
+                        requested.discard(key)
+                    elif status == 429:
+                        blockers[key] = _api_error_text(exc)
+                    else:
+                        raise KubernetesDiscoveryError(
+                            f"Unable to evict pod {namespace}/{name}: {_api_error_text(exc)}"
+                        ) from exc
+
+            if not pending:
+                return
+            if time.monotonic() >= deadline:
+                details = ", ".join(
+                    f"{namespace}/{name} ({blockers.get((namespace, name), 'still terminating')})"
+                    for namespace, name in sorted(pending)
+                )
+                raise KubernetesDiscoveryError(
+                    f"Timed out draining pods after {timeout_seconds}s: {details}"
+                )
+            time.sleep(poll_interval_seconds)
+
+    @contextmanager
+    def mutation_lease(
+        self,
+        name: str = "mgmt-oke-mutation",
+        namespace: str = "kube-system",
+        duration_seconds: int = 1800,
+    ) -> Iterator[str]:
+        client = self.client
+        coordination = client.CoordinationV1Api()
+        holder = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+        now = datetime.now(timezone.utc)
+        duration_seconds = max(60, duration_seconds)
+
+        try:
+            existing = coordination.read_namespaced_lease(name, namespace)
+        except Exception as exc:
+            if getattr(exc, "status", None) != 404:
+                raise KubernetesDiscoveryError(
+                    f"Unable to inspect mutation Lease {namespace}/{name}: {_api_error_text(exc)}"
+                ) from exc
+            body = self._lease_body(name, namespace, holder, duration_seconds, now)
+            try:
+                coordination.create_namespaced_lease(namespace, body)
+            except Exception as create_exc:
+                raise KubernetesDiscoveryError(
+                    f"Unable to acquire mutation Lease {namespace}/{name}: "
+                    f"{_api_error_text(create_exc)}"
+                ) from create_exc
+        else:
+            current_holder = getattr(existing.spec, "holder_identity", None)
+            renew_time = (
+                getattr(existing.spec, "renew_time", None)
+                or getattr(existing.spec, "acquire_time", None)
+            )
+            lease_duration = getattr(existing.spec, "lease_duration_seconds", None) or duration_seconds
+            active = bool(
+                current_holder
+                and renew_time
+                and _utc_datetime(renew_time) + timedelta(seconds=lease_duration) > now
+            )
+            if active:
+                raise KubernetesDiscoveryError(
+                    f"Another mutation is active under Lease {namespace}/{name}: {current_holder}"
+                )
+            body = self._lease_body(name, namespace, holder, duration_seconds, now)
+            body.metadata.resource_version = existing.metadata.resource_version
+            try:
+                coordination.replace_namespaced_lease(name, namespace, body)
+            except Exception as replace_exc:
+                raise KubernetesDiscoveryError(
+                    f"Unable to acquire mutation Lease {namespace}/{name}: "
+                    f"{_api_error_text(replace_exc)}"
+                ) from replace_exc
+
+        try:
+            yield holder
+        finally:
+            try:
+                current = coordination.read_namespaced_lease(name, namespace)
+                if getattr(current.spec, "holder_identity", None) == holder:
+                    coordination.delete_namespaced_lease(name, namespace)
+            except Exception:
+                pass
+
+    def _lease_body(
+        self,
+        name: str,
+        namespace: str,
+        holder: str,
+        duration_seconds: int,
+        now: datetime,
+    ) -> Any:
+        client = self.client
+        return client.V1Lease(
+            metadata=client.V1ObjectMeta(name=name, namespace=namespace),
+            spec=client.V1LeaseSpec(
+                holder_identity=holder,
+                lease_duration_seconds=duration_seconds,
+                acquire_time=now,
+                renew_time=now,
+            ),
+        )
 
     def list_autoscaler_entries(self) -> list[AutoscalerEntry]:
         client = self.client
@@ -230,7 +500,10 @@ class KubernetesBackend:
         custom = client.CustomObjectsApi()
         summary = KueueSummary()
 
-        def list_first_available(plural: str, versions: tuple[str, ...] = ("v1beta1", "v1beta2")) -> list[dict[str, Any]]:
+        def list_first_available(
+            plural: str,
+            versions: tuple[str, ...] = ("v1beta1", "v1beta2"),
+        ) -> list[dict[str, Any]]:
             for version in versions:
                 try:
                     response = custom.list_cluster_custom_object("kueue.x-k8s.io", version, plural)
