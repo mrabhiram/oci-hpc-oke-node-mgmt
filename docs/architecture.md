@@ -56,6 +56,22 @@ mgmt-oke --auth instance_principal pools list
 
 without setting `OKE_CLUSTER_ID`, `OCI_REGION`, or `OCI_COMPARTMENT_ID`.
 
+Example output after kubeconfig and compartment discovery:
+
+```text
+name        kind             placement        shape                desired  oci_active  k8s_ready  gpu             rdma  rdma_vf_required  slinky  autoscaler  kueue_flavor
+----------  ---------------  ---------------  -------------------  -------  ----------  ---------  --------------  ----  ----------------  ------  ----------  ------------
+oke-rdma    cluster-network  cluster-network  BM.GPU4.8            2        2           2          nvidia.com/gpu  yes   no                no      -           -
+oke-cpu     node-pool        standard         VM.Standard.E5.Flex  1        1           1          -               no    no                no      -           -
+oke-gpu     node-pool        standard         VM.GPU.A10.1         1        1           1          nvidia.com/gpu  no    no                no      -           -
+oke-system  node-pool        standard         VM.Standard.E5.Flex  2        2           2          -               no    no                no      -           -
+```
+
+This output demonstrates the join between authoritative OCI ownership and
+Kubernetes readiness. A managed v26.7 RDMA pool is reported as
+`kind=node-pool, placement=compute-cluster`; the captured cluster shown above
+uses the supported legacy Cluster Network model.
+
 ### Kubeconfig Selection
 
 The tool applies the following context selection order:
@@ -133,7 +149,21 @@ authentication but does not independently configure the kubeconfig exec plugin.
 For Kubernetes-only discovery on an operator node, use:
 
 ```bash
-mgmt-oke --auth instance_principal --skip-oci nodes list
+mgmt-oke --auth instance_principal --skip-oci nodes list \
+  --columns name,status,pool,shape --sort pool,name
+```
+
+Example Kubernetes-only output:
+
+```text
+name           status  pool        shape
+-------------  ------  ----------  -------------------
+cpu-node-1     Ready   oke-cpu     VM.Standard.E5.Flex
+gpu-node-1     Ready   oke-gpu     VM.GPU.A10.1
+rdma-node-1    Ready   oke-rdma    BM.GPU4.8
+rdma-node-2    Ready   oke-rdma    BM.GPU4.8
+system-node-1  Ready   oke-system  VM.Standard.E5.Flex
+system-node-2  Ready   oke-system  VM.Standard.E5.Flex
 ```
 
 Kubeconfig target discovery is unavailable with `--in-cluster`. In-cluster

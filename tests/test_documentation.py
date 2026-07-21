@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shlex
 import unittest
@@ -13,6 +14,9 @@ from oke_hpc_mgmt.commands import cli
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MARKDOWN_FILES = (PROJECT_ROOT / "README.md", *sorted((PROJECT_ROOT / "docs").glob("*.md")))
 LINK_RE = re.compile(r"\[[^]]+\]\(([^)]+)\)")
+OUTPUT_HEADING_RE = re.compile(r"Example[^\n]*output", re.IGNORECASE)
+OUTPUT_FENCE_RE = re.compile(r"```(?:text|json|csv)\n")
+JSON_FENCE_RE = re.compile(r"```json\n(.*?)\n```", re.DOTALL)
 
 
 def _bash_blocks(document: str) -> list[tuple[int, str]]:
@@ -112,6 +116,24 @@ class DocumentationTests(unittest.TestCase):
 
         self.assertEqual([], unbalanced)
 
+    def test_documented_json_output_is_valid(self):
+        failures: list[str] = []
+        parsed_blocks = 0
+        for markdown_file in MARKDOWN_FILES:
+            document = markdown_file.read_text(encoding="utf-8")
+            for block_number, block in enumerate(JSON_FENCE_RE.findall(document), start=1):
+                parsed_blocks += 1
+                try:
+                    json.loads(block)
+                except json.JSONDecodeError as error:
+                    failures.append(
+                        f"{markdown_file.relative_to(PROJECT_ROOT)} "
+                        f"JSON block {block_number}: {error}"
+                    )
+
+        self.assertGreaterEqual(parsed_blocks, 13)
+        self.assertEqual([], failures, "Invalid JSON examples:\n" + "\n".join(failures))
+
     def test_documented_mgmt_commands_parse(self):
         failures: list[str] = []
         parsed_commands = 0
@@ -133,6 +155,49 @@ class DocumentationTests(unittest.TestCase):
 
         self.assertGreater(parsed_commands, 40)
         self.assertEqual([], failures, "Invalid documented commands:\n" + "\n".join(failures))
+
+    def test_operational_docs_include_example_output(self):
+        missing: list[str] = []
+        operational_docs = 0
+        for markdown_file in MARKDOWN_FILES:
+            document = markdown_file.read_text(encoding="utf-8")
+            has_executable_command = any(
+                _mgmt_argv(command) is not None
+                for _, block in _bash_blocks(document)
+                for command in _logical_shell_lines(block)
+            )
+            if not has_executable_command:
+                continue
+
+            operational_docs += 1
+            if not OUTPUT_HEADING_RE.search(document) or not OUTPUT_FENCE_RE.search(
+                document
+            ):
+                missing.append(str(markdown_file.relative_to(PROJECT_ROOT)))
+
+        self.assertGreaterEqual(operational_docs, 13)
+        self.assertEqual(
+            [],
+            missing,
+            "Operational guides without example command output:\n" + "\n".join(missing),
+        )
+
+    def test_public_docs_exclude_live_cluster_identifiers(self):
+        findings: list[str] = []
+        full_oci_identifier = re.compile(r"ocid1\.[a-z0-9.-]+\.[a-z0-9-]+\.[a-z0-9]{20,}")
+        for markdown_file in MARKDOWN_FILES:
+            document = markdown_file.read_text(encoding="utf-8")
+            for forbidden in ("10.140.", "84.8.152.", "ssh-key-a10.key"):
+                if forbidden in document:
+                    findings.append(
+                        f"{markdown_file.relative_to(PROJECT_ROOT)} contains {forbidden}"
+                    )
+            if full_oci_identifier.search(document):
+                findings.append(
+                    f"{markdown_file.relative_to(PROJECT_ROOT)} contains a full OCI identifier"
+                )
+
+        self.assertEqual([], findings, "Live identifiers in public docs:\n" + "\n".join(findings))
 
     def test_pool_inventory_docs_describe_fast_path_limits(self):
         discovery_guide = (

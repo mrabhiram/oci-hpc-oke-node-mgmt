@@ -17,6 +17,23 @@ mgmt-oke pools --help
 mgmt-oke nodes terminate --help
 ```
 
+Example top-level help excerpt:
+
+```text
+Usage: mgmt-oke [OPTIONS] COMMAND [ARGS]...
+
+Commands:
+  addons           Inspect and validate OKE accelerator add-ons.
+  autoscaler       Inspect Cluster Autoscaler ownership of worker pools.
+  health           Run deterministic AI/HPC readiness checks.
+  nodes            Discover, maintain, replace, or terminate workers.
+  pools            Discover and resize OCI HPC OKE worker pools.
+  recommendations  Show actionable findings derived from cluster health.
+  reconcile        Run full OCI and Kubernetes discovery.
+  status           Show concise AI/HPC cluster health and capacity status.
+  topology         Inspect OCI RDMA placement topology.
+```
+
 ## Global Options
 
 | Option | Purpose |
@@ -50,6 +67,14 @@ mgmt-oke reconcile
 mgmt-oke --format json reconcile
 ```
 
+Example `status` output:
+
+```text
+overall  pools  nodes  ready  not_ready  gpu_nodes  rdma_nodes  addons_active  addons_total  autoscaler_pools  slinky_nodes  kueue_flavors
+-------  -----  -----  -----  ---------  ---------  ----------  -------------  ------------  ----------------  ------------  -------------
+HEALTHY  4      6      6      0          3          2           7              7             0                 0             2
+```
+
 `pools list` is the faster inventory path. `reconcile`, `status`, health, and
 recommendation commands include the additional pod, autoscaler, Kueue, and
 add-on correlations required by their checks.
@@ -59,6 +84,17 @@ add-on correlations required by their checks.
 ```bash
 mgmt-oke pools list
 mgmt-oke pools get <pool-name-or-ocid>
+```
+
+Example pool inventory output:
+
+```text
+name        kind             placement        shape                desired  oci_active  k8s_ready  gpu             rdma
+----------  ---------------  ---------------  -------------------  -------  ----------  ---------  --------------  ----
+oke-rdma    cluster-network  cluster-network  BM.GPU4.8            2        2           2          nvidia.com/gpu  yes
+oke-cpu     node-pool        standard         VM.Standard.E5.Flex  1        1           1          -               no
+oke-gpu     node-pool        standard         VM.GPU.A10.1         1        1           1          nvidia.com/gpu  no
+oke-system  node-pool        standard         VM.Standard.E5.Flex  2        2           2          -               no
 ```
 
 Set an exact desired size:
@@ -81,6 +117,32 @@ Use explicit add and remove aliases when signed arithmetic is unnecessary:
 ```bash
 mgmt-oke pools add <pool-name> --count 2 --wait
 mgmt-oke pools remove <pool-name> --count 1 --wait
+```
+
+Example add-capacity dry-run:
+
+```bash
+mgmt-oke pools add oke-cpu --count 1 --dry-run --format json
+```
+
+```json
+[
+  {
+    "current_size": 1,
+    "decrement_size": null,
+    "operation": "pool-resize",
+    "owner": "oke",
+    "pool": "oke-cpu",
+    "status": "planned",
+    "steps": ["update the managed OKE node-pool desired size"],
+    "target": "oke-cpu",
+    "target_size": 2,
+    "warnings": [
+      "This direct OCI mutation does not update Terraform or OCI Resource Manager input values; reconcile the declared pool size before the next apply."
+    ],
+    "workload_pods": 0
+  }
+]
 ```
 
 Pool-level scale-down delegates worker selection to OKE or Compute Management.
@@ -133,6 +195,19 @@ mgmt-oke nodes list --pool <pool-name> --one-line
 mgmt-oke nodes list --no-header --columns name,ip
 ```
 
+Example selected-column output:
+
+```text
+name           status  pool        shape
+-------------  ------  ----------  -------------------
+cpu-node-1     Ready   oke-cpu     VM.Standard.E5.Flex
+gpu-node-1     Ready   oke-gpu     VM.GPU.A10.1
+rdma-node-1    Ready   oke-rdma    BM.GPU4.8
+rdma-node-2    Ready   oke-rdma    BM.GPU4.8
+system-node-1  Ready   oke-system  VM.Standard.E5.Flex
+system-node-2  Ready   oke-system  VM.Standard.E5.Flex
+```
+
 Projected node output can include `ready` and `schedulable` independently of
 the combined Kubernetes `status` field.
 
@@ -146,6 +221,30 @@ mgmt-oke nodes cordon <node-a> <node-b> --dry-run
 mgmt-oke nodes cordon --nodes <node-a>,<node-b>
 mgmt-oke nodes drain --fields pool=oke-cpu,ready=true --dry-run
 mgmt-oke nodes uncordon <node-a> <node-b>
+```
+
+Example cordon dry-run output:
+
+```bash
+mgmt-oke nodes cordon gpu-node-1 --dry-run --format json
+```
+
+```json
+[
+  {
+    "current_size": null,
+    "decrement_size": null,
+    "operation": "node-cordon",
+    "owner": "kubernetes",
+    "pool": "oke-gpu",
+    "status": "planned",
+    "steps": ["set spec.unschedulable=true"],
+    "target": "gpu-node-1",
+    "target_size": null,
+    "warnings": [],
+    "workload_pods": 0
+  }
+]
 ```
 
 `nodes drain` cordons the selected workers, ignores DaemonSet and mirror pods,
@@ -185,6 +284,36 @@ Terminate several selected workers:
 mgmt-oke nodes terminate --nodes <node-a>,<node-b> --dry-run
 ```
 
+Example replacement dry-run output:
+
+```bash
+mgmt-oke nodes terminate gpu-node-1 --keep-size --dry-run --format json
+```
+
+```json
+[
+  {
+    "current_size": 1,
+    "decrement_size": false,
+    "operation": "node-remove",
+    "owner": "oke",
+    "pool": "oke-gpu",
+    "status": "planned",
+    "steps": [
+      "cordon Kubernetes node",
+      "evict non-DaemonSet pods through the Eviction API",
+      "delete the selected worker through OKE DeleteNode"
+    ],
+    "target": "gpu-node-1",
+    "target_size": 1,
+    "warnings": [
+      "This direct OCI mutation does not update Terraform or OCI Resource Manager input values; reconcile the declared pool size before the next apply."
+    ],
+    "workload_pods": 0
+  }
+]
+```
+
 Termination drains by default. The safety options are:
 
 | Option | Purpose |
@@ -218,6 +347,18 @@ mgmt-oke addons validate --target gpu
 mgmt-oke addons validate --target rdma --pool <pool-name>
 ```
 
+Example topology and autoscaler output:
+
+```text
+hpc_island  network_block  local_block  nodes  ready  shapes
+----------  -------------  -----------  -----  -----  ---------
+island-a    block-a        local-a      1      1      BM.GPU4.8
+island-a    block-a        local-b      1      1      BM.GPU4.8
+
+Cluster Autoscaler
+(none)
+```
+
 ## Health And Recommendations
 
 ```bash
@@ -231,6 +372,19 @@ mgmt-oke health run --type addons
 mgmt-oke health run --type scheduler
 mgmt-oke recommendations list
 mgmt-oke recommendations list --type rdma --pool <pool-name>
+```
+
+Example health and recommendation output:
+
+```text
+check            scope        status  message                                       recommendation
+---------------  -----------  ------  --------------------------------------------  --------------
+gpu-allocatable  gpu-node-1   PASS    nvidia.com/gpu=1                              -
+rdma-topology    rdma-node-1  PASS    Required OCI RDMA topology labels are valid.  -
+rdma-topology    rdma-node-2  PASS    Required OCI RDMA topology labels are valid.  -
+
+Recommendations
+(none)
 ```
 
 Health evaluation is read-only and deterministic. It compares desired, active,

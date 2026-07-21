@@ -64,8 +64,15 @@ python -m pip install .
 Verify the package entrypoints:
 
 ```bash
+.venv/bin/mgmt-oke --version
 .venv/bin/mgmt-oke --help
 .venv/bin/kubectl-oke --help
+```
+
+Example version output:
+
+```text
+mgmt-oke, version 0.4.0
 ```
 
 ## Upgrade An Existing Installation
@@ -173,6 +180,18 @@ mgmt-oke health run
 mgmt-oke addons validate --target all
 mgmt-oke reconcile
 ```
+
+Example `status` result after the validation sequence:
+
+```text
+overall  pools  nodes  ready  not_ready  gpu_nodes  rdma_nodes  addons_active  addons_total  autoscaler_pools  slinky_nodes  kueue_flavors
+-------  -----  -----  -----  ---------  ---------  ----------  -------------  ------------  ----------------  ------------  -------------
+HEALTHY  4      6      6      0          3          2           7              7             0                 0             2
+```
+
+The values are deployment-specific. A successful installation should report
+authoritative OCI pools, corresponding Kubernetes workers, and no discovery
+warnings before mutation commands are used.
 
 `pools list` should classify each OCI resource by both ownership and placement.
 Common results are:

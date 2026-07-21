@@ -27,6 +27,14 @@ different.
 mgmt-oke --auth instance_principal pools get oke-rdma
 ```
 
+Example output for a legacy Cluster Network-backed pool:
+
+```text
+name      kind             placement        shape      desired  oci_active  k8s_ready  gpu             rdma  rdma_vf_required  slinky  autoscaler  kueue_flavor
+--------  ---------------  ---------------  ---------  -------  ----------  ---------  --------------  ----  ----------------  ------  ----------  ------------
+oke-rdma  cluster-network  cluster-network  BM.GPU4.8  2        2           2          nvidia.com/gpu  yes   no                no      -           -
+```
+
 Interpret `kind` and `placement`:
 
 | Output | Model |
@@ -46,7 +54,35 @@ exposes `cluster_network_id` and `instance_pool_id`.
 ## Add an RDMA Worker
 
 ```bash
-mgmt-oke --auth instance_principal pools add oke-rdma --count 1 --dry-run
+mgmt-oke --auth instance_principal pools add oke-rdma \
+  --count 1 --dry-run --format json
+```
+
+Example dry-run output:
+
+```json
+[
+  {
+    "current_size": 2,
+    "decrement_size": null,
+    "operation": "pool-resize",
+    "owner": "compute-management",
+    "pool": "oke-rdma",
+    "status": "planned",
+    "steps": ["update the Cluster Network's embedded Instance Pool size"],
+    "target": "oke-rdma",
+    "target_size": 3,
+    "warnings": [
+      "This direct OCI mutation does not update Terraform or OCI Resource Manager input values; reconcile the declared pool size before the next apply."
+    ],
+    "workload_pods": 0
+  }
+]
+```
+
+Apply after reviewing the plan:
+
+```bash
 mgmt-oke --auth instance_principal pools add oke-rdma --count 1 --wait
 ```
 
@@ -67,7 +103,36 @@ configuration.
 Reduce desired pool size by one without choosing a specific worker:
 
 ```bash
-mgmt-oke --auth instance_principal pools remove oke-rdma --count 1 --dry-run
+mgmt-oke --auth instance_principal pools remove oke-rdma \
+  --count 1 --dry-run --format json
+```
+
+Example dry-run output:
+
+```json
+[
+  {
+    "current_size": 2,
+    "decrement_size": null,
+    "operation": "pool-resize",
+    "owner": "compute-management",
+    "pool": "oke-rdma",
+    "status": "planned",
+    "steps": ["update the Cluster Network's embedded Instance Pool size"],
+    "target": "oke-rdma",
+    "target_size": 1,
+    "warnings": [
+      "Pool-level scale-down delegates worker selection to the owning service; use nodes terminate when worker identity matters.",
+      "This direct OCI mutation does not update Terraform or OCI Resource Manager input values; reconcile the declared pool size before the next apply."
+    ],
+    "workload_pods": 0
+  }
+]
+```
+
+Apply after reviewing which ownership model will select the departing worker:
+
+```bash
 mgmt-oke --auth instance_principal pools remove oke-rdma --count 1 --wait
 ```
 
@@ -78,7 +143,39 @@ particular A100 or other RDMA worker.
 Choose a specific worker and decrement desired size:
 
 ```bash
-mgmt-oke --auth instance_principal nodes terminate <rdma-node-name-or-ip> --dry-run
+mgmt-oke --auth instance_principal nodes terminate rdma-node-1 \
+  --dry-run --format json
+```
+
+Example dry-run output:
+
+```json
+[
+  {
+    "current_size": 2,
+    "decrement_size": true,
+    "operation": "node-remove",
+    "owner": "compute-management",
+    "pool": "oke-rdma",
+    "status": "planned",
+    "steps": [
+      "cordon Kubernetes node",
+      "evict non-DaemonSet pods through the Eviction API",
+      "detach and automatically terminate the selected Instance Pool member"
+    ],
+    "target": "rdma-node-1",
+    "target_size": 1,
+    "warnings": [
+      "This direct OCI mutation does not update Terraform or OCI Resource Manager input values; reconcile the declared pool size before the next apply."
+    ],
+    "workload_pods": 0
+  }
+]
+```
+
+Apply after reviewing the selected worker:
+
+```bash
 mgmt-oke --auth instance_principal nodes terminate <rdma-node-name-or-ip> --wait
 ```
 
@@ -132,6 +229,15 @@ mgmt-oke --auth instance_principal topology list --pool oke-rdma
 mgmt-oke --auth instance_principal addons status
 mgmt-oke --auth instance_principal addons validate --target rdma --pool oke-rdma
 mgmt-oke --auth instance_principal health run --type rdma --pool oke-rdma
+```
+
+Example RDMA health output:
+
+```text
+check          scope        status  message                                       recommendation
+-------------  -----------  ------  --------------------------------------------  --------------
+rdma-topology  rdma-node-1  PASS    Required OCI RDMA topology labels are valid.  -
+rdma-topology  rdma-node-2  PASS    Required OCI RDMA topology labels are valid.  -
 ```
 
 Every Ready RDMA worker should have valid values for:

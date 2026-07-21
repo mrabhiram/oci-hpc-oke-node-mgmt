@@ -38,10 +38,31 @@ mgmt-oke --auth instance_principal autoscaler status
 The result includes deployment, namespace, minimum, maximum, target OCID, and
 matched pool name.
 
+Example output when no Cluster Autoscaler owns a pool:
+
+```text
+(none)
+```
+
+An empty result means manual ownership protection is not active; it does not
+disable the other drain, Slinky, confirmation, or mutation-lock safeguards.
+
 Use the full snapshot when reviewing multiple ownership signals:
 
 ```bash
 mgmt-oke --auth instance_principal reconcile
+```
+
+Example scheduler sections from the full output:
+
+```text
+Cluster Autoscaler
+(none)
+
+Kueue
+topologies  resource_flavors  cluster_queues  local_queues
+----------  ----------------  --------------  ------------
+1           2                 1               1
 ```
 
 > [!NOTE]

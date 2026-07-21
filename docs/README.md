@@ -4,6 +4,15 @@ Guides for installing and operating the OKE HPC Node Management Tool on an OCI
 HPC OKE operator node. For the project overview and command summary, see the
 [main README](../README.md).
 
+## Output examples
+
+Every operational guide includes representative `mgmt-oke` output captured
+from version 0.4.0 against a running OCI HPC OKE cluster. Node names, IP
+addresses, topology identifiers, and OCI resource identifiers are replaced
+with stable example values. Pool counts, shapes, ownership classifications,
+resource counts, status values, and command behavior are retained. Add-on
+versions and capacity naturally vary by deployment.
+
 ## Getting started
 
 - [Controller Node Installation](./controller-install.md): Install or upgrade
