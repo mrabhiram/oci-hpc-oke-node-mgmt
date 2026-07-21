@@ -28,6 +28,15 @@ kubectl get nodes -o wide
 Stack operator nodes normally have one cluster in kubeconfig. No context
 environment variable is required.
 
+For a non-interactive shell, make sure the OCI CLI is on the effective path and
+select the authentication method used by direct `kubectl`:
+
+```bash
+export PATH=/home/ubuntu/bin:/usr/local/bin:/usr/bin:/bin
+export OCI_CLI_AUTH=instance_principal
+kubectl get nodes -o wide
+```
+
 ### Step 2: Validate OCI Authentication
 
 Confirm that the operator instance can call OCI APIs with its instance

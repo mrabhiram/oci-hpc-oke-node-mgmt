@@ -31,6 +31,12 @@ output remains parseable. Full `reconcile` JSON includes warnings in its
 mgmt-oke --auth instance_principal --format json pools list
 ```
 
+`pools list` and `pools get` use the fast inventory path. They do not scan
+workload pod counts, Cluster Autoscaler deployments, or Kueue resources.
+Fields derived from those scans can therefore be empty in their JSON output.
+Use full `reconcile` JSON when autoscaler ownership, Kueue counts, or
+ResourceFlavor matches are required.
+
 List pool names, ownership, placement, and counts:
 
 ```bash
@@ -81,6 +87,9 @@ mgmt-oke --auth instance_principal --format json reconcile > snapshot.json
 The full snapshot contains raw `pools`, `nodes`, `addons`,
 `autoscaler_entries`, `kueue`, and `warnings` sections. Use the command-specific
 JSON views when a flattened row format is preferable.
+
+Unlike fast pool inventory, full reconciliation performs the autoscaler and
+Kueue scans and enriches pool records with those matches.
 
 ## CSV Export
 

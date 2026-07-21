@@ -60,6 +60,10 @@ mgmt-oke --auth instance_principal pools resize <pool-name> --delta -1 --wait
 Positive deltas add capacity. Negative deltas remove capacity. A target below
 zero is rejected before the OCI API is called.
 
+Pool-level scale-down does not select a worker. The owning OCI service chooses
+which instance leaves while converging to the lower desired size. When a
+specific worker must be removed, use `nodes remove` instead.
+
 ### Step 3: Confirm the Operation
 
 Without `--yes`, the CLI prints the current and target sizes and requires the
@@ -80,6 +84,17 @@ validated the target pool.
 Ready nodes reach the target. GPU and RDMA pools include additional resource
 checks.
 
+These layers can converge at different times. For example, an RDMA pool can
+temporarily report:
+
+```text
+desired=3 oci_active=3 k8s_ready=2 gpu_ready=2 rdma_ready=2
+desired=3 oci_active=3 k8s_ready=3 gpu_ready=2 rdma_ready=3
+desired=3 oci_active=3 k8s_ready=3 gpu_ready=3 rdma_ready=3
+```
+
+The command succeeds only after every applicable count reaches the target.
+
 The default timeout is 1800 seconds with a 30-second polling interval. Override
 them when provisioning is expected to take longer:
 
@@ -87,6 +102,25 @@ them when provisioning is expected to take longer:
 mgmt-oke --auth instance_principal pools resize <pool-name> \
   --size 4 --wait --timeout 3600 --poll-interval 60
 ```
+
+### Submit and Wait Separately
+
+Omit `--wait` to submit a resize and return after OCI accepts the request:
+
+```bash
+mgmt-oke --auth instance_principal pools resize <pool-name> --size 3 --yes
+```
+
+The result is reported as `submitted`. To wait later, repeat the exact target
+with `--wait`:
+
+```bash
+mgmt-oke --auth instance_principal pools resize <pool-name> --size 3 --wait
+```
+
+When desired size is already 3, the second command does not submit another
+resize. It acts as a convergence barrier and returns `ready` only after OCI,
+Kubernetes, and applicable GPU and RDMA checks pass.
 
 ## Managed Compute Cluster Pools
 
@@ -107,6 +141,9 @@ Configuration, cloud-init, tags, and other embedded pool fields are preserved.
 ```bash
 mgmt-oke --auth instance_principal pools resize oke-rdma --size 3 --wait
 ```
+
+No separate worker creation command is required. New instances use the
+existing Instance Configuration and its OKE bootstrap cloud-init.
 
 ## Safety Checks
 
