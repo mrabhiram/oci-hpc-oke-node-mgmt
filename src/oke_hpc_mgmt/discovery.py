@@ -54,7 +54,12 @@ class DiscoveryService:
         self._oci_target_error: str | None = None
 
     def discover(self) -> DiscoverySnapshot:
-        snapshot = DiscoverySnapshot()
+        snapshot = DiscoverySnapshot(
+            oci_discovery_enabled=(
+                not self.options.skip_oci and self.options.auth != "none"
+            ),
+            kubernetes_discovery_enabled=not self.options.skip_kubernetes,
+        )
         self.resolve_oci_target()
         nodes = self._discover_kubernetes(snapshot)
         pools = self._discover_oci(snapshot)
@@ -200,6 +205,13 @@ class DiscoveryService:
 
         self.resolve_oci_target()
         return self._oci()
+
+    def kubernetes_backend(self) -> KubernetesBackend:
+        """Return the Kubernetes backend configured for the selected cluster."""
+
+        if self.options.skip_kubernetes:
+            raise OciDiscoveryError("Kubernetes access is disabled by --skip-kubernetes.")
+        return self._k8s()
 
     def _discover_kubernetes(self, snapshot: DiscoverySnapshot) -> list[NodeInfo]:
         if self.options.skip_kubernetes:

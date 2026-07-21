@@ -20,7 +20,8 @@ identifiers.
 ## Prerequisites
 
 - working OCI and Kubernetes discovery
-- IAM permission to update the target pool's owning OCI resource
+- IAM permission to update the target pool's owning OCI resource and inspect
+  its work requests when using `--wait`
 - no Cluster Autoscaler ownership of the target pool
 - updated Terraform or Resource Manager inputs when the pool is also managed as
   infrastructure as code
@@ -60,11 +61,31 @@ mgmt-oke --auth instance_principal pools resize <pool-name> --delta -1 --wait
 Positive deltas add capacity. Negative deltas remove capacity. A target below
 zero is rejected before the OCI API is called.
 
+The explicit aliases avoid signed arithmetic:
+
+```bash
+mgmt-oke --auth instance_principal pools add <pool-name> --count 1 --wait
+mgmt-oke --auth instance_principal pools remove <pool-name> --count 1 --wait
+```
+
 Pool-level scale-down does not select a worker. The owning OCI service chooses
 which instance leaves while converging to the lower desired size. When a
-specific worker must be removed, use `nodes remove` instead.
+specific worker must be removed, use `nodes terminate` instead.
 
-### Step 3: Confirm the Operation
+### Step 3: Preview the Operation
+
+Run the same request with `--dry-run` before changing capacity:
+
+```bash
+mgmt-oke --auth instance_principal pools add <pool-name> --count 1 --dry-run
+```
+
+The plan reports the operation, owning service, current and target sizes, OCI
+action, and infrastructure-as-code drift warning. Dry-run performs discovery
+and safety validation but does not acquire the mutation Lease or call a
+mutation API.
+
+### Step 4: Confirm the Operation
 
 Without `--yes`, the CLI prints the current and target sizes and requires the
 pool name to be typed exactly. This is the recommended interactive workflow.
@@ -78,11 +99,15 @@ mgmt-oke --auth instance_principal pools resize <pool-name> --delta 1 --wait --y
 Do not use `--yes` in an automation that has not independently selected and
 validated the target pool.
 
-### Step 4: Wait for Convergence
+### Step 5: Wait for Convergence
 
 `--wait` polls until desired OCI size, active OCI instances, and Kubernetes
 Ready nodes reach the target. GPU and RDMA pools include additional resource
-checks.
+checks. The command also monitors the owning OCI work request and exits
+immediately with OCI's error details if it fails or is canceled. For
+self-managed resources, it snapshots existing resource work requests before
+mutation so monitoring remains precise when the update response omits a work
+request identifier.
 
 These layers can converge at different times. For example, an RDMA pool can
 temporarily report:
@@ -154,12 +179,16 @@ The CLI refuses a manual resize when:
 - required OCI ownership metadata is missing
 - a scale-down targets a Slinky-managed pool
 - OCI target discovery cannot resolve the compartment
+- another `mgmt-oke` mutation holds the Kubernetes Lease
 
 Scale-up remains available for a Slinky-managed pool. Scale-down requires a
 future Slurm-aware drain workflow and is currently refused.
 
 Avoid scaling an OKE system pool to zero. The CLI validates numeric size but
 does not replace the operational minimums required by the cluster.
+
+The Lease is enabled by default. Use `--no-lock` only for an intentional
+recovery operation when Kubernetes Lease access is unavailable.
 
 ## Verification
 
@@ -186,6 +215,8 @@ value.
 
 ## Troubleshooting
 
-If `--wait` times out, the resize request might still be active. Re-run the
-read-only inventory commands and inspect the OCI work request before submitting
-another resize. A timeout does not imply rollback.
+If OCI reports a failed work request, resolve the reported service error before
+retrying. If `--wait` times out without an OCI failure, the resize request might
+still be active. Re-run the read-only inventory commands and inspect the OCI
+work request before submitting another resize. A timeout does not imply
+rollback.

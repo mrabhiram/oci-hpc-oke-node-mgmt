@@ -190,6 +190,8 @@ class DiscoverySnapshot:
     autoscaler_entries: list[AutoscalerEntry] = field(default_factory=list)
     kueue: KueueSummary = field(default_factory=KueueSummary)
     warnings: list[str] = field(default_factory=list)
+    oci_discovery_enabled: bool = True
+    kubernetes_discovery_enabled: bool = True
 
     def pool_by_name(self, name: str) -> WorkerPoolInfo | None:
         for pool in self.pools:
@@ -227,6 +229,57 @@ class PoolResourceReadiness:
     gpu_ready: int | None = None
     rdma_topology_ready: int | None = None
     rdma_vf_ready: int | None = None
+
+
+@dataclass(frozen=True)
+class OperationPlan:
+    operation: str
+    target: str
+    pool: str | None = None
+    owner: str | None = None
+    current_size: int | None = None
+    target_size: int | None = None
+    decrement_size: bool | None = None
+    workload_pods: int = 0
+    steps: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class DrainPod:
+    namespace: str
+    name: str
+    phase: str | None = None
+    controller: str | None = None
+    daemonset: bool = False
+    mirror: bool = False
+    has_empty_dir: bool = False
+    eviction_blocker: str | None = None
+
+    @property
+    def evictable(self) -> bool:
+        return not self.daemonset and not self.mirror
+
+
+@dataclass(frozen=True)
+class HealthResult:
+    check: str
+    scope: str
+    status: str
+    message: str
+    recommendation: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkRequestInfo:
+    work_request_id: str
+    status: str
+    percent_complete: float | None = None
+    errors: tuple[str, ...] = ()
+
+    @property
+    def failed(self) -> bool:
+        return self.status.upper() in {"FAILED", "CANCELED", "CANCELLED"}
 
 
 def _valid_topology_value(value: str | None) -> bool:

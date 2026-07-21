@@ -17,7 +17,8 @@ different.
 
 - an OCI HPC OKE cluster with an RDMA worker pool
 - working OCI and Kubernetes discovery
-- IAM permission to read and, for mutations, manage the owning pool resource
+- IAM permission to read and, for mutations, manage the owning pool resource;
+  `--wait` also requires permission to inspect its work requests
 - GPU and network device plug-ins initialized on the workers
 
 ## Identify the RDMA Ownership Model
@@ -45,7 +46,8 @@ exposes `cluster_network_id` and `instance_pool_id`.
 ## Add an RDMA Worker
 
 ```bash
-mgmt-oke --auth instance_principal pools resize oke-rdma --delta 1 --wait
+mgmt-oke --auth instance_principal pools add oke-rdma --count 1 --dry-run
+mgmt-oke --auth instance_principal pools add oke-rdma --count 1 --wait
 ```
 
 For the managed model, OKE increases `node_config_details.size` and places the
@@ -65,7 +67,8 @@ configuration.
 Reduce desired pool size by one without choosing a specific worker:
 
 ```bash
-mgmt-oke --auth instance_principal pools resize oke-rdma --delta -1 --wait
+mgmt-oke --auth instance_principal pools remove oke-rdma --count 1 --dry-run
+mgmt-oke --auth instance_principal pools remove oke-rdma --count 1 --wait
 ```
 
 This operation delegates worker selection to OKE or Compute Management. It is
@@ -75,7 +78,8 @@ particular A100 or other RDMA worker.
 Choose a specific worker and decrement desired size:
 
 ```bash
-mgmt-oke --auth instance_principal nodes remove <rdma-node-name-or-ip> --wait
+mgmt-oke --auth instance_principal nodes terminate <rdma-node-name-or-ip> --dry-run
+mgmt-oke --auth instance_principal nodes terminate <rdma-node-name-or-ip> --wait
 ```
 
 For predictable maintenance, selecting a node is preferable when one worker is
@@ -84,7 +88,7 @@ known to be unhealthy. Review workload and topology data before removal.
 ## Replace a Specific RDMA Worker
 
 ```bash
-mgmt-oke --auth instance_principal nodes remove <rdma-node-name-or-ip> \
+mgmt-oke --auth instance_principal nodes terminate <rdma-node-name-or-ip> \
   --keep-size --wait
 ```
 
@@ -112,6 +116,12 @@ desired=3 oci_active=3 k8s_ready=3 gpu_ready=3 rdma_ready=3
 
 `--wait` continues until every applicable value reaches the target. When the
 NVIDIA Network Operator is active, `rdma_vf_ready` must also reach the target.
+The OCI work request is checked during the same loop. For a self-managed
+Cluster Network, the tool snapshots existing resource requests before the
+mutation, allowing it to identify the new request even when
+`UpdateClusterNetwork` omits a work-request header. Capacity, placement, or
+other OCI failures are returned immediately instead of waiting for the
+convergence timeout.
 
 ## Verify Topology and Resources
 
@@ -120,6 +130,8 @@ mgmt-oke --auth instance_principal nodes list --pool oke-rdma
 mgmt-oke --auth instance_principal nodes list --rdma-only
 mgmt-oke --auth instance_principal topology list --pool oke-rdma
 mgmt-oke --auth instance_principal addons status
+mgmt-oke --auth instance_principal addons validate --target rdma --pool oke-rdma
+mgmt-oke --auth instance_principal health run --type rdma --pool oke-rdma
 ```
 
 Every Ready RDMA worker should have valid values for:

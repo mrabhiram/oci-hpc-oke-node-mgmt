@@ -10,6 +10,8 @@ HPC OKE operator node. For the project overview and command summary, see the
   `mgmt-oke` and `kubectl-oke` on a stack operator node.
 - [Operator Quick Start](./operator-quickstart.md): Validate access and inspect a
   cluster without changing any resources.
+- [Command Reference](./command-reference.md): Review every command, selector,
+  output control, mutation option, and exit status.
 - [Architecture](./architecture.md): Understand automatic OCI target discovery,
   worker-pool ownership, API routing, readiness, and safety boundaries.
 
@@ -20,7 +22,7 @@ HPC OKE operator node. For the project overview and command summary, see the
   nodes, add-ons, topology, Cluster Autoscaler, and Kueue.
 - [Verifying GPU and RDMA Readiness](./verifying-gpu-and-rdma-readiness.md):
   Check GPU allocation, RDMA topology, Network Operator virtual functions, and
-  post-resize convergence.
+  deterministic health and add-on validation.
 - [Using JSON and CSV Output](./using-json-and-csv-output.md): Consume inventory
   safely from scripts, `jq`, spreadsheets, and monitoring workflows.
 
@@ -30,7 +32,7 @@ HPC OKE operator node. For the project overview and command summary, see the
   from managed OKE, Compute Cluster-backed, Cluster Network, and standalone
   Instance Pools.
 - [Removing and Replacing Worker Nodes](./removing-and-replacing-worker-nodes.md):
-  Remove a selected worker or replace it while preserving pool size.
+  Drain and terminate selected workers or replace them while preserving pool size.
 - [Managing RDMA Worker Pools](./managing-rdma-worker-pools.md): Operate both the
   OKE v26.7 Compute Cluster model and legacy self-managed Cluster Network model.
 

@@ -196,9 +196,11 @@ class DiscoveryTests(unittest.TestCase):
             skip_oci=True,
         )
 
-        service.discover()
+        snapshot = service.discover()
 
         load_context.assert_not_called()
+        self.assertFalse(snapshot.oci_discovery_enabled)
+        self.assertTrue(snapshot.kubernetes_discovery_enabled)
 
     def test_managed_compute_cluster_metadata_is_used_to_filter_instance_pools(self):
         managed = WorkerPoolInfo(
@@ -314,6 +316,8 @@ class DiscoveryTests(unittest.TestCase):
 
         self.assertEqual(1, len(snapshot.addons))
         self.assertEqual([], snapshot.warnings)
+        self.assertTrue(snapshot.oci_discovery_enabled)
+        self.assertFalse(snapshot.kubernetes_discovery_enabled)
 
 
 if __name__ == "__main__":

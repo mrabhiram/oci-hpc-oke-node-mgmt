@@ -91,10 +91,24 @@ kubectl get node <node-name> --show-labels
 
 ```bash
 mgmt-oke --auth instance_principal addons status
+mgmt-oke --auth instance_principal addons validate --target gpu
+mgmt-oke --auth instance_principal addons validate --target rdma --pool oke-rdma
 ```
 
 Review `state`, `version`, `active`, and `error`. The add-on view is read-only;
 the CLI does not install, update, or remove OKE add-ons.
+
+Validation correlates add-on lifecycle with discovered capacity. It checks Node
+Feature Discovery for accelerator pools, GPU Operator for NVIDIA pools, Network
+Operator state for RDMA, GPU allocation, RDMA topology, and required RDMA VFs.
+
+Run the underlying health categories directly when diagnosing a failure:
+
+```bash
+mgmt-oke --auth instance_principal health run --type gpu --pool oke-gpu
+mgmt-oke --auth instance_principal health run --type rdma --pool oke-rdma
+mgmt-oke --auth instance_principal recommendations list --type rdma --pool oke-rdma
+```
 
 ## Verify Network Operator Virtual Functions
 
@@ -121,7 +135,7 @@ mgmt-oke --auth instance_principal pools resize <pool-name> --delta 1 --wait
 or:
 
 ```bash
-mgmt-oke --auth instance_principal nodes remove <node-name-or-ip> \
+mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> \
   --keep-size --wait
 ```
 
@@ -140,7 +154,7 @@ counts equal the target before the operation reports `ready` or `removed`.
 When RDMA VF readiness is required, the status also includes
 `rdma_vf_ready=<count>`.
 
-For `nodes remove --keep-size`, the waiter additionally requires
+For `nodes terminate --keep-size`, the waiter additionally requires
 `node_present=False` for the selected worker before accepting the replacement
 as complete.
 

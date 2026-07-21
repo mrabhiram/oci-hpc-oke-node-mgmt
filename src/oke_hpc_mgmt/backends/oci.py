@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-from oke_hpc_mgmt.models import AddonInfo, WorkerPoolInfo
+from oke_hpc_mgmt.models import AddonInfo, WorkerPoolInfo, WorkRequestInfo
 
 
 class OciDiscoveryError(RuntimeError):
@@ -31,6 +31,7 @@ class OciBackend:
         self._container_engine = None
         self._compute_mgmt = None
         self._compute = None
+        self._work_requests = None
 
     def _ensure_loaded(self) -> None:
         if self._oci is not None:
@@ -42,6 +43,7 @@ class OciBackend:
             import oci.container_engine
             import oci.core
             import oci.pagination
+            import oci.work_requests
         except ImportError as exc:
             raise OciDiscoveryError(
                 "The oci Python package is not installed. Install the project dependencies first."
@@ -90,6 +92,15 @@ class OciBackend:
         if self._compute is None:
             self._compute = self.oci.core.ComputeClient(config=self._config or {}, signer=self._signer)
         return self._compute
+
+    @property
+    def work_requests(self):
+        self._ensure_loaded()
+        if self._work_requests is None:
+            self._work_requests = self.oci.work_requests.WorkRequestClient(
+                config=self._config or {}, signer=self._signer
+            )
+        return self._work_requests
 
     @staticmethod
     def _call(operation: str, function: Callable[..., T], *args: Any, **kwargs: Any) -> T:
@@ -181,6 +192,74 @@ class OciBackend:
             )
             for addon in response.data
         ]
+
+    def get_work_request_status(
+        self,
+        work_request_id: str,
+        compartment_id: str | None = None,
+    ) -> WorkRequestInfo:
+        is_oke_work_request = work_request_id.startswith("ocid1.clustersworkrequest")
+        client = self.container_engine if is_oke_work_request else self.work_requests
+        response = self._call(
+            "OCI work request lookup",
+            client.get_work_request,
+            work_request_id,
+        )
+        status = str(getattr(response.data, "status", "UNKNOWN"))
+        percent = getattr(response.data, "percent_complete", None)
+        errors: tuple[str, ...] = ()
+        if status.upper() in {"FAILED", "CANCELED", "CANCELLED"}:
+            error_args: tuple[str, ...]
+            if is_oke_work_request:
+                if not compartment_id:
+                    raise OciDiscoveryError(
+                        "OKE work request error lookup requires the compartment OCID."
+                    )
+                error_args = (compartment_id, work_request_id)
+            else:
+                error_args = (work_request_id,)
+            error_response = self._call(
+                "OCI work request error lookup",
+                self.oci.pagination.list_call_get_all_results,
+                client.list_work_request_errors,
+                *error_args,
+            )
+            errors = tuple(
+                _work_request_error(error) for error in error_response.data
+            )
+        return WorkRequestInfo(
+            work_request_id=work_request_id,
+            status=status,
+            percent_complete=float(percent) if percent is not None else None,
+            errors=errors,
+        )
+
+    def list_resource_work_requests(
+        self,
+        compartment_id: str,
+        resource_id: str,
+    ) -> list[WorkRequestInfo]:
+        response = self._call(
+            "OCI resource work request listing",
+            self.oci.pagination.list_call_get_all_results,
+            self.work_requests.list_work_requests,
+            compartment_id,
+            resource_id=resource_id,
+        )
+        work_requests: list[WorkRequestInfo] = []
+        for summary in response.data:
+            work_request_id = getattr(summary, "id", None)
+            if not isinstance(work_request_id, str) or not work_request_id:
+                continue
+            percent = getattr(summary, "percent_complete", None)
+            work_requests.append(
+                WorkRequestInfo(
+                    work_request_id=work_request_id,
+                    status=str(getattr(summary, "status", "UNKNOWN")),
+                    percent_complete=float(percent) if percent is not None else None,
+                )
+            )
+        return work_requests
 
     def resize_managed_node_pool(self, node_pool_id: str, size: int) -> str | None:
         if size < 0:
@@ -480,6 +559,12 @@ def _addon_error(addon: Any) -> str | None:
     if error is None:
         return None
     return str(error)
+
+
+def _work_request_error(error: Any) -> str:
+    code = getattr(error, "code", None)
+    message = getattr(error, "message", None) or str(error)
+    return f"{code}: {message}" if code else str(message)
 
 
 def _object_id(item: Any) -> str | None:

@@ -1,8 +1,7 @@
 # Operator Quick Start
 
 This guide validates a new `mgmt-oke` installation and builds a read-only view
-of an OCI HPC OKE cluster. The commands in this guide do not resize pools or
-remove nodes.
+of an OCI HPC OKE cluster. Every command in this guide is read-only.
 
 ## Prerequisites
 
@@ -111,7 +110,20 @@ An empty topology view is expected when the cluster has no RDMA workers. For an
 RDMA pool, topology output should contain valid HPC Island, Network Block, and
 Local Block values.
 
-### Step 7: Build a Full Snapshot
+### Step 7: Run Health And Add-on Validation
+
+```bash
+mgmt-oke --auth instance_principal status
+mgmt-oke --auth instance_principal health run
+mgmt-oke --auth instance_principal addons validate --target all
+mgmt-oke --auth instance_principal recommendations list
+```
+
+`status` and `health run` return `1` for warnings and `2` for failures, making
+them suitable for monitoring and installation gates. Optional components, such
+as Network Operator on a host-network RDMA deployment, are informational.
+
+### Step 8: Build a Full Snapshot
 
 ```bash
 mgmt-oke --auth instance_principal reconcile
@@ -133,6 +145,7 @@ The installation is ready for operator use when:
 - `desired`, `oci_active`, and `k8s_ready` agree for stable pools
 - GPU nodes report an allocatable GPU resource
 - RDMA nodes appear in `topology list`
+- `health run` contains no unexplained warnings or failures
 - the command completes without target-discovery or authentication warnings
 
 Review the [Verifying GPU and RDMA Readiness](./verifying-gpu-and-rdma-readiness.md)
