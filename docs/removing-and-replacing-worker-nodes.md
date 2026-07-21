@@ -5,11 +5,12 @@ replace it while preserving the pool's desired size.
 
 ## Overview
 
-`nodes remove` always targets a specific Kubernetes worker. The node can be
+`nodes terminate` always targets selected Kubernetes workers. `nodes remove`
+is an equivalent compatibility alias. A node can be
 identified by Kubernetes name, Slinky name, internal IP, provider ID, or OCI
 instance OCID.
 
-Use `nodes remove` instead of pool-level scale-down when the identity of the
+Use `nodes terminate` instead of pool-level scale-down when the identity of the
 departing worker matters. `pools resize --delta -1` reduces capacity but leaves
 worker selection to the owning OCI service.
 
@@ -27,8 +28,10 @@ the owning service launches a replacement.
 ## Prerequisites
 
 - complete OCI and Kubernetes inventory
-- IAM permission to delete an OKE node or detach an Instance Pool instance
-- application workloads safely evacuated or explicitly accepted
+- IAM permission to delete an OKE node or detach an Instance Pool instance and
+  inspect its work requests when using `--wait`
+- Kubernetes permission to read nodes and pods, patch nodes, create pod
+  evictions, and manage the `kube-system/mgmt-oke-mutation` Lease
 - no Cluster Autoscaler ownership of the target pool
 - no Slinky ownership of the target node or pool
 
@@ -56,24 +59,37 @@ mgmt-oke --auth instance_principal nodes list --pool <pool-name>
 mgmt-oke --auth instance_principal pools get <pool-name>
 ```
 
-### Step 2: Remove and Decrement Pool Size
+### Step 2: Preview Drain And Termination
+
+```bash
+mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> --dry-run
+```
+
+Preflight resolves the owning OCI service, calculates target capacity, lists
+pods, checks dry-run eviction admission, and reports every planned step. It
+does not cordon, evict, or terminate the node.
+
+### Step 3: Remove and Decrement Pool Size
 
 Use the default operation when the selected node and one unit of desired
 capacity should both be removed:
 
 ```bash
-mgmt-oke --auth instance_principal nodes remove <node-name-or-ip> --wait
+mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> --wait
 ```
 
 The CLI asks for the exact node name before submitting the mutation. The final
 target size is the current desired size minus one.
 
-### Step 3: Replace and Keep Pool Size
+By default, the CLI acquires the mutation Lease, cordons the node, evicts
+eligible pods, and then invokes the owning OCI termination API.
+
+### Step 4: Replace and Keep Pool Size
 
 Use `--keep-size` when the selected worker should be replaced:
 
 ```bash
-mgmt-oke --auth instance_principal nodes remove <node-name-or-ip> \
+mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> \
   --keep-size --wait
 ```
 
@@ -81,7 +97,7 @@ For a managed pool, OKE deletes the node with `is_decrement_size=false`. For a
 self-managed pool, Compute Management detaches and automatically terminates the
 instance with `is_decrement_size=false`. The pool then creates a replacement.
 
-### Step 4: Verify the Result
+### Step 5: Verify the Result
 
 ```bash
 mgmt-oke --auth instance_principal pools get <pool-name>
@@ -95,6 +111,8 @@ readiness.
 The replacement wait does not finish merely because the selected node has
 disappeared. It also requires desired size, active OCI membership, Kubernetes
 Ready count, and applicable GPU, RDMA topology, and RDMA VF counts to converge.
+When OCI returns work-request identifiers, the waiter monitors each request and
+reports a failed or canceled operation immediately.
 
 ## Managed OKE Eviction Options
 
@@ -102,7 +120,7 @@ Managed OKE deletion uses a default eviction grace duration of `PT10M`.
 Override it when workloads need more time:
 
 ```bash
-mgmt-oke --auth instance_principal nodes remove <node-name> \
+mgmt-oke --auth instance_principal nodes terminate <node-name> \
   --keep-size --eviction-grace PT20M --wait
 ```
 
@@ -110,29 +128,51 @@ mgmt-oke --auth instance_principal nodes remove <node-name> \
 grace period:
 
 ```bash
-mgmt-oke --auth instance_principal nodes remove <node-name> \
+mgmt-oke --auth instance_principal nodes terminate <node-name> \
   --keep-size --eviction-grace PT20M --force-after-grace --wait
 ```
 
 These options apply only to managed OKE node pools. They are rejected for
 Cluster Network and standalone Instance Pool nodes.
 
-## Workload Safety
+## Kubernetes Drain Safety
 
-The CLI refuses removal when ordinary workload pods are running on the node.
-DaemonSets, mirror pods, and known system-namespace pods are counted separately.
+Drain is enabled by default. The CLI cordons every selected worker, ignores
+DaemonSet and mirror pods, and submits the remaining pods through the
+`policy/v1` Eviction API. PodDisruptionBudgets can delay or block the operation;
+the command retries until `--drain-timeout` expires.
 
-`--allow-workloads` bypasses the workload-count refusal:
+Pod-local `emptyDir` data requires explicit acknowledgement:
 
 ```bash
-mgmt-oke --auth instance_principal nodes remove <node-name-or-ip> \
-  --keep-size --allow-workloads --wait
+mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> \
+  --delete-emptydir-data --wait
 ```
 
-> [!WARNING]
-> The self-managed Instance Pool path does not implement a Kubernetes cordon or
-> drain. Drain and validate a self-managed node before using
-> `--allow-workloads`. Managed OKE deletion delegates eviction to OKE.
+Pods without a controller require `--force` because Kubernetes will not
+recreate them:
+
+```bash
+mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> \
+  --force --wait
+```
+
+Use `--no-drain` only when the worker has already been drained by an external
+workflow. If ordinary workload pods remain, `--allow-workloads` is also
+required:
+
+```bash
+mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> \
+  --no-drain --allow-workloads --wait
+```
+
+Standalone node maintenance uses the same selection and eviction engine:
+
+```bash
+mgmt-oke nodes cordon <node-name>
+mgmt-oke nodes drain <node-name>
+mgmt-oke nodes uncordon <node-name>
+```
 
 ## Non-Interactive Execution
 
@@ -140,7 +180,7 @@ Use `--yes` only after automation has selected the node and checked workload,
 pool, autoscaler, and Slinky state:
 
 ```bash
-mgmt-oke --auth instance_principal nodes remove <node-name-or-ip> \
+mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> \
   --keep-size --wait --yes
 ```
 
@@ -152,9 +192,12 @@ The CLI refuses node removal when:
 - the owning pool cannot be determined
 - Cluster Autoscaler owns the pool
 - the pool or node is Slinky-managed
-- workload pods are present without `--allow-workloads`
+- `--no-drain` is selected with workload pods and without `--allow-workloads`
+- drain would delete `emptyDir` data without acknowledgement
+- drain would evict a pod without a controller and `--force` is absent
 - managed-only eviction options are supplied for a self-managed pool
 - OCI target discovery fails
+- another mutation holds the Kubernetes Lease
 
 There is no force option that bypasses Cluster Autoscaler or Slinky ownership
 protection.

@@ -1,50 +1,91 @@
+from __future__ import annotations
+
+import json
 import io
 import os
 import sys
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr
 from unittest.mock import Mock, patch
 
-from oke_hpc_mgmt.cli import (
-    _configure_oci_cli_auth,
-    _program_name,
-    _readiness_status,
-    _resource_counts_match,
-    build_parser,
-    cmd_addons_status,
-    cmd_nodes_remove,
-    cmd_pools_resize,
-)
+from click.testing import CliRunner
+
+from oke_hpc_mgmt.cli import _configure_oci_cli_auth, _program_name, main
+from oke_hpc_mgmt.commands import cli
 from oke_hpc_mgmt.models import (
     AddonInfo,
     DiscoverySnapshot,
     NodeInfo,
-    PoolResourceReadiness,
+    OperationPlan,
     WorkerPoolInfo,
 )
+from oke_hpc_mgmt.workflows.lifecycle import PreparedNodeRemoval, PreparedPoolResize
+from oke_hpc_mgmt.workflows.node_maintenance import PreparedNodeMaintenance
 
 
 class CliTests(unittest.TestCase):
-    def test_kube_context_environment_variable_is_not_used(self):
-        with patch.dict(os.environ, {"KUBE_CONTEXT": "unexpected-context"}):
-            args = build_parser().parse_args(["pools", "list"])
+    def setUp(self) -> None:
+        self.runner = CliRunner()
 
-        self.assertIsNone(args.context)
+    def test_global_help_exposes_modular_command_families(self):
+        result = self.runner.invoke(cli, ["--help"])
 
-    def test_explicit_context_override_is_supported(self):
-        args = build_parser().parse_args(
-            ["--context", "operator-context", "pools", "list"]
+        self.assertEqual(0, result.exit_code)
+        self.assertIn("Management CLI for OCI HPC OKE", result.output)
+        for command in (
+            "status",
+            "pools",
+            "nodes",
+            "topology",
+            "autoscaler",
+            "addons",
+            "health",
+            "recommendations",
+            "reconcile",
+        ):
+            self.assertIn(command, result.output)
+
+    def test_node_lifecycle_help_exposes_remove_alias_and_maintenance(self):
+        result = self.runner.invoke(cli, ["nodes", "--help"])
+
+        self.assertEqual(0, result.exit_code)
+        for command in ("remove", "terminate", "cordon", "drain", "uncordon"):
+            self.assertIn(command, result.output)
+
+    def test_pool_resize_help_defines_delta_signs(self):
+        result = self.runner.invoke(cli, ["pools", "resize", "--help"])
+
+        self.assertEqual(0, result.exit_code)
+        self.assertIn(
+            "positive adds nodes; negative removes nodes",
+            " ".join(result.output.split()),
         )
 
-        self.assertEqual("operator-context", args.context)
+    def test_kube_context_environment_variable_is_not_used(self):
+        service = Mock()
+        service.discover.return_value = DiscoverySnapshot()
+        with (
+            patch.dict(os.environ, {"KUBE_CONTEXT": "unexpected-context"}),
+            patch("oke_hpc_mgmt.commands.common.DiscoveryService", return_value=service) as factory,
+        ):
+            result = self.runner.invoke(cli, ["--auth", "none", "pools", "list"])
 
-    def test_global_help_describes_target_discovery_modes(self):
-        help_text = " ".join(build_parser().format_help().split())
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIsNone(factory.call_args.args[0].context)
 
-        self.assertIn("resolved from the OKE cluster", help_text)
-        self.assertIn("read from the selected kubeconfig context", help_text)
-        self.assertIn("Automatic kubeconfig target discovery is unavailable", help_text)
-        self.assertIn("Skip OCI inventory and disable OCI-backed mutations", help_text)
+    def test_explicit_context_override_is_supported(self):
+        service = Mock()
+        service.discover.return_value = DiscoverySnapshot()
+        with patch(
+            "oke_hpc_mgmt.commands.common.DiscoveryService", return_value=service
+        ) as factory:
+            result = self.runner.invoke(
+                cli,
+                ["--auth", "none", "--context", "operator-context", "pools", "list"],
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual("operator-context", factory.call_args.args[0].context)
 
     def test_instance_principal_is_propagated_to_kubeconfig_oci_exec(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -57,12 +98,6 @@ class CliTests(unittest.TestCase):
             _configure_oci_cli_auth("instance_principal")
 
             self.assertEqual("security_token", os.environ["OCI_CLI_AUTH"])
-
-    def test_empty_kubeconfig_oci_exec_auth_uses_selected_principal(self):
-        with patch.dict(os.environ, {"OCI_CLI_AUTH": ""}, clear=True):
-            _configure_oci_cli_auth("resource_principal")
-
-            self.assertEqual("resource_principal", os.environ["OCI_CLI_AUTH"])
 
     def test_config_file_auth_does_not_set_kubeconfig_oci_exec_auth(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -78,227 +113,245 @@ class CliTests(unittest.TestCase):
         with patch.object(sys, "argv", ["/usr/local/bin/kubectl-oke"]):
             self.assertEqual("kubectl oke", _program_name())
 
-    def test_addons_status_is_registered(self):
-        args = build_parser().parse_args(
-            [
-                "--auth",
-                "instance_principal",
-                "--cluster-id",
-                "cluster-1",
-                "addons",
-                "status",
-            ]
-        )
+    def test_addons_status_requires_oci_auth_with_stable_exit_code(self):
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(2, main(["--auth", "none", "addons", "status"]))
 
-        self.assertIs(cmd_addons_status, args.handler)
+    def test_unknown_command_has_usage_exit_code(self):
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(2, main(["does-not-exist"]))
 
-    def test_addons_status_requires_oci_auth(self):
-        args = build_parser().parse_args(["--auth", "none", "addons", "status"])
-        stderr = io.StringIO()
-
-        with redirect_stderr(stderr):
-            result = cmd_addons_status(args)
-
-        self.assertEqual(2, result)
-        self.assertIn("requires OCI auth", stderr.getvalue())
-
-    def test_addons_status_resolves_cluster_from_kubeconfig(self):
-        args = build_parser().parse_args(
-            ["--auth", "instance_principal", "addons", "status"]
-        )
+    def test_status_is_degraded_when_discovery_is_partial(self):
         service = Mock()
         service.discover.return_value = DiscoverySnapshot(
-            addons=[AddonInfo(name="NodeFeatureDiscovery", lifecycle_state="ACTIVE")]
+            warnings=["OCI discovery skipped: access denied"]
         )
-
-        with (
-            patch("oke_hpc_mgmt.cli.DiscoveryService", return_value=service),
-            redirect_stdout(io.StringIO()),
-        ):
-            result = cmd_addons_status(args)
-
-        self.assertEqual(0, result)
-        service.resolve_oci_target.assert_called_once_with(require_cluster=True)
-
-    def test_compute_cluster_backed_pool_resize_uses_oke_api(self):
-        pool = WorkerPoolInfo(
-            name="oke-rdma",
-            kind="node-pool",
-            placement_type="compute-cluster",
-            compute_cluster_id="compute-cluster-1",
-            node_pool_id="node-pool-1",
-            desired_size=2,
-        )
-        args = build_parser().parse_args(
-            [
-                "--auth",
-                "instance_principal",
-                "--cluster-id",
-                "cluster-1",
-                "pools",
-                "resize",
-                "oke-rdma",
-                "--delta",
-                "1",
-                "--yes",
-            ]
-        )
-        backend = Mock()
-        backend.resize_managed_node_pool.return_value = "work-request-1"
-        service = Mock()
-        service.discover.return_value = DiscoverySnapshot(pools=[pool])
-        service.oci_backend.return_value = backend
-
-        with (
-            patch("oke_hpc_mgmt.cli.DiscoveryService", return_value=service),
-            redirect_stdout(io.StringIO()),
-        ):
-            result = cmd_pools_resize(args)
-
-        self.assertEqual(0, result)
-        service.resolve_oci_target.assert_called_once_with(require_compartment=True)
-        backend.resize_managed_node_pool.assert_called_once_with("node-pool-1", 3)
-        backend.resize_instance_pool.assert_not_called()
-
-    def test_slinky_pool_scale_down_is_refused_before_oci_call(self):
-        pool = WorkerPoolInfo(
-            name="oke-rdma",
-            kind="node-pool",
-            node_pool_id="node-pool-1",
-            desired_size=2,
-            slinky_managed=True,
-        )
-        args = build_parser().parse_args(
-            [
-                "--auth",
-                "instance_principal",
-                "--compartment-id",
-                "compartment-1",
-                "pools",
-                "resize",
-                "oke-rdma",
-                "--delta",
-                "-1",
-                "--yes",
-            ]
-        )
+        stdout = io.StringIO()
         stderr = io.StringIO()
-        service = Mock()
-        service.discover.return_value = DiscoverySnapshot(pools=[pool])
-
         with (
-            patch("oke_hpc_mgmt.cli.DiscoveryService", return_value=service),
+            patch("oke_hpc_mgmt.commands.common.DiscoveryService", return_value=service),
             redirect_stderr(stderr),
+            patch("sys.stdout", new=stdout),
         ):
-            result = cmd_pools_resize(args)
+            exit_status = main(["--auth", "none", "status"])
 
-        self.assertEqual(2, result)
-        self.assertIn("Slurm-aware drain", stderr.getvalue())
-        service.oci_backend.assert_not_called()
+        self.assertEqual(1, exit_status)
+        self.assertIn("DEGRADED", stdout.getvalue())
+        self.assertIn("OCI discovery skipped", stderr.getvalue())
 
-    def test_compute_cluster_backed_node_removal_uses_oke_delete(self):
+    def test_pool_resize_dry_run_prints_plan_without_execution(self):
         pool = WorkerPoolInfo(
             name="oke-rdma",
             kind="node-pool",
-            placement_type="compute-cluster",
+            desired_size=2,
             node_pool_id="node-pool-1",
-            desired_size=2,
         )
-        node = NodeInfo(
-            k8s_name="10.0.0.1",
-            instance_ocid="instance-1",
-            pool_name="oke-rdma",
+        prepared = PreparedPoolResize(
+            snapshot=DiscoverySnapshot(pools=[pool]),
+            pool=pool,
+            plan=OperationPlan(
+                operation="pool-resize",
+                target="oke-rdma",
+                pool="oke-rdma",
+                current_size=2,
+                target_size=3,
+                steps=("resize",),
+            ),
         )
-        args = build_parser().parse_args(
-            [
-                "--auth",
-                "instance_principal",
-                "nodes",
-                "remove",
-                "10.0.0.1",
-                "--keep-size",
-                "--yes",
+        with (
+            patch("oke_hpc_mgmt.commands.pools.prepare_pool_resize", return_value=prepared),
+            patch("oke_hpc_mgmt.commands.pools.execute_pool_resize") as execute,
+        ):
+            result = self.runner.invoke(
+                cli,
+                [
+                    "--auth",
+                    "instance_principal",
+                    "pools",
+                    "resize",
+                    "oke-rdma",
+                    "--delta",
+                    "1",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(3, json.loads(result.output)[0]["target_size"])
+        execute.assert_not_called()
+
+    def test_pool_add_translates_count_to_positive_delta(self):
+        pool = WorkerPoolInfo(name="oke-cpu", kind="node-pool", desired_size=1)
+        prepared = PreparedPoolResize(
+            snapshot=DiscoverySnapshot(pools=[pool]),
+            pool=pool,
+            plan=OperationPlan(operation="pool-resize", target="oke-cpu"),
+        )
+        with patch(
+            "oke_hpc_mgmt.commands.pools.prepare_pool_resize", return_value=prepared
+        ) as prepare:
+            result = self.runner.invoke(
+                cli,
+                ["pools", "add", "oke-cpu", "--count", "2", "--dry-run"],
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(2, prepare.call_args.kwargs["delta"])
+
+    def test_pool_remove_translates_count_to_negative_delta(self):
+        pool = WorkerPoolInfo(name="oke-cpu", kind="node-pool", desired_size=3)
+        prepared = PreparedPoolResize(
+            snapshot=DiscoverySnapshot(pools=[pool]),
+            pool=pool,
+            plan=OperationPlan(operation="pool-resize", target="oke-cpu"),
+        )
+        with patch(
+            "oke_hpc_mgmt.commands.pools.prepare_pool_resize", return_value=prepared
+        ) as prepare:
+            result = self.runner.invoke(
+                cli,
+                ["pools", "remove", "oke-cpu", "--count", "2", "--dry-run"],
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(-2, prepare.call_args.kwargs["delta"])
+
+    def test_nodes_list_filters_projects_sorts_and_prints_one_line(self):
+        service = Mock()
+        service.discover.return_value = DiscoverySnapshot(
+            nodes=[
+                NodeInfo("gpu-b", pool_name="oke-gpu", ready=True),
+                NodeInfo("gpu-a", pool_name="oke-gpu", ready=True),
+                NodeInfo("cpu-a", pool_name="oke-cpu", ready=True),
             ]
         )
-        backend = Mock()
-        backend.delete_node.return_value = "work-request-1"
+        with patch("oke_hpc_mgmt.commands.common.DiscoveryService", return_value=service):
+            result = self.runner.invoke(
+                cli,
+                [
+                    "--auth",
+                    "none",
+                    "nodes",
+                    "list",
+                    "--fields",
+                    "pool=oke-gpu,ready=true",
+                    "--columns",
+                    "name,pool,ready,schedulable",
+                    "--sort",
+                    "name",
+                    "--one-line",
+                ],
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual("gpu-a,gpu-b", result.output.strip())
+
+    def test_nodes_list_projects_ready_and_schedulable_columns(self):
         service = Mock()
-        service.discover.return_value = DiscoverySnapshot(pools=[pool], nodes=[node])
-        service.oci_backend.return_value = backend
+        service.discover.return_value = DiscoverySnapshot(
+            nodes=[NodeInfo("gpu-a", ready=True, schedulable=False)]
+        )
+        with patch("oke_hpc_mgmt.commands.common.DiscoveryService", return_value=service):
+            result = self.runner.invoke(
+                cli,
+                [
+                    "--auth",
+                    "none",
+                    "nodes",
+                    "list",
+                    "--columns",
+                    "name,ready,schedulable",
+                    "--sort",
+                    "schedulable,name",
+                ],
+            )
 
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIn("gpu-a", result.output)
+        self.assertIn("yes", result.output)
+        self.assertIn("no", result.output)
+
+    def test_nodes_remove_alias_uses_shared_termination_dry_run(self):
+        node = NodeInfo("cpu-1", pool_name="oke-cpu", instance_ocid="instance-1")
+        pool = WorkerPoolInfo("oke-cpu", "node-pool", desired_size=1)
+        prepared = PreparedNodeRemoval(
+            snapshot=DiscoverySnapshot(pools=[pool], nodes=[node]),
+            nodes=(node,),
+            pools={"oke-cpu": pool},
+            plans=(OperationPlan("node-remove", "cpu-1", pool="oke-cpu"),),
+            drain_pods={},
+            target_sizes={"oke-cpu": 0},
+            decrement_size=True,
+        )
         with (
-            patch("oke_hpc_mgmt.cli.DiscoveryService", return_value=service),
-            redirect_stdout(io.StringIO()),
+            patch("oke_hpc_mgmt.commands.nodes.prepare_node_removal", return_value=prepared),
+            patch("oke_hpc_mgmt.commands.nodes.execute_node_removal") as execute,
         ):
-            result = cmd_nodes_remove(args)
+            result = self.runner.invoke(
+                cli,
+                ["nodes", "remove", "cpu-1", "--dry-run", "--format", "json"],
+            )
 
-        self.assertEqual(0, result)
-        service.resolve_oci_target.assert_called_once_with(require_compartment=True)
-        backend.delete_node.assert_called_once_with(
-            "node-pool-1",
-            "instance-1",
-            decrement_size=False,
-            override_eviction_grace_duration="PT10M",
-            force_after_grace=False,
-        )
-        backend.detach_instance_pool_node.assert_not_called()
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual("node-remove", json.loads(result.output)[0]["operation"])
+        execute.assert_not_called()
 
-    def test_slinky_node_removal_is_refused_even_with_allow_workloads(self):
-        pool = WorkerPoolInfo(
-            name="oke-rdma",
-            kind="cluster-network",
-            instance_pool_id="instance-pool-1",
-            desired_size=2,
-            slinky_managed=True,
+    def test_node_maintenance_dry_run_never_executes(self):
+        node = NodeInfo("cpu-1", pool_name="oke-cpu", ready=True)
+        prepared = PreparedNodeMaintenance(
+            action="cordon",
+            snapshot=DiscoverySnapshot(nodes=[node]),
+            nodes=(node,),
+            plans=(OperationPlan("node-cordon", "cpu-1", owner="kubernetes"),),
+            drain_pods={},
         )
-        node = NodeInfo(
-            k8s_name="10.0.0.1",
-            instance_ocid="instance-1",
-            pool_name="oke-rdma",
-            slinky_workload_pods=1,
+        with (
+            patch(
+                "oke_hpc_mgmt.commands.nodes.prepare_node_maintenance",
+                return_value=prepared,
+            ),
+            patch("oke_hpc_mgmt.commands.nodes.execute_node_maintenance") as execute,
+        ):
+            result = self.runner.invoke(
+                cli,
+                ["nodes", "cordon", "cpu-1", "--dry-run"],
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        execute.assert_not_called()
+
+    def test_status_process_exit_reflects_health_severity(self):
+        healthy = DiscoverySnapshot(
+            pools=[
+                WorkerPoolInfo(
+                    "oke-cpu",
+                    "node-pool",
+                    desired_size=1,
+                    active_oci_instances=1,
+                    ready_k8s_nodes=1,
+                )
+            ],
+            nodes=[NodeInfo("cpu-1", pool_name="oke-cpu", ready=True)],
+            addons=[AddonInfo("CoreDNS", "ACTIVE")],
         )
-        args = build_parser().parse_args(
-            [
-                "--auth",
-                "instance_principal",
-                "--compartment-id",
-                "compartment-1",
-                "nodes",
-                "remove",
-                "10.0.0.1",
-                "--allow-workloads",
-                "--yes",
-            ]
-        )
-        stderr = io.StringIO()
         service = Mock()
-        service.discover.return_value = DiscoverySnapshot(pools=[pool], nodes=[node])
-
+        service.discover.return_value = healthy
         with (
-            patch("oke_hpc_mgmt.cli.DiscoveryService", return_value=service),
-            redirect_stderr(stderr),
+            patch("oke_hpc_mgmt.commands.common.DiscoveryService", return_value=service),
+            redirect_stderr(io.StringIO()),
+            patch("sys.stdout", new=io.StringIO()),
         ):
-            result = cmd_nodes_remove(args)
+            healthy_status = main(["--auth", "none", "status"])
+            healthy.nodes[0].schedulable = False
+            warning_status = main(["--auth", "none", "status"])
+            healthy.nodes[0].ready = False
+            failed_status = main(["--auth", "none", "status"])
 
-        self.assertEqual(2, result)
-        self.assertIn("Slurm-aware drain", stderr.getvalue())
-        service.oci_backend.assert_not_called()
-
-    def test_readiness_status_and_match_include_rdma_vfs(self):
-        ready = PoolResourceReadiness(
-            gpu_ready=2,
-            rdma_topology_ready=2,
-            rdma_vf_ready=2,
-        )
-        pending = PoolResourceReadiness(
-            gpu_ready=2,
-            rdma_topology_ready=2,
-            rdma_vf_ready=1,
-        )
-
-        self.assertIn("rdma_vf_ready=2", _readiness_status(ready))
-        self.assertTrue(_resource_counts_match(ready, 2))
-        self.assertFalse(_resource_counts_match(pending, 2))
+        self.assertEqual(0, healthy_status)
+        self.assertEqual(1, warning_status)
+        self.assertEqual(2, failed_status)
 
 
 if __name__ == "__main__":

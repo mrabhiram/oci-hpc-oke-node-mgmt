@@ -146,11 +146,11 @@ instance OCID.
 mgmt-oke --auth instance_principal autoscaler status
 ```
 
-Manual resize and node removal are intentionally refused for a matched
+Manual resize and node termination are intentionally refused for a matched
 autoscaler target. Coordinate the change through Cluster Autoscaler rather than
 using `--yes`.
 
-## Node Removal Refused for Workloads
+## Node Drain Preflight Is Refused
 
 Inspect the node and its pods:
 
@@ -159,15 +159,49 @@ mgmt-oke --auth instance_principal nodes get <node-name-or-ip>
 kubectl get pods -A --field-selector spec.nodeName=<node-name>
 ```
 
-For a self-managed pool, drain the node manually before using
-`--allow-workloads`. The CLI does not implement a self-managed cordon/drain
-workflow.
+Run a dry-run plan to identify the exact refusal:
+
+```bash
+mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> --dry-run
+```
+
+Use `--delete-emptydir-data` only after accepting loss of pod-local data. Use
+`--force` only when a pod without a controller can be discarded. A
+PodDisruptionBudget warning must be resolved or allowed to clear; the actual
+drain keeps retrying eviction until its timeout.
+
+`--no-drain` is intended for nodes drained by an external workflow. It requires
+`--allow-workloads` when ordinary workload pods remain.
+
+## Mutation Lease Is Held
+
+Every mutation uses `kube-system/mgmt-oke-mutation` by default. An error naming
+another holder means another tool process is changing cluster state or its
+Lease has not yet expired.
+
+Inspect the Lease and the other process before retrying:
+
+```bash
+kubectl -n kube-system get lease mgmt-oke-mutation -o yaml
+```
+
+Do not delete an active Lease. `--no-lock` is available only for a reviewed
+recovery when no other mutation is running.
 
 ## Slinky Operation Refused
 
 The tool refuses Slinky scale-down, node removal, and replacement because those
 operations require Slurm-aware drain. `--allow-workloads` and `--yes` do not
 bypass the check. Scale-up remains supported.
+
+## OCI Work Request Failed
+
+With `--wait`, the CLI monitors OKE, Compute, and Compute Management work
+requests. For self-managed resources, it snapshots existing resource requests
+before mutation so a newly created request is monitored even when the mutation
+response omits its identifier. A failed or canceled request stops the wait and
+prints the service error details. Resolve that OCI error before submitting
+another mutation.
 
 ## Resize or Removal Timed Out
 
@@ -182,13 +216,12 @@ mgmt-oke --auth instance_principal nodes list --pool <pool-name>
 ```
 
 Inspect the OCI work request and avoid submitting a duplicate mutation until
-the original state is understood.
-
-Some Compute Management responses do not expose a work request identifier. In
-that case, use the Cluster Network or Instance Pool lifecycle state together
-with `pools get` and `nodes list` as the authoritative progress view. Repeating
-the current exact target with `--wait` is non-mutating and can be used as a
-convergence barrier.
+the original state is understood. A timeout without an OCI failure generally
+means that the request is still running or post-provisioning
+Kubernetes/resource readiness did not converge. Use the Cluster Network or
+Instance Pool lifecycle state together with `pools get` and `nodes list` as the
+authoritative progress view. Repeating the current exact target with `--wait`
+is non-mutating and can be used as a convergence barrier.
 
 ## GPU or RDMA Readiness Is Incomplete
 
@@ -196,6 +229,9 @@ Run:
 
 ```bash
 mgmt-oke --auth instance_principal addons status
+mgmt-oke --auth instance_principal addons validate --target all
+mgmt-oke --auth instance_principal health run
+mgmt-oke --auth instance_principal recommendations list
 mgmt-oke --auth instance_principal nodes list --pool <pool-name>
 mgmt-oke --auth instance_principal topology list --pool <pool-name>
 ```

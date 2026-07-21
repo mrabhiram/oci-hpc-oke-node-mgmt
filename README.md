@@ -20,10 +20,23 @@ management for OCI HPC OKE clusters:
 - show Kueue resource counts and ResourceFlavor-to-pool matches `[Implemented]`
 - discover Slinky Slurm node aliases and protect Slinky workers from unsafe removal `[Implemented]`
 - resize standard and Compute Cluster-backed OKE node pools and self-managed cluster-network pools `[Implemented]`
-- remove or replace a specific managed or self-managed worker node `[Implemented]`
+- add or remove pool capacity with explicit `pools add` and `pools remove` commands `[Implemented]`
+- preview every mutation as a validated operation plan with `--dry-run` `[Implemented]`
+- serialize concurrent mutations with a Kubernetes Lease `[Implemented]`
+- cordon, drain, and uncordon selected Kubernetes workers `[Implemented]`
+- remove, replace, or terminate one or more managed or self-managed workers `[Implemented]`
+- select nodes by identifiers or exact operational fields `[Implemented]`
+- project and sort node output for shell and automation workflows `[Implemented]`
 - wait for OCI, Kubernetes, GPU, RDMA topology, and applicable RDMA VF readiness `[Implemented]`
+- report concise cluster status and deterministic node, pool, GPU, RDMA, add-on, and scheduler health `[Implemented]`
+- derive actionable recommendations from failed or degraded health checks `[Implemented]`
+- validate OKE accelerator add-ons against discovered GPU and RDMA capacity `[Implemented]`
 
-Discovery commands are read-only. `pools resize` and `nodes remove` mutate OCI resources and require OCI auth plus either `--yes` or an interactive confirmation.
+Inventory, status, health, recommendation, topology, autoscaler, add-on status,
+and reconciliation commands are read-only. Pool capacity commands and node
+termination mutate OCI resources. Node maintenance commands mutate Kubernetes.
+Every mutation supports `--dry-run`, uses a Kubernetes Lease by default, and
+requires either `--yes` or an interactive typed confirmation.
 
 ## Install
 
@@ -93,6 +106,7 @@ Global options:
 | `--skip-oci` | Skip OCI discovery. |
 | `--skip-kubernetes` | Skip Kubernetes discovery. |
 | `--format table\|json\|csv` | Output format. `table` is the default. |
+| `--debug` | Print an exception traceback when troubleshooting a failed command. |
 
 Command groups:
 
@@ -101,12 +115,22 @@ Command groups:
 | `pools list` | List discovered worker pools. |
 | `pools get <pool>` | Get one worker pool by name or OCID. |
 | `pools resize <pool> (--size <n> \| --delta <n>)` | Resize a managed OKE node pool, cluster network, or instance pool. |
-| `nodes list` | List Kubernetes nodes. |
+| `pools add <pool> --count <n>` | Add `n` workers to desired pool capacity. |
+| `pools remove <pool> --count <n>` | Remove `n` workers from desired pool capacity; OCI selects the workers. |
+| `nodes list` | List and filter Kubernetes nodes. |
 | `nodes get <identifier...>` | Get nodes by Kubernetes name, Slurm name, internal IP, provider ID, or instance OCID. |
-| `nodes remove <node>` | Remove or replace one specific managed or self-managed worker node. |
+| `nodes terminate <identifier...>` | Drain and terminate selected managed or self-managed workers. |
+| `nodes remove <identifier...>` | Compatibility alias for `nodes terminate`. |
+| `nodes cordon <identifier...>` | Mark selected workers unschedulable. |
+| `nodes drain <identifier...>` | Cordon workers and evict non-DaemonSet pods through the Eviction API. |
+| `nodes uncordon <identifier...>` | Mark selected workers schedulable. |
 | `topology list` | Group nodes by RDMA topology labels. |
 | `autoscaler status` | Show Cluster Autoscaler pool ownership. |
 | `addons status` | Show OKE add-on lifecycle state and installed versions. |
+| `addons validate` | Validate NFD, GPU Operator, Network Operator, GPU, and RDMA readiness. |
+| `status` | Show concise cluster capacity and health. |
+| `health run` | Run deterministic health checks by category or pool. |
+| `recommendations list` | Show actionable warnings and failures. |
 | `reconcile` | Show a full discovery snapshot. |
 
 Resize options:
@@ -115,9 +139,11 @@ Resize options:
 | --- | --- |
 | `--size <n>` | Set the worker pool to an exact desired size. |
 | `--delta <n>` | Change the current desired size by `n`. Positive values add nodes; negative values remove nodes. For example, `--delta 2` adds two nodes and `--delta -1` removes one node. |
-| `--wait` | Wait for target OCI and Kubernetes counts. GPU/RDMA pools also wait for allocatable GPUs and valid RDMA topology; when `NvidiaNetworkOperator` is active, RDMA pools also wait for `nvidia.com/rdma-vf`. |
+| `--wait` | Monitor the submitted OCI work request and wait for target OCI and Kubernetes counts. OCI failures are reported immediately. GPU/RDMA pools also wait for allocatable GPUs and valid RDMA topology; when `NvidiaNetworkOperator` is active, RDMA pools also wait for `nvidia.com/rdma-vf`. |
 | `--timeout <seconds>` | Maximum seconds to wait. Default: `1800`. |
 | `--poll-interval <seconds>` | Wait polling interval. Default: `30`. |
+| `--dry-run` | Validate ownership and safety, then print the operation plan without mutation. |
+| `--lock` / `--no-lock` | Use or bypass the Kubernetes mutation Lease. Locking is enabled by default. |
 | `--yes` | Do not prompt for confirmation. |
 
 Node removal options:
@@ -125,12 +151,19 @@ Node removal options:
 | Option | Description |
 | --- | --- |
 | `--keep-size` | Delete the node but keep the pool size so the backing pool replaces it. |
-| `--allow-workloads` | Allow removing a node that currently has non-system workload pods. |
+| `--drain` / `--no-drain` | Cordon and evict pods before termination. Drain is enabled by default. |
+| `--allow-workloads` | Allow `--no-drain` termination when workload pods are present. |
+| `--delete-emptydir-data` | Acknowledge deletion of pod-local `emptyDir` data during drain. |
+| `--force` | Allow drain of pods without a controller. |
+| `--grace-period <seconds>` | Pod termination grace period. Default: `30`. |
+| `--drain-timeout <seconds>` | Maximum time for Kubernetes eviction. Default: `600`. |
 | `--eviction-grace <duration>` | Managed OKE node eviction grace duration. Default: `PT10M`. |
 | `--force-after-grace` | For managed OKE pools, force compute deletion if pods cannot be evicted before the grace duration expires. |
-| `--wait` | Wait until the selected node is absent and the pool has converged, including applicable GPU, RDMA topology, and RDMA VF readiness. |
+| `--wait` | Monitor submitted OCI work requests, then wait until the selected node is absent and the pool has converged, including applicable GPU, RDMA topology, and RDMA VF readiness. |
 | `--timeout <seconds>` | Maximum seconds to wait. Default: `1800`. |
 | `--poll-interval <seconds>` | Wait polling interval. Default: `30`. |
+| `--dry-run` | Validate selection, ownership, drain constraints, and eviction admission without mutation. |
+| `--lock` / `--no-lock` | Use or bypass the Kubernetes mutation Lease. Locking is enabled by default. |
 | `--yes` | Do not prompt for confirmation. |
 
 ## Authentication
@@ -238,17 +271,26 @@ managed RDMA pool from appearing twice.
 Add one node to a pool:
 
 ```bash
-mgmt-oke pools resize oke-cpu --delta 1 --wait --yes
+mgmt-oke pools add oke-cpu --count 1 --wait --yes
 ```
 
 Remove one node from a pool:
 
 ```bash
-mgmt-oke pools resize oke-cpu --delta -1 --wait --yes
+mgmt-oke pools remove oke-cpu --count 1 --wait --yes
+```
+
+The signed `--delta` form remains available: positive values add capacity and
+negative values remove capacity.
+
+Preview the same change without mutating OCI:
+
+```bash
+mgmt-oke pools resize oke-cpu --delta 1 --dry-run
 ```
 
 Pool-level scale-down changes desired capacity but does not select which worker
-OCI removes. Use `nodes remove` when a particular worker must be removed.
+OCI removes. Use `nodes terminate` when a particular worker must be removed.
 
 Set a pool to an exact desired size:
 
@@ -278,14 +320,46 @@ mgmt-oke nodes list --rdma-only
 mgmt-oke nodes get 10.0.127.32
 mgmt-oke nodes get ocid1.instance.oc1.iad.example
 mgmt-oke nodes get <slurm-node-name>
-mgmt-oke nodes remove 10.0.127.32 --wait --yes
-mgmt-oke nodes remove 10.0.127.32 --keep-size --wait --yes
+mgmt-oke nodes terminate 10.0.127.32 --wait --yes
+mgmt-oke nodes terminate 10.0.127.32 --keep-size --wait --yes
+```
+
+`nodes remove` is an alias for `nodes terminate`.
+
+Node termination drains by default. Preflight lists pods, checks eviction
+admission, rejects unacknowledged `emptyDir` data and unmanaged pods, then the
+execution path cordons the node and uses the Kubernetes Eviction API before
+calling the owning OCI service. Use `--no-drain` only for an intentionally
+pre-drained node.
+
+Preview a replacement plan:
+
+```bash
+mgmt-oke nodes terminate <node-name> --keep-size --dry-run
+```
+
+Operate on several explicitly selected nodes or an exact field selection:
+
+```bash
+mgmt-oke nodes cordon node-a node-b
+mgmt-oke nodes drain --fields pool=oke-cpu,ready=true
+mgmt-oke nodes uncordon --nodes node-a,node-b
+```
+
+Filter and shape inventory output:
+
+```bash
+mgmt-oke nodes list --not-ready
+mgmt-oke nodes list --workloads --sort workload_pods,name
+mgmt-oke nodes list --fields pool=oke-rdma,rdma=true \
+  --columns name,status,shape,gpu,rdma_vf
+mgmt-oke nodes list --pool oke-gpu --one-line
 ```
 
 Replace a specific RDMA worker while keeping the pool at its current size:
 
 ```bash
-mgmt-oke nodes remove <rdma-node-name> --keep-size --wait --yes
+mgmt-oke nodes terminate <rdma-node-name> --keep-size --wait --yes
 ```
 
 Without `--keep-size`, the selected worker is removed and desired pool size is
@@ -295,6 +369,22 @@ service launches a replacement at the existing desired size.
 For Slinky-managed pools, node removal, replacement, and pool scale-down are
 refused because they require a Slurm-aware drain. Pool scale-up remains
 available. `--allow-workloads` does not bypass this protection.
+
+### Status, health, and recommendations
+
+```bash
+mgmt-oke status
+mgmt-oke health run
+mgmt-oke health run --type discovery
+mgmt-oke health run --type rdma --pool oke-rdma
+mgmt-oke recommendations list
+```
+
+Health checks are deterministic evaluations of the discovered control-plane
+and node state. They do not run arbitrary commands on workers. `status`,
+`health run`, and `addons validate` return `0` when healthy, `1` when degraded,
+and `2` when a check fails or the command cannot complete. A partial OCI or
+Kubernetes discovery is degraded rather than being presented as healthy.
 
 ### RDMA topology
 
@@ -314,6 +404,8 @@ mgmt-oke autoscaler status
 ```bash
 mgmt-oke addons status
 mgmt-oke --format json addons status
+mgmt-oke addons validate --target gpu
+mgmt-oke addons validate --target rdma --pool oke-rdma
 ```
 
 The add-on view is read-only. When `NvidiaNetworkOperator` is active, readiness
@@ -322,10 +414,16 @@ addition to GPU and OCI RDMA topology readiness.
 
 ## Resource Ownership
 
-Pool resize and node removal update live OCI resources. If those resources are
-also managed by Terraform or OCI Resource Manager, update the corresponding
+Pool capacity changes and node termination update live OCI resources. Before
+confirmation, the CLI reports that these direct mutations do not update
+Terraform or OCI Resource Manager input values. Reconcile the corresponding
 stack variables before a later apply so the declared size does not replace the
 live value.
+
+All mutations acquire the `kube-system/mgmt-oke-mutation` Lease by default.
+This prevents two tool processes from changing cluster capacity or node state
+concurrently. `--no-lock` is available for recovery when Kubernetes Lease
+access is intentionally unavailable.
 
 ## Output Formats
 
@@ -338,6 +436,10 @@ All commands support:
 ```
 
 `table` is the default.
+
+Node inventory also supports `--fields`, `--columns`, `--sort`, `--no-header`,
+and `--one-line`. Machine-readable row schemas are versioned as `v1`; field
+changes that break automation require a new schema version.
 
 ## Tests
 
@@ -362,6 +464,8 @@ mypy src
   classification, mutation API routing, readiness, and safety boundaries
 - [`docs/controller-install.md`](docs/controller-install.md): operator node
   prerequisites, installation, authentication, validation, and troubleshooting
+- [`docs/command-reference.md`](docs/command-reference.md): complete command,
+  selector, mutation-option, output, and exit-status reference
 - [`docs/scope.md`](docs/scope.md): implemented features and planned items
 
 ## Cluster Validation

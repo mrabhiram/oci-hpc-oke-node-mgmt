@@ -78,6 +78,23 @@ mgmt-oke --auth instance_principal --format json nodes list --rdma-only | \
   jq '.[] | {name, pool, rdma, rdma_vf}'
 ```
 
+Filter, project, and sort before serialization:
+
+```bash
+mgmt-oke --auth instance_principal nodes list \
+  --fields pool=oke-rdma,ready=true \
+  --columns name,status,ready,schedulable,shape,gpu,rdma_vf \
+  --sort name --format json
+```
+
+Use `--one-line` when a comma-separated node-name list is required, or
+`--no-header` for headerless table and CSV consumers:
+
+```bash
+mgmt-oke --auth instance_principal nodes list --pool oke-gpu --one-line
+mgmt-oke --auth instance_principal nodes list --columns name,ip --no-header
+```
+
 ## Full Snapshot as JSON
 
 ```bash
@@ -116,8 +133,8 @@ Use process status in automation rather than parsing human-readable messages:
 | Status | Meaning |
 | --- | --- |
 | `0` | Command completed successfully. |
-| `1` | A requested pool or node was not found. |
-| `2` | Validation, target discovery, OCI operation, or timeout failure. |
+| `1` | A requested resource was not found, or a health command found a warning. |
+| `2` | Usage, validation, discovery, operation, timeout, or health failure. |
 | `130` | Interactive cancellation or keyboard interruption. |
 
 Example:
@@ -146,11 +163,25 @@ mgmt-oke --auth instance_principal --format json pools get "$POOL" | \
   jq -e '.[0].slinky == false'
 
 mgmt-oke --auth instance_principal pools resize "$POOL" \
+  --delta 1 --dry-run
+
+mgmt-oke --auth instance_principal pools resize "$POOL" \
   --delta 1 --wait --yes
 ```
 
 The CLI repeats authoritative autoscaler and ownership checks during mutation
 preflight. Script-side validation is an additional guard, not a replacement.
+
+Mutation plans use the same table, JSON, and CSV serializers as inventory:
+
+```bash
+mgmt-oke --auth instance_principal pools add "$POOL" \
+  --count 1 --dry-run --format json
+```
+
+The current flattened row schema is `v1`. Backward-incompatible field changes
+require a new schema version; scripts should still select only the fields they
+consume.
 
 ## Capturing Warnings
 

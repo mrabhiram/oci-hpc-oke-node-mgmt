@@ -55,7 +55,7 @@ target:
 
 ```bash
 mgmt-oke --auth instance_principal pools resize <pool-name> --delta 1
-mgmt-oke --auth instance_principal nodes remove <node-name-or-ip>
+mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip>
 ```
 
 There is no force flag for bypassing this protection. Change capacity through
@@ -97,8 +97,8 @@ The CLI refuses:
 
 ```bash
 mgmt-oke --auth instance_principal pools resize <slinky-pool> --delta -1
-mgmt-oke --auth instance_principal nodes remove <slinky-node>
-mgmt-oke --auth instance_principal nodes remove <slinky-node> --keep-size
+mgmt-oke --auth instance_principal nodes terminate <slinky-node>
+mgmt-oke --auth instance_principal nodes terminate <slinky-node> --keep-size
 ```
 
 `--allow-workloads` and `--yes` do not bypass Slinky ownership protection.

@@ -6,7 +6,17 @@ import sys
 from dataclasses import asdict, is_dataclass
 from typing import Any, Iterable
 
-from oke_hpc_mgmt.models import AddonInfo, DiscoverySnapshot, NodeInfo, WorkerPoolInfo
+from oke_hpc_mgmt.models import (
+    AddonInfo,
+    DiscoverySnapshot,
+    HealthResult,
+    NodeInfo,
+    OperationPlan,
+    WorkerPoolInfo,
+)
+
+
+OUTPUT_SCHEMA_VERSION = "v1"
 
 
 def serializable(value: Any) -> Any:
@@ -21,14 +31,25 @@ def serializable(value: Any) -> Any:
     return value
 
 
-def print_records(records: list[dict[str, Any]], output: str, columns: list[str] | None = None) -> None:
+def print_records(
+    records: list[dict[str, Any]],
+    output: str,
+    columns: list[str] | None = None,
+    show_header: bool = True,
+    one_line: bool = False,
+) -> None:
     if output == "json":
-        print(json.dumps(serializable(records), indent=2, sort_keys=True))
+        indent = None if one_line else 2
+        separators = (",", ":") if one_line else None
+        print(json.dumps(serializable(records), indent=indent, sort_keys=True, separators=separators))
         return
     if output == "csv":
-        print_csv(records, columns)
+        print_csv(records, columns, show_header=show_header)
         return
-    print_table(records, columns)
+    if one_line:
+        print(",".join(_cell(record.get("name")) for record in records))
+        return
+    print_table(records, columns, show_header=show_header)
 
 
 def print_snapshot(snapshot: DiscoverySnapshot, output: str) -> None:
@@ -71,17 +92,26 @@ def print_warnings(warnings: Iterable[str]) -> None:
         print(f"- {warning}", file=sys.stderr)
 
 
-def print_csv(records: list[dict[str, Any]], columns: list[str] | None = None) -> None:
+def print_csv(
+    records: list[dict[str, Any]],
+    columns: list[str] | None = None,
+    show_header: bool = True,
+) -> None:
     if not records:
         return
     columns = columns or list(records[0].keys())
     writer = csv.DictWriter(sys.stdout, fieldnames=columns, extrasaction="ignore")
-    writer.writeheader()
+    if show_header:
+        writer.writeheader()
     for record in records:
         writer.writerow({key: _cell(record.get(key)) for key in columns})
 
 
-def print_table(records: list[dict[str, Any]], columns: list[str] | None = None) -> None:
+def print_table(
+    records: list[dict[str, Any]],
+    columns: list[str] | None = None,
+    show_header: bool = True,
+) -> None:
     if not records:
         print("(none)")
         return
@@ -92,8 +122,9 @@ def print_table(records: list[dict[str, Any]], columns: list[str] | None = None)
     }
     header = "  ".join(column.ljust(widths[column]) for column in columns)
     rule = "  ".join("-" * widths[column] for column in columns)
-    print(header)
-    print(rule)
+    if show_header:
+        print(header)
+        print(rule)
     for record in records:
         print("  ".join(_cell(record.get(column)).ljust(widths[column]) for column in columns))
 
@@ -157,6 +188,37 @@ TOPOLOGY_COLUMNS = [
     "shapes",
 ]
 
+PLAN_COLUMNS = [
+    "operation",
+    "target",
+    "pool",
+    "owner",
+    "current_size",
+    "target_size",
+    "decrement_size",
+    "workload_pods",
+    "steps",
+    "warnings",
+    "status",
+]
+
+HEALTH_COLUMNS = ["check", "scope", "status", "message", "recommendation"]
+
+STATUS_COLUMNS = [
+    "overall",
+    "pools",
+    "nodes",
+    "ready",
+    "not_ready",
+    "gpu_nodes",
+    "rdma_nodes",
+    "addons_active",
+    "addons_total",
+    "autoscaler_pools",
+    "slinky_nodes",
+    "kueue_flavors",
+]
+
 
 def pool_rows(pools: list[WorkerPoolInfo]) -> list[dict[str, Any]]:
     return [
@@ -191,6 +253,8 @@ def node_rows(nodes: list[NodeInfo]) -> list[dict[str, Any]]:
             "slurm_name": node.slurm_name,
             "ip": node.internal_ip,
             "status": node.status,
+            "ready": node.ready,
+            "schedulable": node.schedulable,
             "pool": node.pool_name,
             "shape": node.shape,
             "gpu": node.gpu_allocatable or node.gpu_resource,
@@ -296,6 +360,99 @@ def kueue_counts(snapshot: DiscoverySnapshot) -> dict[str, int]:
         "cluster_queues": len(snapshot.kueue.cluster_queues),
         "local_queues": len(snapshot.kueue.local_queues),
     }
+
+
+def operation_plan_rows(plans: list[OperationPlan]) -> list[dict[str, Any]]:
+    return [
+        {
+            "operation": plan.operation,
+            "target": plan.target,
+            "pool": plan.pool,
+            "owner": plan.owner,
+            "current_size": plan.current_size,
+            "target_size": plan.target_size,
+            "decrement_size": plan.decrement_size,
+            "workload_pods": plan.workload_pods,
+            "steps": plan.steps,
+            "warnings": plan.warnings,
+            "status": "planned",
+        }
+        for plan in plans
+    ]
+
+
+def health_rows(results: list[HealthResult]) -> list[dict[str, Any]]:
+    return [
+        {
+            "check": result.check,
+            "scope": result.scope,
+            "status": result.status,
+            "message": result.message,
+            "recommendation": result.recommendation,
+        }
+        for result in results
+    ]
+
+
+def status_rows(snapshot: DiscoverySnapshot, health: list[HealthResult]) -> list[dict[str, Any]]:
+    failed = any(result.status == "FAIL" for result in health)
+    warning = any(result.status == "WARN" for result in health)
+    return [
+        {
+            "overall": "FAILED" if failed else "DEGRADED" if warning else "HEALTHY",
+            "pools": len(snapshot.pools),
+            "nodes": len(snapshot.nodes),
+            "ready": sum(1 for node in snapshot.nodes if node.ready),
+            "not_ready": sum(1 for node in snapshot.nodes if not node.ready),
+            "gpu_nodes": sum(1 for node in snapshot.nodes if node.gpu_resource),
+            "rdma_nodes": sum(1 for node in snapshot.nodes if node.rdma_topology_ready),
+            "addons_active": sum(1 for addon in snapshot.addons if addon.active),
+            "addons_total": len(snapshot.addons),
+            "autoscaler_pools": sum(1 for pool in snapshot.pools if pool.autoscaler_owned),
+            "slinky_nodes": sum(1 for node in snapshot.nodes if node.slinky_managed),
+            "kueue_flavors": len(snapshot.kueue.resource_flavors),
+        }
+    ]
+
+
+def parse_columns(specification: str | None, available: list[str]) -> list[str]:
+    if not specification:
+        return list(available)
+    requested = [field.strip() for field in specification.split(",") if field.strip()]
+    invalid = [field for field in requested if field not in available]
+    if invalid:
+        raise ValueError(
+            f"Unknown column(s): {', '.join(invalid)}. Valid columns: {', '.join(available)}"
+        )
+    if not requested:
+        raise ValueError("At least one output column is required.")
+    return requested
+
+
+def sort_records(records: list[dict[str, Any]], specification: str | None) -> list[dict[str, Any]]:
+    if not specification:
+        return records
+    fields = [field.strip() for field in specification.split(",") if field.strip()]
+    available = set().union(*(record.keys() for record in records)) if records else set()
+    invalid = [field for field in fields if field not in available]
+    if invalid:
+        raise ValueError(
+            f"Unknown sort field(s): {', '.join(invalid)}. Valid fields: {', '.join(sorted(available))}"
+        )
+
+    def field_key(value: Any) -> tuple[int, int, float, str]:
+        if value is None:
+            return (1, 2, 0.0, "")
+        if isinstance(value, bool):
+            return (0, 0, float(value), "")
+        if isinstance(value, (int, float)):
+            return (0, 0, float(value), "")
+        return (0, 1, 0.0, _cell(value).lower())
+
+    def key(record: dict[str, Any]) -> tuple[tuple[int, int, float, str], ...]:
+        return tuple(field_key(record.get(field)) for field in fields)
+
+    return sorted(records, key=key)
 
 
 def _autoscaler_label(pool: WorkerPoolInfo) -> str:

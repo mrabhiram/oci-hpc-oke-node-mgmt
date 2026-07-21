@@ -26,7 +26,8 @@ The controller/operator node must have:
 - `kubectl` configured for the target OKE cluster
 - OCI CLI on `PATH` and able to use instance principal auth
 - IAM policy allowing the instance principal to read the target OKE cluster,
-  inspect its node pools and add-ons, and inspect backing compute resources
+  inspect its node pools and add-ons, inspect backing compute resources, and
+  inspect work requests used by `--wait`
 - additional IAM permissions to manage node pools, Cluster Networks, or
   Instance Pools when resize or node-removal commands will be used
 - Network access to the Kubernetes API and OCI regional APIs
@@ -167,6 +168,9 @@ mgmt-oke nodes list
 mgmt-oke topology list
 mgmt-oke autoscaler status
 mgmt-oke addons status
+mgmt-oke status
+mgmt-oke health run
+mgmt-oke addons validate --target all
 mgmt-oke reconcile
 ```
 
@@ -187,19 +191,28 @@ these checks when the operator kubeconfig identifies one OKE cluster.
 The current mutating commands are:
 
 ```bash
-mgmt-oke pools resize <pool> (--size <n> | --delta <n>) [--wait] [--yes]
-mgmt-oke nodes remove <node> [--keep-size] [--wait] [--yes]
+mgmt-oke pools resize <pool> (--size <n> | --delta <n>) [--dry-run] [--wait]
+mgmt-oke pools add <pool> --count <n> [--dry-run] [--wait]
+mgmt-oke pools remove <pool> --count <n> [--dry-run] [--wait]
+mgmt-oke nodes cordon <node...> [--dry-run]
+mgmt-oke nodes drain <node...> [--dry-run]
+mgmt-oke nodes uncordon <node...> [--dry-run]
+mgmt-oke nodes terminate <node...> [--keep-size] [--dry-run] [--wait]
 ```
 
 Safety behavior:
 
 - Discovery commands are read-only.
-- Resize and remove require OCI auth.
-- Resize and remove require either `--yes` or an interactive confirmation.
+- Pool mutations and node termination require OCI auth.
+- Every mutation supports a validated `--dry-run` plan.
+- Every mutation requires either `--yes` or an interactive typed confirmation.
+- Mutations acquire a Kubernetes Lease by default to prevent concurrent tool operations.
 - The tool refuses to resize or remove nodes from Cluster Autoscaler-owned pools
   by default.
-- `nodes remove` refuses nodes with non-system workload pods unless
-  `--allow-workloads` is provided.
+- Node termination cordons and drains through the Kubernetes Eviction API by
+  default. PodDisruptionBudgets remain authoritative.
+- Drain requires explicit acknowledgement for `emptyDir` data or pods without
+  a controller.
 - Compute Cluster-backed OKE pools are resized and modified through OKE APIs;
   their internal backing instance pools are not mutation targets.
 - Legacy Cluster Network pools are resized with `UpdateClusterNetwork`; their
@@ -215,20 +228,38 @@ Safety behavior:
 Example managed or self-managed pool resize:
 
 ```bash
-mgmt-oke pools resize oke-cpu --delta 1 --wait
+mgmt-oke pools add oke-cpu --count 1 --dry-run
+mgmt-oke pools add oke-cpu --count 1 --wait
 ```
 
 A negative delta reduces capacity but does not select the departing worker. Use
-`nodes remove` when a particular worker must be removed.
+`nodes terminate` when a particular worker must be removed.
 
 Example specific node replacement while keeping pool size:
 
 ```bash
-mgmt-oke nodes remove <node-name-or-ip> --keep-size --wait
+mgmt-oke nodes terminate <node-name-or-ip> --keep-size --dry-run
+mgmt-oke nodes terminate <node-name-or-ip> --keep-size --wait
 ```
 
 Use `--yes` only for non-interactive operations where the target pool or node
 has already been selected intentionally.
+
+## Shell Completion
+
+Click can generate completion scripts from the installed command. For Bash:
+
+```bash
+_MGMT_OKE_COMPLETE=bash_source mgmt-oke > /home/ubuntu/.mgmt-oke-complete.bash
+printf '\n. /home/ubuntu/.mgmt-oke-complete.bash\n' >> /home/ubuntu/.bashrc
+. /home/ubuntu/.mgmt-oke-complete.bash
+```
+
+For a one-shell activation without writing a completion file:
+
+```bash
+eval "$(_MGMT_OKE_COMPLETE=bash_source mgmt-oke)"
+```
 
 ## Troubleshooting
 

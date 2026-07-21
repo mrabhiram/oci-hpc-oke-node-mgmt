@@ -70,6 +70,29 @@ class _ContainerEngine:
         return SimpleNamespace(data=self.addons)
 
 
+class _WorkRequests:
+    def __init__(self, status="SUCCEEDED", percent=100.0, errors=None, summaries=None):
+        self.status = status
+        self.percent = percent
+        self.errors = errors or []
+        self.summaries = summaries or []
+        self.calls = []
+
+    def get_work_request(self, work_request_id):
+        self.calls.append(("get_work_request", work_request_id))
+        return SimpleNamespace(
+            data=SimpleNamespace(status=self.status, percent_complete=self.percent)
+        )
+
+    def list_work_request_errors(self, *args):
+        self.calls.append(("list_work_request_errors", *args))
+        return SimpleNamespace(data=self.errors)
+
+    def list_work_requests(self, compartment_id, **kwargs):
+        self.calls.append(("list_work_requests", compartment_id, kwargs))
+        return SimpleNamespace(data=self.summaries)
+
+
 class _Compute:
     def __init__(self, shapes=None):
         self.shapes = shapes or {}
@@ -106,6 +129,7 @@ def _backend(cluster_network=None):
     backend._compute_mgmt = _ComputeManagement(cluster_network)
     backend._container_engine = _ContainerEngine()
     backend._compute = _Compute()
+    backend._work_requests = _WorkRequests()
     return backend
 
 
@@ -159,6 +183,22 @@ class OciBackendMutationTests(unittest.TestCase):
         with self.assertRaises(OciDiscoveryError):
             backend.resize_cluster_network("cluster-1", "pool-2", 3)
 
+    def test_resize_cluster_network_accepts_missing_work_request_header(self):
+        pool = SimpleNamespace(
+            id="pool-1",
+            instance_configuration_id="config-1",
+            display_name="oke-rdma",
+            size=2,
+        )
+        backend = _backend(SimpleNamespace(instance_pools=[pool]))
+        backend._compute_mgmt.update_cluster_network = lambda *_args: SimpleNamespace(
+            headers={}
+        )
+
+        work_request = backend.resize_cluster_network("cluster-1", "pool-1", 3)
+
+        self.assertIsNone(work_request)
+
     def test_resize_instance_pool(self):
         backend = _backend()
 
@@ -191,6 +231,106 @@ class OciBackendMutationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(OciDiscoveryError, "Read failed: bad request"):
             OciBackend._call("Read", fail)
+
+    def test_generic_work_request_failure_includes_service_errors(self):
+        backend = _backend()
+        backend._work_requests = _WorkRequests(
+            status="FAILED",
+            percent=60,
+            errors=[SimpleNamespace(code="1611", message="Insufficient capacity")],
+        )
+
+        result = backend.get_work_request_status(
+            "ocid1.coreservicesworkrequest.oc1.region.example"
+        )
+
+        self.assertTrue(result.failed)
+        self.assertEqual(60.0, result.percent_complete)
+        self.assertEqual(("1611: Insufficient capacity",), result.errors)
+
+    def test_oke_work_request_uses_container_engine_client(self):
+        backend = _backend()
+        work_requests = _WorkRequests(status="IN_PROGRESS", percent=25)
+        backend._container_engine.get_work_request = work_requests.get_work_request
+        backend._container_engine.list_work_request_errors = (
+            work_requests.list_work_request_errors
+        )
+
+        result = backend.get_work_request_status(
+            "ocid1.clustersworkrequest.oc1.region.example"
+        )
+
+        self.assertEqual("IN_PROGRESS", result.status)
+        self.assertEqual(25.0, result.percent_complete)
+        self.assertEqual(
+            "get_work_request",
+            work_requests.calls[0][0],
+        )
+
+    def test_oke_work_request_failure_uses_compartment_for_errors(self):
+        backend = _backend()
+        work_requests = _WorkRequests(
+            status="FAILED",
+            percent=50,
+            errors=[SimpleNamespace(code="LimitExceeded", message="GPU limit reached")],
+        )
+        backend._container_engine.get_work_request = work_requests.get_work_request
+        backend._container_engine.list_work_request_errors = (
+            work_requests.list_work_request_errors
+        )
+
+        result = backend.get_work_request_status(
+            "ocid1.clustersworkrequest.oc1.region.example",
+            compartment_id="compartment-1",
+        )
+
+        self.assertTrue(result.failed)
+        self.assertEqual(("LimitExceeded: GPU limit reached",), result.errors)
+        self.assertEqual(
+            (
+                "list_work_request_errors",
+                "compartment-1",
+                "ocid1.clustersworkrequest.oc1.region.example",
+            ),
+            work_requests.calls[-1],
+        )
+
+    def test_oke_work_request_failure_requires_compartment(self):
+        backend = _backend()
+        work_requests = _WorkRequests(status="FAILED")
+        backend._container_engine.get_work_request = work_requests.get_work_request
+
+        with self.assertRaisesRegex(OciDiscoveryError, "requires the compartment"):
+            backend.get_work_request_status(
+                "ocid1.clustersworkrequest.oc1.region.example"
+            )
+
+    def test_list_resource_work_requests_returns_typed_summaries(self):
+        backend = _backend()
+        backend._work_requests = _WorkRequests(
+            summaries=[
+                SimpleNamespace(
+                    id="work-request-1",
+                    status="FAILED",
+                    percent_complete=60,
+                ),
+                SimpleNamespace(status="ACCEPTED", percent_complete=0),
+            ]
+        )
+
+        results = backend.list_resource_work_requests("compartment-1", "resource-1")
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("work-request-1", results[0].work_request_id)
+        self.assertTrue(results[0].failed)
+        self.assertEqual(
+            (
+                "list_work_requests",
+                "compartment-1",
+                {"resource_id": "resource-1"},
+            ),
+            backend._work_requests.calls[0],
+        )
 
 
 class OciBackendDiscoveryTests(unittest.TestCase):

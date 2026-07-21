@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import io
 import re
 import shlex
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-from oke_hpc_mgmt.cli import build_parser
+from click.testing import CliRunner
+
+from oke_hpc_mgmt.commands import cli
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -115,7 +115,7 @@ class DocumentationTests(unittest.TestCase):
     def test_documented_mgmt_commands_parse(self):
         failures: list[str] = []
         parsed_commands = 0
-        parser = build_parser()
+        runner = CliRunner()
         for markdown_file in MARKDOWN_FILES:
             document = markdown_file.read_text(encoding="utf-8")
             for block_line, block in _bash_blocks(document):
@@ -124,13 +124,12 @@ class DocumentationTests(unittest.TestCase):
                     if argv is None:
                         continue
                     parsed_commands += 1
-                    try:
-                        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                            parser.parse_args(argv)
-                    except SystemExit as exc:
-                        if exc.code != 0:
-                            location = markdown_file.relative_to(PROJECT_ROOT)
-                            failures.append(f"{location}:{block_line + offset}: {command}")
+                    result = runner.invoke(cli, [*argv, "--help"])
+                    if result.exit_code != 0:
+                        location = markdown_file.relative_to(PROJECT_ROOT)
+                        failures.append(
+                            f"{location}:{block_line + offset}: {command}: {result.output.strip()}"
+                        )
 
         self.assertGreater(parsed_commands, 40)
         self.assertEqual([], failures, "Invalid documented commands:\n" + "\n".join(failures))
@@ -153,8 +152,8 @@ class DocumentationTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("Pool-level scale-down does not select a worker", resize_guide)
-        self.assertIn("use `nodes remove`", resize_guide)
-        self.assertIn("always targets a specific Kubernetes worker", removal_guide)
+        self.assertIn("use `nodes terminate`", resize_guide)
+        self.assertIn("always targets selected Kubernetes workers", removal_guide)
 
     def test_wait_docs_cover_layered_resource_convergence(self):
         readiness_guide = (

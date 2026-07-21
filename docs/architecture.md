@@ -18,11 +18,15 @@ APIs.
 | --- | --- |
 | `src/oke_hpc_mgmt/backends/kubeconfig.py` | Loads and validates kubeconfig, selects a context, and extracts the OKE cluster OCID and region from OCI CLI exec arguments. |
 | `src/oke_hpc_mgmt/discovery.py` | Resolves and caches the OCI target, joins Kubernetes and OCI inventory, classifies pool ownership, and applies add-on readiness expectations. |
-| `src/oke_hpc_mgmt/backends/oci.py` | Calls OKE `GetCluster`, discovers managed and self-managed pools, filters internal backing pools, and implements ownership-specific OCI mutations. |
-| `src/oke_hpc_mgmt/backends/kubernetes.py` | Discovers Kubernetes nodes, pod safety counts, allocatable resources, topology labels, and Slinky metadata. |
-| `src/oke_hpc_mgmt/models.py` | Defines node, pool, add-on, placement, RDMA readiness, and discovery snapshot models. |
-| `src/oke_hpc_mgmt/cli.py` | Defines commands and overrides, propagates kubeconfig exec authentication, enforces mutation safety, routes OCI APIs, and waits for convergence. |
-| `src/oke_hpc_mgmt/render.py` | Exposes ownership, placement, Compute Cluster, add-on, Slinky, GPU, and RDMA fields in table, JSON, and CSV output. |
+| `src/oke_hpc_mgmt/backends/oci.py` | Calls OKE `GetCluster`, discovers managed and self-managed pools, filters internal backing pools, implements ownership-specific OCI mutations, and reads OKE and Compute work requests. |
+| `src/oke_hpc_mgmt/backends/kubernetes.py` | Discovers nodes and pods, manages cordon state, performs PDB-aware eviction, and serializes mutations with a Lease. |
+| `src/oke_hpc_mgmt/models.py` | Defines node, pool, add-on, placement, operation-plan, drain, health, and discovery models. |
+| `src/oke_hpc_mgmt/commands/` | Defines the modular Click command tree, options, output controls, confirmation, status, health, recommendations, and add-on validation. |
+| `src/oke_hpc_mgmt/workflows/` | Implements reusable ownership-aware pool, node termination, and Kubernetes maintenance workflows. |
+| `src/oke_hpc_mgmt/health.py` | Evaluates deterministic node, pool, GPU, RDMA, add-on, and scheduler health. |
+| `src/oke_hpc_mgmt/selection.py` | Parses node identifiers and exact field selectors. |
+| `src/oke_hpc_mgmt/cli.py` | Provides warning suppression, entrypoint naming, exception handling, and stable process exit status. |
+| `src/oke_hpc_mgmt/render.py` | Exposes stable table, JSON, CSV, plan, health, and status row schemas. |
 | `src/oke_hpc_mgmt/__main__.py` | Preserves CLI exit status when invoked with `python -m oke_hpc_mgmt`. |
 | `pyproject.toml` | Declares OCI, Kubernetes, and safe YAML parsing dependencies plus development checks. |
 | `tests/` | Covers target parsing and precedence, OCI API payloads, ownership classification, mutation routing, readiness, rendering, help text, and process exit behavior. |
@@ -222,6 +226,19 @@ pool, the CLI calls OKE `DeleteNode`:
 The selected node is never detached directly from an OKE-internal Instance
 Pool.
 
+Before either managed or self-managed termination, the default workflow:
+
+1. discovers and validates every selected node and its owning pool
+2. performs dry-run Kubernetes eviction admission for non-DaemonSet pods
+3. rejects unacknowledged `emptyDir` data and unmanaged pods
+4. acquires the cluster mutation Lease
+5. cordons all selected nodes
+6. evicts eligible pods through the `policy/v1` Eviction API
+7. invokes the ownership-specific OCI termination operation
+
+`--no-drain` bypasses steps 2, 5, and 6 and requires `--allow-workloads` when
+ordinary workload pods remain.
+
 ### Legacy Cluster Network Resize
 
 A legacy RDMA pool is represented by a Cluster Network containing an embedded
@@ -260,6 +277,15 @@ After a mutation with `--wait`, the tool reconciles the selected pool until:
 - `nvidia.com/rdma-vf` is allocatable on every Ready RDMA node when the NVIDIA
   Network Operator add-on is active
 
+Each wait poll also checks the mutation's work request through its owning
+service. OKE work requests use the Container Engine API. Before a self-managed
+Cluster Network or Instance Pool mutation, the tool snapshots existing
+resource-scoped work requests through the generic Work Request API. If the
+mutation response omits `opc-work-request-id`, any new request for that resource
+is still monitored without confusing it with an older failure. A failed or
+canceled request stops the wait immediately and reports the OCI error details;
+state and resource convergence remain authoritative after the request succeeds.
+
 Topology validation rejects missing values and sentinel values such as
 `no-imds-data`, `unknown`, and `not-available`.
 
@@ -269,10 +295,41 @@ Before mutation, the CLI verifies pool ownership and backing identifiers. It
 also refuses unsafe operations when:
 
 - the pool is owned by Cluster Autoscaler
-- a target node has workload pods and `--allow-workloads` is absent
+- a `--no-drain` target has workload pods and `--allow-workloads` is absent
+- a drain would delete `emptyDir` data without `--delete-emptydir-data`
+- a drain would evict an unmanaged pod without `--force`
 - a requested target size is negative
 - a scale-down or node removal targets a detected Slinky-managed worker
 - required OCI target information cannot be resolved
 
-All mutations require `--yes` or an interactive confirmation. Discovery,
-topology, add-on, autoscaler, and reconciliation commands are read-only.
+Every mutation is represented by an `OperationPlan`. `--dry-run` prints that
+validated plan and stops before acquiring the Lease or changing Kubernetes or
+OCI. Actual mutations require `--yes` or an interactive typed confirmation.
+
+Actual mutations acquire the `kube-system/mgmt-oke-mutation` Lease by default.
+An active holder causes the second operation to fail before mutation. The Lease
+duration covers the requested drain or convergence timeout and is released when
+the operation exits. `--no-lock` is an explicit recovery override.
+
+Direct OCI mutations warn that Terraform and OCI Resource Manager inputs are
+not updated. This is a drift warning, not an automated stack-state change.
+
+Discovery, topology, add-on status, autoscaler, status, health,
+recommendations, and reconciliation commands are read-only.
+
+## Health Model
+
+`status`, `health run`, `recommendations list`, and `addons validate` share one
+pure evaluation engine. It does not execute commands on worker nodes. Checks
+are derived from the discovery snapshot and include:
+
+- desired, active OCI, and Ready Kubernetes pool convergence
+- Kubernetes node Ready and schedulable state
+- allocatable NVIDIA or AMD GPU resources
+- required OCI RDMA topology labels
+- `nvidia.com/rdma-vf` when Network Operator is active or the pool requires VFs
+- OKE add-on lifecycle and expected accelerator add-ons
+- Cluster Autoscaler, Kueue, and Slinky metadata
+
+Health commands return `0` for pass or informational results, `1` when warnings
+exist, and `2` when a check fails.

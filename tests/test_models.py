@@ -1,7 +1,6 @@
 import unittest
 
 from oke_hpc_mgmt.backends.kubernetes import parse_instance_ocid
-from oke_hpc_mgmt.cli import _pool_resource_readiness
 from oke_hpc_mgmt.models import (
     AddonInfo,
     DiscoverySnapshot,
@@ -9,6 +8,7 @@ from oke_hpc_mgmt.models import (
     PoolResourceReadiness,
     WorkerPoolInfo,
 )
+from oke_hpc_mgmt.workflows.lifecycle import pool_resource_readiness
 
 
 class ModelTests(unittest.TestCase):
@@ -138,7 +138,7 @@ class ModelTests(unittest.TestCase):
 
         self.assertEqual(
             PoolResourceReadiness(gpu_ready=1, rdma_topology_ready=2),
-            _pool_resource_readiness(snapshot, pool),
+            pool_resource_readiness(snapshot, pool),
         )
 
     def test_pool_resource_readiness_requires_rdma_vf_when_enabled(self):
@@ -176,7 +176,7 @@ class ModelTests(unittest.TestCase):
 
         self.assertEqual(
             PoolResourceReadiness(rdma_topology_ready=2, rdma_vf_ready=1),
-            _pool_resource_readiness(snapshot, pool),
+            pool_resource_readiness(snapshot, pool),
         )
 
 
