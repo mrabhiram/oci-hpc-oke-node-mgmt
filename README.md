@@ -286,7 +286,29 @@ negative values remove capacity.
 Preview the same change without mutating OCI:
 
 ```bash
-mgmt-oke pools resize oke-cpu --delta 1 --dry-run
+mgmt-oke pools resize oke-cpu --delta 1 --dry-run --format json
+```
+
+Example output:
+
+```json
+[
+  {
+    "current_size": 1,
+    "decrement_size": null,
+    "operation": "pool-resize",
+    "owner": "oke",
+    "pool": "oke-cpu",
+    "status": "planned",
+    "steps": ["update the managed OKE node-pool desired size"],
+    "target": "oke-cpu",
+    "target_size": 2,
+    "warnings": [
+      "This direct OCI mutation does not update Terraform or OCI Resource Manager input values; reconcile the declared pool size before the next apply."
+    ],
+    "workload_pods": 0
+  }
+]
 ```
 
 Pool-level scale-down changes desired capacity but does not select which worker
@@ -378,6 +400,14 @@ mgmt-oke health run
 mgmt-oke health run --type discovery
 mgmt-oke health run --type rdma --pool oke-rdma
 mgmt-oke recommendations list
+```
+
+Example `mgmt-oke status` output:
+
+```text
+overall  pools  nodes  ready  not_ready  gpu_nodes  rdma_nodes  addons_active  addons_total  autoscaler_pools  slinky_nodes  kueue_flavors
+-------  -----  -----  -----  ---------  ---------  ----------  -------------  ------------  ----------------  ------------  -------------
+HEALTHY  4      6      6      0          3          2           7              7             0                 0             2
 ```
 
 Health checks are deterministic evaluations of the discovered control-plane

@@ -40,7 +40,15 @@ the owning service launches a replacement.
 ### Step 1: Inspect the Node
 
 ```bash
-mgmt-oke --auth instance_principal nodes get <node-name-or-ip>
+mgmt-oke --auth instance_principal nodes get gpu-node-1
+```
+
+Example output:
+
+```text
+name        slurm_name  ip          status  pool     shape         gpu               rdma  rdma_vf  workload_pods  slurm_pods  system_pods  daemonsets
+----------  ----------  ----------  ------  -------  ------------  ----------------  ----  -------  -------------  ----------  -----------  ----------
+gpu-node-1  -           10.0.1.101  Ready   oke-gpu  VM.GPU.A10.1  nvidia.com/gpu=1  no    -        0              0           0            16
 ```
 
 Review:
@@ -62,7 +70,34 @@ mgmt-oke --auth instance_principal pools get <pool-name>
 ### Step 2: Preview Drain And Termination
 
 ```bash
-mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> --dry-run
+mgmt-oke --auth instance_principal nodes terminate gpu-node-1 \
+  --keep-size --dry-run --format json
+```
+
+Example replacement dry-run output:
+
+```json
+[
+  {
+    "current_size": 1,
+    "decrement_size": false,
+    "operation": "node-remove",
+    "owner": "oke",
+    "pool": "oke-gpu",
+    "status": "planned",
+    "steps": [
+      "cordon Kubernetes node",
+      "evict non-DaemonSet pods through the Eviction API",
+      "delete the selected worker through OKE DeleteNode"
+    ],
+    "target": "gpu-node-1",
+    "target_size": 1,
+    "warnings": [
+      "This direct OCI mutation does not update Terraform or OCI Resource Manager input values; reconcile the declared pool size before the next apply."
+    ],
+    "workload_pods": 0
+  }
+]
 ```
 
 Preflight resolves the owning OCI service, calculates target capacity, lists
@@ -149,6 +184,17 @@ mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> \
   --delete-emptydir-data --wait
 ```
 
+Example refusal without that acknowledgement:
+
+```text
+Error: Refusing to drain cpu-node-1: pods use emptyDir data:
+kueue-system/kueue-controller-manager-example,
+monitoring/kube-prometheus-stack-grafana-0. Use --delete-emptydir-data to
+acknowledge data loss.
+```
+
+The command exits with status `2` and does not cordon or terminate the node.
+
 Pods without a controller require `--force` because Kubernetes will not
 recreate them:
 
@@ -169,9 +215,29 @@ mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> \
 Standalone node maintenance uses the same selection and eviction engine:
 
 ```bash
-mgmt-oke nodes cordon <node-name>
+mgmt-oke nodes cordon gpu-node-1 --dry-run --format json
 mgmt-oke nodes drain <node-name>
 mgmt-oke nodes uncordon <node-name>
+```
+
+Example cordon dry-run output:
+
+```json
+[
+  {
+    "current_size": null,
+    "decrement_size": null,
+    "operation": "node-cordon",
+    "owner": "kubernetes",
+    "pool": "oke-gpu",
+    "status": "planned",
+    "steps": ["set spec.unschedulable=true"],
+    "target": "gpu-node-1",
+    "target_size": null,
+    "warnings": [],
+    "workload_pods": 0
+  }
+]
 ```
 
 ## Non-Interactive Execution

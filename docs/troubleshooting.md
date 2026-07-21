@@ -14,6 +14,13 @@ echo "$PATH"
 ls -l /home/ubuntu/bin/mgmt-oke
 ```
 
+Example output after installation:
+
+```text
+/home/ubuntu/bin/mgmt-oke
+/home/ubuntu/bin/kubectl-oke
+```
+
 If the virtual environment exists but the stable links do not, repeat the
 `PATH` steps in [Controller Node Installation](./controller-install.md).
 
@@ -105,8 +112,22 @@ Read-only commands preserve available results and print warnings when one
 source fails. Use the partial modes to isolate the failing side:
 
 ```bash
-mgmt-oke --auth instance_principal --skip-oci nodes list
+mgmt-oke --auth instance_principal --skip-oci nodes list \
+  --columns name,status,pool,shape --sort pool,name
 mgmt-oke --auth instance_principal --skip-kubernetes pools list
+```
+
+Example Kubernetes-only output using selected columns:
+
+```text
+name           status  pool        shape
+-------------  ------  ----------  -------------------
+cpu-node-1     Ready   oke-cpu     VM.Standard.E5.Flex
+gpu-node-1     Ready   oke-gpu     VM.GPU.A10.1
+rdma-node-1    Ready   oke-rdma    BM.GPU4.8
+rdma-node-2    Ready   oke-rdma    BM.GPU4.8
+system-node-1  Ready   oke-system  VM.Standard.E5.Flex
+system-node-2  Ready   oke-system  VM.Standard.E5.Flex
 ```
 
 Do not treat partial discovery as sufficient mutation preflight.
@@ -140,10 +161,24 @@ Pool lookup accepts the displayed pool name or backing resource OCID. Node
 lookup accepts Kubernetes name, Slinky name, internal IP, provider ID, or
 instance OCID.
 
+Example failed lookup:
+
+```text
+Error: Pool not found: pool-does-not-exist
+```
+
+The command exits with status `1`.
+
 ## Manual Mutation Refused for Autoscaler Ownership
 
 ```bash
 mgmt-oke --auth instance_principal autoscaler status
+```
+
+Example output when no Cluster Autoscaler owns a discovered pool:
+
+```text
+(none)
 ```
 
 Manual resize and node termination are intentionally refused for a matched
@@ -164,6 +199,17 @@ Run a dry-run plan to identify the exact refusal:
 ```bash
 mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> --dry-run
 ```
+
+Example safety refusal:
+
+```text
+Error: Refusing to drain cpu-node-1: pods use emptyDir data:
+kueue-system/kueue-controller-manager-example,
+monitoring/kube-prometheus-stack-grafana-0. Use --delete-emptydir-data to
+acknowledge data loss.
+```
+
+The command exits with status `2` without changing node or OCI state.
 
 Use `--delete-emptydir-data` only after accepting loss of pod-local data. Use
 `--force` only when a pod without a controller can be discarded. A
@@ -234,6 +280,16 @@ mgmt-oke --auth instance_principal health run
 mgmt-oke --auth instance_principal recommendations list
 mgmt-oke --auth instance_principal nodes list --pool <pool-name>
 mgmt-oke --auth instance_principal topology list --pool <pool-name>
+```
+
+Example healthy check output:
+
+```text
+check            scope        status  message                                       recommendation
+---------------  -----------  ------  --------------------------------------------  --------------
+gpu-allocatable  gpu-node-1   PASS    nvidia.com/gpu=1                              -
+rdma-topology    rdma-node-1  PASS    Required OCI RDMA topology labels are valid.  -
+rdma-topology    rdma-node-2  PASS    Required OCI RDMA topology labels are valid.  -
 ```
 
 Check Node Feature Discovery, GPU Operator or device plug-in state, NVIDIA

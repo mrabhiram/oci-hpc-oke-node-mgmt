@@ -38,6 +38,17 @@ mgmt-oke --auth instance_principal autoscaler status
 Confirm the current `desired`, `oci_active`, and `k8s_ready` values. Check
 `kind`, `placement`, `autoscaler`, and `slinky` before continuing.
 
+Example inspection result for `oke-cpu`:
+
+```text
+name     kind       placement  shape                desired  oci_active  k8s_ready  gpu  rdma  rdma_vf_required  slinky  autoscaler  kueue_flavor
+-------  ---------  ---------  -------------------  -------  ----------  ---------  ---  ----  ----------------  ------  ----------  ------------
+oke-cpu  node-pool  standard   VM.Standard.E5.Flex  1        1           1          -    no    no                no      -           -
+
+Cluster Autoscaler
+(none)
+```
+
 ### Step 2: Choose Exact Size or Delta
 
 Set an exact desired size:
@@ -78,6 +89,35 @@ Run the same request with `--dry-run` before changing capacity:
 
 ```bash
 mgmt-oke --auth instance_principal pools add <pool-name> --count 1 --dry-run
+```
+
+Concrete example with machine-readable output:
+
+```bash
+mgmt-oke --auth instance_principal pools add oke-cpu \
+  --count 1 --dry-run --format json
+```
+
+Example output:
+
+```json
+[
+  {
+    "current_size": 1,
+    "decrement_size": null,
+    "operation": "pool-resize",
+    "owner": "oke",
+    "pool": "oke-cpu",
+    "status": "planned",
+    "steps": ["update the managed OKE node-pool desired size"],
+    "target": "oke-cpu",
+    "target_size": 2,
+    "warnings": [
+      "This direct OCI mutation does not update Terraform or OCI Resource Manager input values; reconcile the declared pool size before the next apply."
+    ],
+    "workload_pods": 0
+  }
+]
 ```
 
 The plan reports the operation, owning service, current and target sizes, OCI
@@ -204,6 +244,14 @@ For RDMA pools, also run:
 ```bash
 mgmt-oke --auth instance_principal topology list --pool <pool-name>
 mgmt-oke --auth instance_principal addons status
+```
+
+Example converged RDMA pool result:
+
+```text
+name      kind             placement        shape      desired  oci_active  k8s_ready  gpu             rdma
+--------  ---------------  ---------------  ---------  -------  ----------  ---------  --------------  ----
+oke-rdma  cluster-network  cluster-network  BM.GPU4.8  2        2           2          nvidia.com/gpu  yes
 ```
 
 ## Infrastructure-As-Code Ownership

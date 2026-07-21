@@ -27,8 +27,16 @@ With `--wait`, the CLI checks the layers applicable to the selected pool:
 ## Inspect Pool Readiness
 
 ```bash
-mgmt-oke --auth instance_principal pools get <pool-name>
-mgmt-oke --auth instance_principal nodes list --pool <pool-name>
+mgmt-oke --auth instance_principal pools get oke-rdma
+mgmt-oke --auth instance_principal nodes list --pool oke-rdma
+```
+
+Example pool output:
+
+```text
+name      kind             placement        shape      desired  oci_active  k8s_ready  gpu             rdma  rdma_vf_required  slinky  autoscaler  kueue_flavor
+--------  ---------------  ---------------  ---------  -------  ----------  ---------  --------------  ----  ----------------  ------  ----------  ------------
+oke-rdma  cluster-network  cluster-network  BM.GPU4.8  2        2           2          nvidia.com/gpu  yes   no                no      -           -
 ```
 
 For a stable pool, `desired`, `oci_active`, and `k8s_ready` should agree.
@@ -46,8 +54,19 @@ The node view reports:
 List the target pool:
 
 ```bash
-mgmt-oke --auth instance_principal nodes list --pool oke-gpu
+mgmt-oke --auth instance_principal nodes list --pool oke-gpu \
+  --columns name,status,pool,shape,gpu,rdma,workload_pods
 ```
+
+Example output:
+
+```text
+name        status  pool     shape         gpu               rdma  workload_pods
+----------  ------  -------  ------------  ----------------  ----  -------------
+gpu-node-1  Ready   oke-gpu  VM.GPU.A10.1  nvidia.com/gpu=1  no    0
+```
+
+This example shows selected columns from the live node inventory.
 
 NVIDIA nodes should advertise `nvidia.com/gpu`. AMD nodes should advertise
 `amd.com/gpu`. A node can be Kubernetes Ready before its GPU resource becomes
@@ -65,9 +84,27 @@ resource is missing.
 ## Verify RDMA Topology
 
 ```bash
-mgmt-oke --auth instance_principal nodes list --rdma-only
+mgmt-oke --auth instance_principal nodes list --rdma-only \
+  --columns name,status,pool,shape,gpu,rdma,workload_pods
 mgmt-oke --auth instance_principal topology list --pool oke-rdma
 ```
+
+Example node and topology output:
+
+```text
+name         status  pool      shape      gpu               rdma  workload_pods
+-----------  ------  --------  ---------  ----------------  ----  -------------
+rdma-node-1  Ready   oke-rdma  BM.GPU4.8  nvidia.com/gpu=8  yes   0
+rdma-node-2  Ready   oke-rdma  BM.GPU4.8  nvidia.com/gpu=8  yes   0
+
+hpc_island  network_block  local_block  nodes  ready  shapes
+----------  -------------  -----------  -----  -----  ---------
+island-a    block-a        local-a      1      1      BM.GPU4.8
+island-a    block-a        local-b      1      1      BM.GPU4.8
+```
+
+Node and topology identifiers are representative replacements; the readiness
+counts and shape are retained from the captured output.
 
 The CLI requires valid values for HPC Island, Network Block, and Local Block.
 It rejects missing values and sentinel values including:
@@ -95,6 +132,19 @@ mgmt-oke --auth instance_principal addons validate --target gpu
 mgmt-oke --auth instance_principal addons validate --target rdma --pool oke-rdma
 ```
 
+Example add-on status output:
+
+```text
+name                  state   version         active  error
+--------------------  ------  --------------  ------  -----
+NodeFeatureDiscovery  ACTIVE  v0.17.3-1       yes     -
+NvidiaGpuOperator     ACTIVE  v25.10.1        yes     -
+NodeProblemDetector   ACTIVE  v0.8.20         yes     -
+```
+
+The full command also reports the core networking, DNS, proxy, and
+observability add-ons discovered on the cluster.
+
 Review `state`, `version`, `active`, and `error`. The add-on view is read-only;
 the CLI does not install, update, or remove OKE add-ons.
 
@@ -108,6 +158,19 @@ Run the underlying health categories directly when diagnosing a failure:
 mgmt-oke --auth instance_principal health run --type gpu --pool oke-gpu
 mgmt-oke --auth instance_principal health run --type rdma --pool oke-rdma
 mgmt-oke --auth instance_principal recommendations list --type rdma --pool oke-rdma
+```
+
+Example health output:
+
+```text
+check            scope        status  message                                       recommendation
+---------------  -----------  ------  --------------------------------------------  --------------
+gpu-allocatable  gpu-node-1   PASS    nvidia.com/gpu=1                              -
+rdma-topology    rdma-node-1  PASS    Required OCI RDMA topology labels are valid.  -
+rdma-topology    rdma-node-2  PASS    Required OCI RDMA topology labels are valid.  -
+
+Recommendations
+(none)
 ```
 
 ## Verify Network Operator Virtual Functions

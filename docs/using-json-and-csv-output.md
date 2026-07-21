@@ -31,6 +31,34 @@ output remains parseable. Full `reconcile` JSON includes warnings in its
 mgmt-oke --auth instance_principal --format json pools list
 ```
 
+Example output excerpt:
+
+```json
+[
+  {
+    "autoscaler": "-",
+    "cluster_network_id": "ocid1.clusternetwork.oc1..example",
+    "compute_cluster_id": null,
+    "desired": 2,
+    "gpu": "nvidia.com/gpu",
+    "instance_pool_id": "ocid1.instancepool.oc1..example",
+    "k8s_ready": 2,
+    "kind": "cluster-network",
+    "name": "oke-rdma",
+    "node_pool_id": null,
+    "oci_active": 2,
+    "placement": "cluster-network",
+    "rdma": true,
+    "rdma_vf_required": false,
+    "shape": "BM.GPU4.8",
+    "slinky": false
+  }
+]
+```
+
+The complete output contains one object per discovered pool. Resource OCIDs in
+this example are placeholders.
+
 `pools list` and `pools get` use the fast inventory path. They do not scan
 workload pod counts, Cluster Autoscaler deployments, or Kueue resources.
 Fields derived from those scans can therefore be empty in their JSON output.
@@ -87,12 +115,47 @@ mgmt-oke --auth instance_principal nodes list \
   --sort name --format json
 ```
 
+Example output:
+
+```json
+[
+  {
+    "gpu": {
+      "nvidia.com/gpu": "8"
+    },
+    "name": "rdma-node-1",
+    "rdma_vf": null,
+    "ready": true,
+    "schedulable": true,
+    "shape": "BM.GPU4.8",
+    "status": "Ready"
+  },
+  {
+    "gpu": {
+      "nvidia.com/gpu": "8"
+    },
+    "name": "rdma-node-2",
+    "rdma_vf": null,
+    "ready": true,
+    "schedulable": true,
+    "shape": "BM.GPU4.8",
+    "status": "Ready"
+  }
+]
+```
+
 Use `--one-line` when a comma-separated node-name list is required, or
 `--no-header` for headerless table and CSV consumers:
 
 ```bash
 mgmt-oke --auth instance_principal nodes list --pool oke-gpu --one-line
 mgmt-oke --auth instance_principal nodes list --columns name,ip --no-header
+```
+
+Example `--one-line` output:
+
+```text
+gpu-node-1
 ```
 
 ## Full Snapshot as JSON
@@ -115,6 +178,18 @@ Export pools or nodes:
 ```bash
 mgmt-oke --auth instance_principal --format csv pools list > pools.csv
 mgmt-oke --auth instance_principal --format csv nodes list > nodes.csv
+```
+
+Example `nodes.csv` content:
+
+```csv
+name,status,pool,shape,gpu,rdma
+cpu-node-1,Ready,oke-cpu,VM.Standard.E5.Flex,-,no
+gpu-node-1,Ready,oke-gpu,VM.GPU.A10.1,nvidia.com/gpu=1,no
+rdma-node-1,Ready,oke-rdma,BM.GPU4.8,nvidia.com/gpu=8,yes
+rdma-node-2,Ready,oke-rdma,BM.GPU4.8,nvidia.com/gpu=8,yes
+system-node-1,Ready,oke-system,VM.Standard.E5.Flex,-,no
+system-node-2,Ready,oke-system,VM.Standard.E5.Flex,-,no
 ```
 
 Export the full snapshot:
@@ -177,6 +252,28 @@ Mutation plans use the same table, JSON, and CSV serializers as inventory:
 ```bash
 mgmt-oke --auth instance_principal pools add "$POOL" \
   --count 1 --dry-run --format json
+```
+
+Example mutation-plan output for `POOL=oke-cpu`:
+
+```json
+[
+  {
+    "current_size": 1,
+    "decrement_size": null,
+    "operation": "pool-resize",
+    "owner": "oke",
+    "pool": "oke-cpu",
+    "status": "planned",
+    "steps": ["update the managed OKE node-pool desired size"],
+    "target": "oke-cpu",
+    "target_size": 2,
+    "warnings": [
+      "This direct OCI mutation does not update Terraform or OCI Resource Manager input values; reconcile the declared pool size before the next apply."
+    ],
+    "workload_pods": 0
+  }
+]
 ```
 
 The current flattened row schema is `v1`. Backward-incompatible field changes
