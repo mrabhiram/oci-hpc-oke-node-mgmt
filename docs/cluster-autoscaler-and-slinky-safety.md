@@ -6,16 +6,16 @@ from conflicting with Cluster Autoscaler or Slinky Slurm.
 ## Overview
 
 `mgmt-oke` can mutate OCI worker capacity, but it does not replace a workload
-scheduler or autoscaler. Before resize or node removal, the CLI discovers
-external ownership and refuses operations that require coordination it cannot
-perform safely.
+scheduler or autoscaler. Before resize, node removal, or boot volume
+replacement, the CLI discovers external ownership and refuses operations that
+require coordination it cannot perform safely.
 
 Two protections are enforced:
 
-- manual resize and node removal are refused for a pool targeted by Cluster
-  Autoscaler
+- manual resize, node removal, and BVR are refused for a pool targeted by
+  Cluster Autoscaler
 - Slinky-managed pools allow scale-up but refuse scale-down, specific node
-  removal, and replacement until a Slurm-aware drain workflow exists
+  removal, replacement, and BVR until a Slurm-aware drain workflow exists
 
 ## Cluster Autoscaler Detection
 
@@ -67,7 +67,7 @@ topologies  resource_flavors  cluster_queues  local_queues
 
 > [!NOTE]
 > `pools list` is optimized for inventory and does not scan Cluster Autoscaler
-> deployments. Resize and node-removal preflight always performs the scan.
+> deployments. Resize, node-removal, and BVR preflight always perform the scan.
 
 ## Autoscaler-Owned Pool Behavior
 
@@ -77,6 +77,8 @@ target:
 ```bash
 mgmt-oke --auth instance_principal pools resize <pool-name> --delta 1
 mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip>
+mgmt-oke --auth instance_principal nodes boot-volume-replace <node-name-or-ip>
+mgmt-oke --auth instance_principal pools boot-volume-replace <pool-name> --image-id <image-ocid>
 ```
 
 There is no force flag for bypassing this protection. Change capacity through
@@ -120,6 +122,8 @@ The CLI refuses:
 mgmt-oke --auth instance_principal pools resize <slinky-pool> --delta -1
 mgmt-oke --auth instance_principal nodes terminate <slinky-node>
 mgmt-oke --auth instance_principal nodes terminate <slinky-node> --keep-size
+mgmt-oke --auth instance_principal nodes boot-volume-replace <slinky-node>
+mgmt-oke --auth instance_principal pools boot-volume-replace <slinky-pool> --image-id <image-ocid>
 ```
 
 `--allow-workloads` and `--yes` do not bypass Slinky ownership protection.

@@ -65,6 +65,7 @@ def _node():
             conditions=[SimpleNamespace(type="Ready", status="True")],
             addresses=[SimpleNamespace(type="InternalIP", address="10.0.0.1")],
             allocatable={"nvidia.com/gpu": "8", "nvidia.com/rdma-vf": "8"},
+            node_info=SimpleNamespace(boot_id="boot-session-1"),
         ),
     )
 
@@ -194,6 +195,7 @@ class KubernetesBackendTests(unittest.TestCase):
         self.assertEqual(1, node.slinky_workload_pods)
         self.assertEqual("oke-rdma", node.pool_name)
         self.assertEqual("ocid1.instance.oc1.lhr.node1", node.instance_ocid)
+        self.assertEqual("boot-session-1", node.boot_id)
 
     def test_list_nodes_tolerates_pod_list_failure(self):
         core = _CoreApi([_node()], [])

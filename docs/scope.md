@@ -55,6 +55,16 @@ Management Tool.
 - wait for allocatable GPU, RDMA topology, and applicable RDMA VF readiness
 - guarded specific managed OKE node removal/termination through OKE `delete_node`
 - guarded specific self-managed node removal/replacement through instance-pool detach and automatic termination
+- guarded individual boot volume replacement for managed and self-managed
+  workers through OKE `ReplaceBootVolumeClusterNode`, preserving the compute
+  instance, network address, image, and existing node configuration
+- guarded managed node-pool boot volume replacement through OKE
+  `UpdateNodePool` with `BOOT_VOLUME_REPLACE` cycling and supported image, boot
+  KMS, boot size, Kubernetes version, metadata, and SSH-key updates
+- enhanced-cluster, Linux distribution, image/shape, pool-wide health,
+  eviction, instance identity, boot volume identity, GPU, RDMA topology, and
+  RDMA VF validation for BVR, while permitting individual repair of a NotReady
+  worker
 - multi-node termination by identifier or exact field selector
 - Kubernetes cordon, uncordon, and PDB-aware drain workflows
 - default drain before node termination, with explicit `emptyDir` and unmanaged-pod acknowledgements
@@ -72,10 +82,10 @@ Management Tool.
 - [`creating-worker-pools.md`](creating-worker-pools.md)
 - [`live-pool-creation-validation.md`](live-pool-creation-validation.md)
 - [`live-pool-deletion-validation.md`](live-pool-deletion-validation.md)
+- [`replacing-worker-boot-volumes.md`](replacing-worker-boot-volumes.md)
 
 ## Not Implemented Yet
 
-- boot volume replacement wrapper
 - automatic Kueue `ClusterQueue` quota updates after worker-pool capacity changes
 - Cluster Autoscaler bounds updates
 - OKE add-on installation, update, or removal

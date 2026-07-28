@@ -366,6 +366,49 @@ pool and configuration carry the `mgmt-oke-created=true` ownership tag.
 Configurations owned by the OCI HPC OKE stack are not deleted. A no-wait
 deletion reports the retained configuration for manual cleanup.
 
+### Boot Volume Replacement
+
+OKE exposes two different BVR contracts, and the CLI keeps them separate.
+
+`nodes boot-volume-replace` accepts specific managed or self-managed workers.
+Preparation confirms the cluster is enhanced, ownership is stable, and
+eviction admission succeeds. A selected worker can be NotReady when BVR is
+being used as a repair. The plan records the compute instance OCID, internal
+IP, Kubernetes boot ID, and current boot volume OCID. Execution invokes OKE
+`ReplaceBootVolumeClusterNode`; it does not call Compute boot volume
+replacement directly.
+
+The individual OKE API accepts node eviction settings but no image or other
+node-property update. OKE preserves the existing image, cloud-init, bootstrap,
+networking, and node configuration.
+
+`pools boot-volume-replace` is limited to fully healthy managed OKE node pools.
+It builds
+`UpdateNodePoolDetails` with
+`NodePoolCyclingDetails(cycle_modes=["BOOT_VOLUME_REPLACE"])` and at least one
+supported update:
+
+- image ID
+- boot volume size
+- boot volume KMS key
+- Kubernetes version
+- node metadata
+- SSH public key
+
+Image preparation verifies shape availability, VCN consistency, Linux-only
+operation, and the same Linux distribution as the current image. Boot volume
+size reduction and reserved OKE metadata changes are refused.
+
+Both workflows perform eviction dry-runs, require explicit acknowledgement for
+`emptyDir` data or unmanaged pods, protect Cluster Autoscaler and Slinky
+ownership, and rediscover state under the mutation Lease before submission.
+
+The BVR waiter verifies the OKE work request, unchanged instance OCID and
+internal IP, changed boot volume OCID, changed Kubernetes boot ID when
+available, Ready and schedulable state, complete pool counts, GPU allocation,
+RDMA topology, and applicable Network Operator VFs. The managed-pool waiter
+also verifies the requested node-pool properties from OKE.
+
 ## Node And Resource Readiness
 
 After a mutation with `--wait`, the tool reconciles the selected pool until:

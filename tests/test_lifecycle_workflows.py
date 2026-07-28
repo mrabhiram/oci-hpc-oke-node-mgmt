@@ -4,11 +4,16 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from oke_hpc_mgmt.backends.oci import (
+    BootVolumeAttachmentPending,
+    OciDiscoveryError,
+)
 from oke_hpc_mgmt.models import (
     ClusterNetworkCreateResult,
     DiscoverySnapshot,
     DrainPod,
     NodeInfo,
+    PoolBootVolumeReplaceSpec,
     PoolCreateSpec,
     PoolResourceReadiness,
     WorkerPoolInfo,
@@ -20,18 +25,25 @@ from oke_hpc_mgmt.workflows.lifecycle import (
     INSTANCE_CONFIGURATION_DERIVATION_NOTICE,
     WorkflowError,
     WorkflowNotFound,
+    execute_node_boot_volume_replace,
     execute_node_removal,
+    execute_pool_boot_volume_replace,
     execute_pool_create,
     execute_pool_delete,
     execute_pool_resize,
+    prepare_node_boot_volume_replace,
     prepare_node_removal,
+    prepare_pool_boot_volume_replace,
     prepare_pool_create,
     prepare_pool_delete,
     prepare_pool_resize,
+    _try_get_instance_boot_volume_id,
     readiness_status,
     resource_counts_match,
     wait_for_pool_creation,
     wait_for_pool_deleted,
+    wait_for_node_boot_volume_replace,
+    wait_for_pool_boot_volume_replace,
     wait_for_pool_size,
 )
 
@@ -58,10 +70,384 @@ def _service(snapshot: DiscoverySnapshot) -> Mock:
     service.oci_backend.return_value.preview_managed_node_pool_create.return_value = {
         "backend": "oke-node-pool"
     }
+    service.oci_backend.return_value.get_cluster_type.return_value = (
+        "ENHANCED_CLUSTER"
+    )
+    service.oci_backend.return_value.get_instance_boot_volume_id.side_effect = (
+        lambda instance_id: f"boot-{instance_id}"
+    )
+    service.oci_backend.return_value.preview_managed_pool_boot_volume_replace.return_value = {
+        "current": {"image_id": "image-old"},
+        "effective": {"image_id": "image-new"},
+    }
+    service.kubernetes_backend.return_value.list_drain_pods.return_value = []
     return service
 
 
+def _bvr_snapshot(
+    *,
+    kind: str = "node-pool",
+    pool_name: str = "oke-gpu",
+    instance_id: str = "instance-1",
+    boot_id: str = "boot-session-old",
+) -> tuple[DiscoverySnapshot, WorkerPoolInfo, NodeInfo]:
+    pool = WorkerPoolInfo(
+        name=pool_name,
+        kind=kind,
+        shape="VM.GPU.A10.1",
+        desired_size=1,
+        active_oci_instances=1,
+        ready_k8s_nodes=1,
+        node_pool_id="node-pool-1" if kind == "node-pool" else None,
+        cluster_network_id=(
+            "cluster-network-1" if kind == "cluster-network" else None
+        ),
+        instance_pool_id=(
+            "instance-pool-1" if kind != "node-pool" else None
+        ),
+        oci_instance_ids={instance_id},
+        gpu_resource="nvidia.com/gpu",
+        rdma_enabled=kind != "node-pool",
+    )
+    labels = {}
+    shape = "VM.GPU.A10.1"
+    allocatable = {"nvidia.com/gpu": "1"}
+    if kind != "node-pool":
+        shape = "BM.GPU4.8"
+        pool.shape = shape
+        labels = {
+            "oci.oraclecloud.com/rdma.hpc_island_id": "island-1",
+            "oci.oraclecloud.com/rdma.network_block_id": "block-1",
+            "oci.oraclecloud.com/rdma.local_block_id": "local-1",
+        }
+        allocatable["nvidia.com/gpu"] = "8"
+    node = NodeInfo(
+        k8s_name=f"{pool_name}-node-1",
+        internal_ip="10.0.0.10",
+        instance_ocid=instance_id,
+        pool_name=pool_name,
+        node_pool_id=pool.node_pool_id,
+        shape=shape,
+        ready=True,
+        schedulable=True,
+        allocatable=allocatable,
+        labels=labels,
+        boot_id=boot_id,
+    )
+    return DiscoverySnapshot(pools=[pool], nodes=[node]), pool, node
+
+
 class LifecycleWorkflowTests(unittest.TestCase):
+    def test_bvr_wait_retries_only_transient_attachment_gap(self):
+        backend = Mock()
+        backend.get_instance_boot_volume_id.side_effect = (
+            BootVolumeAttachmentPending("attachment is changing")
+        )
+        self.assertIsNone(
+            _try_get_instance_boot_volume_id(backend, "instance-1")
+        )
+
+        backend.get_instance_boot_volume_id.side_effect = OciDiscoveryError(
+            "not authorized"
+        )
+        with self.assertRaisesRegex(OciDiscoveryError, "not authorized"):
+            _try_get_instance_boot_volume_id(backend, "instance-1")
+
+    def test_prepare_individual_bvr_supports_managed_and_self_managed_nodes(self):
+        for kind in ("node-pool", "cluster-network"):
+            with self.subTest(kind=kind):
+                snapshot, pool, node = _bvr_snapshot(kind=kind)
+                service = _service(snapshot)
+                service.kubernetes_backend.return_value.list_drain_pods.return_value = []
+
+                prepared = prepare_node_boot_volume_replace(
+                    service,
+                    identifiers=(node.k8s_name,),
+                    eviction_grace_duration="pt30m",
+                )
+
+                self.assertEqual(
+                    "node-boot-volume-replace",
+                    prepared.plans[0].operation,
+                )
+                self.assertEqual("PT30M", prepared.eviction_grace_duration)
+                self.assertTrue(
+                    prepared.plans[0].details[
+                        "preserves_existing_configuration"
+                    ]
+                )
+                self.assertEqual(
+                    f"boot-{node.instance_ocid}",
+                    prepared.old_boot_volume_ids[node.instance_ocid],
+                )
+                self.assertEqual(pool.name, prepared.pools[pool.name].name)
+
+    def test_prepare_bvr_requires_enhanced_healthy_unowned_pool(self):
+        snapshot, pool, node = _bvr_snapshot()
+        service = _service(snapshot)
+        service.oci_backend.return_value.get_cluster_type.return_value = (
+            "BASIC_CLUSTER"
+        )
+        with self.assertRaisesRegex(WorkflowError, "enhanced cluster"):
+            prepare_node_boot_volume_replace(
+                service,
+                identifiers=(node.k8s_name,),
+            )
+
+        service = _service(snapshot)
+        pool.autoscaler_owned = True
+        with self.assertRaisesRegex(WorkflowError, "autoscaler-owned"):
+            prepare_node_boot_volume_replace(
+                service,
+                identifiers=(node.k8s_name,),
+            )
+
+        snapshot, pool, node = _bvr_snapshot(pool_name="oke-system")
+        service = _service(snapshot)
+        with self.assertRaisesRegex(WorkflowError, "system pool"):
+            prepare_node_boot_volume_replace(
+                service,
+                identifiers=(node.k8s_name,),
+            )
+
+    def test_individual_bvr_allows_not_ready_node_as_repair(self):
+        snapshot, pool, node = _bvr_snapshot()
+        node.ready = False
+        node.schedulable = False
+        pool.ready_k8s_nodes = 0
+        service = _service(snapshot)
+
+        prepared = prepare_node_boot_volume_replace(
+            service,
+            identifiers=(node.k8s_name,),
+        )
+
+        self.assertTrue(
+            any(
+                "treated as a repair" in warning
+                for warning in prepared.plans[0].warnings
+            )
+        )
+
+    def test_execute_individual_bvr_submits_and_waits_sequentially(self):
+        snapshot, pool, node = _bvr_snapshot()
+        service = _service(snapshot)
+        service.kubernetes_backend.return_value.list_drain_pods.return_value = []
+        prepared = prepare_node_boot_volume_replace(
+            service,
+            identifiers=(node.k8s_name,),
+        )
+        service.oci_backend.return_value.replace_cluster_node_boot_volume.return_value = (
+            "work-request-1"
+        )
+
+        with patch(
+            "oke_hpc_mgmt.workflows.lifecycle.wait_for_node_boot_volume_replace",
+            return_value=(node, pool, "boot-volume-new"),
+        ) as waiter:
+            results = execute_node_boot_volume_replace(
+                service,
+                prepared,
+                wait=True,
+                lock=False,
+            )
+
+        service.oci_backend.return_value.replace_cluster_node_boot_volume.assert_called_once_with(
+            "cluster-1",
+            "instance-1",
+            eviction_grace_duration="PT60M",
+            force_after_grace=False,
+        )
+        waiter.assert_called_once()
+        self.assertEqual("ready", results[0]["status"])
+        self.assertEqual("boot-volume-new", results[0]["new_boot_volume_id"])
+        self.assertTrue(results[0]["same_instance"])
+
+    def test_multiple_individual_bvr_requires_wait(self):
+        snapshot, pool, first = _bvr_snapshot()
+        second = NodeInfo(
+            k8s_name="oke-gpu-node-2",
+            internal_ip="10.0.0.11",
+            instance_ocid="instance-2",
+            pool_name=pool.name,
+            node_pool_id=pool.node_pool_id,
+            shape=pool.shape,
+            ready=True,
+            schedulable=True,
+            allocatable={"nvidia.com/gpu": "1"},
+            boot_id="boot-session-2",
+        )
+        snapshot.nodes.append(second)
+        pool.desired_size = 2
+        pool.active_oci_instances = 2
+        pool.ready_k8s_nodes = 2
+        pool.oci_instance_ids.add("instance-2")
+        service = _service(snapshot)
+        service.kubernetes_backend.return_value.list_drain_pods.return_value = []
+        prepared = prepare_node_boot_volume_replace(
+            service,
+            identifiers=(first.k8s_name, second.k8s_name),
+        )
+
+        with self.assertRaisesRegex(WorkflowError, "require --wait"):
+            execute_node_boot_volume_replace(
+                service,
+                prepared,
+                wait=False,
+                lock=False,
+            )
+
+    def test_managed_pool_bvr_supports_image_change_and_refuses_self_managed(self):
+        snapshot, pool, _node = _bvr_snapshot()
+        service = _service(snapshot)
+        spec = PoolBootVolumeReplaceSpec(image_id="image-new")
+
+        prepared = prepare_pool_boot_volume_replace(
+            service,
+            pool.name,
+            spec,
+        )
+
+        self.assertEqual("pool-boot-volume-replace", prepared.plan.operation)
+        self.assertEqual("image-new", prepared.plan.details["updates"]["image_id"])
+
+        rdma_snapshot, rdma_pool, _rdma_node = _bvr_snapshot(
+            kind="cluster-network"
+        )
+        with self.assertRaisesRegex(WorkflowError, "managed OKE node pools"):
+            prepare_pool_boot_volume_replace(
+                _service(rdma_snapshot),
+                rdma_pool.name,
+                spec,
+            )
+
+    def test_managed_pool_bvr_requires_pod_data_acknowledgements(self):
+        snapshot, pool, _node = _bvr_snapshot()
+        service = _service(snapshot)
+        service.kubernetes_backend.return_value.list_drain_pods.return_value = [
+            DrainPod(
+                "training",
+                "checkpoint-writer",
+                controller="Job/job-1",
+                has_empty_dir=True,
+            ),
+            DrainPod("training", "manual-debugger"),
+        ]
+        spec = PoolBootVolumeReplaceSpec(image_id="image-new")
+
+        with self.assertRaisesRegex(WorkflowError, "emptyDir"):
+            prepare_pool_boot_volume_replace(
+                service,
+                pool.name,
+                spec,
+            )
+        with self.assertRaisesRegex(WorkflowError, "unmanaged pods"):
+            prepare_pool_boot_volume_replace(
+                service,
+                pool.name,
+                spec,
+                delete_emptydir_data=True,
+            )
+
+        prepared = prepare_pool_boot_volume_replace(
+            service,
+            pool.name,
+            spec,
+            delete_emptydir_data=True,
+            force_unmanaged=True,
+        )
+        self.assertEqual(2, len(prepared.drain_pods["oke-gpu-node-1"]))
+
+        pool.ready_k8s_nodes = 0
+        with self.assertRaisesRegex(WorkflowError, "fully Ready"):
+            prepare_pool_boot_volume_replace(
+                service,
+                pool.name,
+                spec,
+                delete_emptydir_data=True,
+                force_unmanaged=True,
+            )
+
+    def test_execute_managed_pool_bvr_submits_and_waits(self):
+        snapshot, pool, _node = _bvr_snapshot()
+        service = _service(snapshot)
+        prepared = prepare_pool_boot_volume_replace(
+            service,
+            pool.name,
+            PoolBootVolumeReplaceSpec(image_id="image-new"),
+        )
+        service.oci_backend.return_value.replace_managed_pool_boot_volumes.return_value = (
+            "work-request-pool"
+        )
+
+        with patch(
+            "oke_hpc_mgmt.workflows.lifecycle.wait_for_pool_boot_volume_replace",
+            return_value=(pool, {"instance-1": "boot-volume-new"}),
+        ) as waiter:
+            result = execute_pool_boot_volume_replace(
+                service,
+                prepared,
+                wait=True,
+                lock=False,
+            )
+
+        service.oci_backend.return_value.replace_managed_pool_boot_volumes.assert_called_once_with(
+            "node-pool-1",
+            prepared.spec,
+        )
+        waiter.assert_called_once()
+        self.assertEqual("ready", result["status"])
+        self.assertEqual(1, result["replaced_nodes"])
+
+    def test_bvr_waiters_verify_boot_and_node_identity(self):
+        old_snapshot, pool, old_node = _bvr_snapshot()
+        new_snapshot, new_pool, new_node = _bvr_snapshot(
+            boot_id="boot-session-new"
+        )
+        service = _service(new_snapshot)
+        service.oci_backend.return_value.get_instance_boot_volume_id.side_effect = (
+            None
+        )
+        service.oci_backend.return_value.get_instance_boot_volume_id.return_value = (
+            "boot-volume-new"
+        )
+        service.oci_backend.return_value.managed_pool_boot_volume_replace_applied.return_value = (
+            True
+        )
+
+        observed_node, observed_pool, boot_volume_id = (
+            wait_for_node_boot_volume_replace(
+                service,
+                old_node,
+                pool,
+                "boot-volume-old",
+                None,
+                timeout_seconds=1,
+                poll_interval_seconds=1,
+            )
+        )
+        self.assertEqual(new_node.boot_id, observed_node.boot_id)
+        self.assertEqual(new_pool.name, observed_pool.name)
+        self.assertEqual("boot-volume-new", boot_volume_id)
+
+        prepared = prepare_pool_boot_volume_replace(
+            _service(old_snapshot),
+            pool.name,
+            PoolBootVolumeReplaceSpec(image_id="image-new"),
+        )
+        observed_pool, boot_volume_ids = wait_for_pool_boot_volume_replace(
+            service,
+            prepared,
+            None,
+            timeout_seconds=1,
+            poll_interval_seconds=1,
+        )
+        self.assertEqual(new_pool.name, observed_pool.name)
+        self.assertEqual(
+            {"instance-1": "boot-volume-new"},
+            boot_volume_ids,
+        )
+
     def test_prepare_pool_delete_protects_system_autoscaler_and_slinky_pools(self):
         system = WorkerPoolInfo(
             name="oke-system",

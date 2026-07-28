@@ -9,6 +9,7 @@ from oke_hpc_mgmt.models import (
     NODE_POOL_CNI_TYPES,
     POOL_CREATE_TYPES,
     POOL_STORAGE_MODES,
+    PoolBootVolumeReplaceSpec,
     PoolCreateSpec,
 )
 
@@ -43,6 +44,9 @@ _RESERVED_FREEFORM_TAG_KEYS = frozenset(
         "role",
         "state_id",
     }
+)
+_ISO_HOUR_MINUTE_DURATION_PATTERN = re.compile(
+    r"PT(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?"
 )
 
 
@@ -205,6 +209,68 @@ def validate_pool_create_spec(spec: PoolCreateSpec) -> PoolCreateSpec:
             "Lustre mount path",
         )
     return spec
+
+
+def validate_pool_boot_volume_replace_spec(
+    spec: PoolBootVolumeReplaceSpec,
+) -> PoolBootVolumeReplaceSpec:
+    updates = (
+        spec.image_id,
+        spec.boot_volume_size_in_gbs,
+        spec.boot_volume_kms_key_id,
+        spec.kubernetes_version,
+        spec.node_metadata,
+        spec.ssh_public_key,
+    )
+    if not any(value not in (None, "", ()) for value in updates):
+        raise ValueError(
+            "Managed-pool boot volume replacement requires at least one "
+            "supported update: image, boot volume size or KMS key, Kubernetes "
+            "version, node metadata, or SSH public key."
+        )
+    _require_positive(spec.boot_volume_size_in_gbs, "Boot volume size")
+    validate_maximum_unavailable(spec.maximum_unavailable)
+
+    metadata_keys = {key for key, _value in spec.node_metadata}
+    reserved = sorted(metadata_keys.intersection(_RESERVED_NODE_METADATA_KEYS))
+    if reserved:
+        raise ValueError(
+            "Use dedicated boot-volume-replacement options instead of overriding "
+            f"reserved OKE node metadata: {', '.join(reserved)}."
+        )
+    for key, value in spec.node_metadata:
+        _validate_single_line(key, "Node metadata key")
+        _validate_single_line(value, f"Node metadata value for {key}")
+    return spec
+
+
+def validate_maximum_unavailable(value: str) -> None:
+    normalized = value.strip()
+    if normalized.endswith("%"):
+        percentage = normalized[:-1]
+        if not percentage.isdigit() or not 1 <= int(percentage) <= 100:
+            raise ValueError(
+                "Maximum unavailable percentage must be between 1% and 100%."
+            )
+        return
+    if not normalized.isdigit() or int(normalized) < 1:
+        raise ValueError("Maximum unavailable must be a positive count or percentage.")
+
+
+def validate_eviction_grace_duration(value: str) -> str:
+    normalized = value.strip().upper()
+    match = _ISO_HOUR_MINUTE_DURATION_PATTERN.fullmatch(normalized)
+    if not match or not any(match.groupdict().values()):
+        raise ValueError(
+            "Eviction grace duration must be an ISO-8601 hour/minute duration "
+            "such as PT30M."
+        )
+    minutes = int(match.group("hours") or 0) * 60 + int(
+        match.group("minutes") or 0
+    )
+    if minutes > 60:
+        raise ValueError("Eviction grace duration cannot exceed PT60M.")
+    return normalized
 
 
 def validate_kubernetes_label(key: str, value: str) -> None:

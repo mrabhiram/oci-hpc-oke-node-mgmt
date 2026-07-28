@@ -202,6 +202,15 @@ mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> \
   --keep-size --wait
 ```
 
+For boot volume replacement:
+
+```bash
+mgmt-oke --auth instance_principal nodes boot-volume-replace \
+  <node-name-or-ip> --wait
+mgmt-oke --auth instance_principal pools boot-volume-replace \
+  <managed-pool> --image-id <image-ocid> --wait
+```
+
 Wait status is printed only when a value changes. For a GPU with RDMA pool it
 can progress through:
 
@@ -220,6 +229,11 @@ When RDMA VF readiness is required, the status also includes
 For `nodes terminate --keep-size`, the waiter additionally requires
 `node_present=False` for the selected worker before accepting the replacement
 as complete.
+
+For BVR, the waiter instead requires the original compute instance and internal
+IP to remain present, the boot volume and Kubernetes boot IDs to change, the
+node to become Ready and schedulable, and every applicable GPU, RDMA topology,
+and RDMA VF check to recover.
 
 ## Troubleshooting
 

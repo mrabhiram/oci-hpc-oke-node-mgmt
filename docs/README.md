@@ -48,6 +48,9 @@ capacity naturally vary by deployment.
   workflows.
 - [Removing and Replacing Worker Nodes](./removing-and-replacing-worker-nodes.md):
   Drain and terminate selected workers or replace them while preserving pool size.
+- [Replacing Worker Boot Volumes](./replacing-worker-boot-volumes.md): Replace
+  one managed or self-managed worker boot volume, or roll a managed pool to a
+  supported new image or node property.
 - [Managing RDMA Worker Pools](./managing-rdma-worker-pools.md): Operate both the
   OKE v26.7 Compute Cluster model and legacy self-managed Cluster Network model.
 

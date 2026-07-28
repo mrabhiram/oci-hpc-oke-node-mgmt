@@ -5,6 +5,9 @@ from typing import Any, cast
 
 import click
 
+from oke_hpc_mgmt.commands.bvr_options import (
+    boot_volume_replace_wait_options,
+)
 from oke_hpc_mgmt.commands.common import (
     CliState,
     confirm_plans,
@@ -23,7 +26,9 @@ from oke_hpc_mgmt.commands.common import (
 from oke_hpc_mgmt.render import NODE_COLUMNS, node_rows, parse_columns, print_records, sort_records
 from oke_hpc_mgmt.selection import select_nodes
 from oke_hpc_mgmt.workflows.lifecycle import (
+    execute_node_boot_volume_replace,
     execute_node_removal,
+    prepare_node_boot_volume_replace,
     prepare_node_removal,
 )
 from oke_hpc_mgmt.workflows.node_maintenance import (
@@ -253,6 +258,127 @@ def terminate_nodes(
 
 nodes.add_command(terminate_nodes)
 nodes.add_command(terminate_nodes, "remove")
+
+
+def boot_volume_replace_options(
+    function: Callable[..., Any],
+) -> Callable[..., Any]:
+    function = click.option(
+        "--grace-period",
+        type=click.IntRange(min=0),
+        default=30,
+        show_default=True,
+        help="Pod termination grace period used for the eviction preflight.",
+    )(function)
+    function = click.option(
+        "--allow-system-pool",
+        is_flag=True,
+        help="Permit BVR of an oke-system worker after explicit review.",
+    )(function)
+    function = click.option(
+        "--force",
+        "force_unmanaged",
+        is_flag=True,
+        help="Acknowledge eviction of pods without a controller.",
+    )(function)
+    function = click.option(
+        "--delete-emptydir-data",
+        is_flag=True,
+        help="Acknowledge deletion of pod-local emptyDir data.",
+    )(function)
+    function = click.option(
+        "--force-after-grace",
+        is_flag=True,
+        help="Force the OKE BVR action when the eviction grace period ends.",
+    )(function)
+    function = click.option(
+        "--eviction-grace",
+        default="PT60M",
+        show_default=True,
+        help="OKE cordon-and-drain grace duration from PT0M through PT60M.",
+    )(function)
+    return function
+
+
+@click.command(
+    "boot-volume-replace",
+    help=(
+        "Replace boot volumes of specific managed or self-managed workers. "
+        "This preserves the current image and node configuration."
+    ),
+)
+@click.argument("identifiers", nargs=-1)
+@node_selector_options
+@boot_volume_replace_options
+@boot_volume_replace_wait_options
+@mutation_options
+@output_option
+@pass_state
+def replace_node_boot_volumes(
+    state: CliState,
+    identifiers: tuple[str, ...],
+    node_values: tuple[str, ...],
+    fields: str | None,
+    eviction_grace: str,
+    force_after_grace: bool,
+    delete_emptydir_data: bool,
+    force_unmanaged: bool,
+    allow_system_pool: bool,
+    grace_period: int,
+    wait: bool,
+    timeout: int,
+    poll_interval: int,
+    dry_run: bool,
+    lock: bool,
+    yes: bool,
+    output_override: str | None,
+) -> int:
+    service = state.service(
+        include_pod_counts=True,
+        include_autoscaler=True,
+        include_kueue=False,
+        include_addons=True,
+    )
+    prepared = prepare_node_boot_volume_replace(
+        service,
+        identifiers=selected_identifiers(identifiers, node_values),
+        fields=fields,
+        delete_emptydir_data=delete_emptydir_data,
+        force_unmanaged=force_unmanaged,
+        allow_system_pool=allow_system_pool,
+        eviction_grace_duration=eviction_grace,
+        force_after_grace=force_after_grace,
+        drain_grace_period_seconds=grace_period,
+    )
+    if dry_run:
+        emit_plans(state, output_override, prepared.plans)
+        print_discovery_warnings(prepared.snapshot.warnings)
+        return 0
+
+    confirmation = (
+        prepared.nodes[0].k8s_name
+        if len(prepared.nodes) == 1
+        else f"replace boot volumes for {len(prepared.nodes)} nodes"
+    )
+    confirm_plans(prepared.plans, confirmation, approved=yes)
+    results = execute_node_boot_volume_replace(
+        service,
+        prepared,
+        wait=wait,
+        timeout_seconds=timeout,
+        poll_interval_seconds=poll_interval,
+        lock=lock,
+        drain_grace_period_seconds=grace_period,
+        progress=progress,
+    )
+    print_records(results, resolve_output(state, output_override))
+    print_discovery_warnings(prepared.snapshot.warnings)
+    return 0
+
+
+nodes.add_command(replace_node_boot_volumes)
+nodes.add_command(replace_node_boot_volumes, "bvr")
+nodes.add_command(replace_node_boot_volumes, "boot-volume-swap")
 
 
 def maintenance_options(function: Callable[..., Any]) -> Callable[..., Any]:

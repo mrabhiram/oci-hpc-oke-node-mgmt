@@ -243,6 +243,11 @@ class KubernetesBackend:
                     daemonset_pods=counts["daemonset"],
                     system_pods=counts["system"],
                     slinky_workload_pods=counts["slinky"],
+                    boot_id=getattr(
+                        getattr(node.status, "node_info", None),
+                        "boot_id",
+                        None,
+                    ),
                 )
             )
         return nodes

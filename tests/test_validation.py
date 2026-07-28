@@ -1,9 +1,16 @@
 import unittest
 
-from oke_hpc_mgmt.models import NvmeRaidSpec, PoolCreateSpec
+from oke_hpc_mgmt.models import (
+    NvmeRaidSpec,
+    PoolBootVolumeReplaceSpec,
+    PoolCreateSpec,
+)
 from oke_hpc_mgmt.validation import (
     normalize_pool_name,
     parse_key_value_options,
+    validate_eviction_grace_duration,
+    validate_maximum_unavailable,
+    validate_pool_boot_volume_replace_spec,
     validate_pool_create_spec,
 )
 
@@ -81,3 +88,43 @@ class ValidationTests(unittest.TestCase):
                 )
             ).storage_mode,
         )
+
+    def test_pool_bvr_requires_a_supported_property_update(self):
+        with self.assertRaisesRegex(ValueError, "at least one supported update"):
+            validate_pool_boot_volume_replace_spec(
+                PoolBootVolumeReplaceSpec()
+            )
+
+        spec = validate_pool_boot_volume_replace_spec(
+            PoolBootVolumeReplaceSpec(
+                image_id="ocid1.image.oc1..example",
+                maximum_unavailable="25%",
+            )
+        )
+        self.assertEqual("25%", spec.maximum_unavailable)
+
+    def test_pool_bvr_rejects_reserved_metadata_and_invalid_parallelism(self):
+        with self.assertRaisesRegex(ValueError, "reserved OKE node metadata"):
+            validate_pool_boot_volume_replace_spec(
+                PoolBootVolumeReplaceSpec(
+                    node_metadata=(("user_data", "replacement"),),
+                )
+            )
+        for value in ("0", "-1", "0%", "101%", "half"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_maximum_unavailable(value)
+
+    def test_eviction_grace_duration_accepts_zero_through_sixty_minutes(self):
+        for value, expected in (
+            ("PT0M", "PT0M"),
+            ("pt30m", "PT30M"),
+            ("PT1H", "PT1H"),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    expected,
+                    validate_eviction_grace_duration(value),
+                )
+        for value in ("PT61M", "PT2H", "30m", "PT"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_eviction_grace_duration(value)

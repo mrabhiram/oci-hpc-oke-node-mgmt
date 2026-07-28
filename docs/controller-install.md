@@ -31,6 +31,10 @@ The controller/operator node must have:
 - additional IAM permissions to create, update, or delete OKE node pools,
   Instance Configurations, Cluster Networks, and Instance Pools when lifecycle
   commands will be used
+- permission to invoke OKE cluster-node boot volume replacement and read
+  compute instance, image, boot volume, and work-request state when BVR commands
+  will be used
+- an enhanced OKE cluster for boot volume replacement
 - Network access to the Kubernetes API and OCI regional APIs
 
 Validate the controller environment before installing:
@@ -73,7 +77,7 @@ Verify the package entrypoints:
 Example version output:
 
 ```text
-mgmt-oke, version 0.7.0
+mgmt-oke, version 0.8.0
 ```
 
 ## Upgrade An Existing Installation
@@ -216,16 +220,18 @@ mgmt-oke pools delete <pool> [--dry-run] [--wait]
 mgmt-oke pools resize <pool> (--size <n> | --delta <n>) [--dry-run] [--wait]
 mgmt-oke pools add <pool> --count <n> [--dry-run] [--wait]
 mgmt-oke pools remove <pool> --count <n> [--dry-run] [--wait]
+mgmt-oke pools boot-volume-replace <managed-pool> <property-update> [--dry-run] [--wait]
 mgmt-oke nodes cordon <node...> [--dry-run]
 mgmt-oke nodes drain <node...> [--dry-run]
 mgmt-oke nodes uncordon <node...> [--dry-run]
 mgmt-oke nodes terminate <node...> [--keep-size] [--dry-run] [--wait]
+mgmt-oke nodes boot-volume-replace <node...> [--dry-run] [--wait]
 ```
 
 Safety behavior:
 
 - Discovery commands are read-only.
-- Pool mutations and node termination require OCI auth.
+- Pool mutations, node termination, and BVR require OCI auth.
 - Every mutation supports a validated `--dry-run` plan.
 - Every mutation requires either `--yes` or an interactive typed confirmation.
 - Mutations acquire a Kubernetes Lease by default to prevent concurrent tool operations.
@@ -240,6 +246,13 @@ Safety behavior:
   default. PodDisruptionBudgets remain authoritative.
 - Drain requires explicit acknowledgement for `emptyDir` data or pods without
   a controller.
+- Boot volume replacement requires an enhanced cluster, eviction preflight,
+  and explicit acknowledgement for `emptyDir` data or pods without a
+  controller. Pool-wide BVR also requires a fully healthy pool; individual BVR
+  can repair a NotReady worker.
+- Individual BVR preserves the selected compute instance, network address,
+  image, and current node configuration. Managed-pool BVR is the supported path
+  for applying a new image to existing workers.
 - Compute Cluster-backed OKE pools are resized and modified through OKE APIs;
   their internal backing instance pools are not mutation targets.
 - Legacy Cluster Network pools are resized with `UpdateClusterNetwork`; their
@@ -251,6 +264,9 @@ Safety behavior:
   until a Slurm-aware drain workflow is available. Scale-up remains supported.
 - When the NVIDIA Network Operator add-on is active, RDMA convergence also
   requires allocatable `nvidia.com/rdma-vf` resources.
+
+See [`replacing-worker-boot-volumes.md`](replacing-worker-boot-volumes.md) for
+BVR IAM, image, data-loss, and operational requirements.
 
 Example managed or self-managed pool resize:
 

@@ -2,12 +2,13 @@ import unittest
 from types import SimpleNamespace
 
 from oke_hpc_mgmt.backends.oci import (
+    BootVolumeAttachmentPending,
     OciBackend,
     OciDiscoveryError,
     _clone_pool_freeform_tags,
     _retarget_oke_node_labels,
 )
-from oke_hpc_mgmt.models import PoolCreateSpec
+from oke_hpc_mgmt.models import PoolBootVolumeReplaceSpec, PoolCreateSpec
 
 
 class _Model:
@@ -127,11 +128,29 @@ class _ContainerEngine:
     def get_node_pool(self, node_pool_id):
         self.calls.append(("get_node_pool", node_pool_id))
         pool = next(pool for pool in self.node_pools if pool.id == node_pool_id)
-        return SimpleNamespace(data=pool)
+        return SimpleNamespace(data=pool, headers={"etag": "node-pool-etag"})
 
-    def update_node_pool(self, node_pool_id, details):
-        self.calls.append(("update_node_pool", node_pool_id, details))
+    def update_node_pool(self, node_pool_id, details, **kwargs):
+        self.calls.append(("update_node_pool", node_pool_id, details, kwargs))
         return SimpleNamespace(headers={"opc-work-request-id": "wr-node-pool"})
+
+    def replace_boot_volume_cluster_node(
+        self,
+        cluster_id,
+        node_id,
+        details,
+        **kwargs,
+    ):
+        self.calls.append(
+            (
+                "replace_boot_volume_cluster_node",
+                cluster_id,
+                node_id,
+                details,
+                kwargs,
+            )
+        )
+        return SimpleNamespace(headers={"opc-work-request-id": "wr-node-bvr"})
 
     def create_node_pool(self, details, **kwargs):
         self.calls.append(("create_node_pool", details, kwargs))
@@ -175,11 +194,44 @@ class _WorkRequests:
 
 
 class _Compute:
-    def __init__(self, shapes=None):
+    def __init__(
+        self,
+        shapes=None,
+        boot_volume_ids=None,
+        image_operating_systems=None,
+    ):
         self.shapes = shapes or {}
+        self.boot_volume_ids = boot_volume_ids or {}
+        self.image_operating_systems = image_operating_systems or {}
 
     def get_instance(self, instance_id):
-        return SimpleNamespace(data=SimpleNamespace(shape=self.shapes.get(instance_id)))
+        return SimpleNamespace(
+            data=SimpleNamespace(
+                shape=self.shapes.get(instance_id),
+                availability_domain="AD-1",
+                compartment_id="compartment-1",
+            )
+        )
+
+    def list_boot_volume_attachments(
+        self,
+        availability_domain,
+        compartment_id,
+        **kwargs,
+    ):
+        instance_id = kwargs["instance_id"]
+        boot_volume_id = self.boot_volume_ids.get(instance_id)
+        attachments = (
+            []
+            if boot_volume_id is None
+            else [
+                SimpleNamespace(
+                    boot_volume_id=boot_volume_id,
+                    lifecycle_state="ATTACHED",
+                )
+            ]
+        )
+        return SimpleNamespace(data=attachments)
 
     def list_shapes(self, compartment_id, **kwargs):
         return SimpleNamespace(
@@ -189,6 +241,16 @@ class _Compute:
                 SimpleNamespace(shape="VM.GPU.A10.1", local_disks=0),
                 SimpleNamespace(shape="VM.GPU.A10.2", local_disks=0),
             ]
+        )
+
+    def get_image(self, image_id):
+        return SimpleNamespace(
+            data=SimpleNamespace(
+                operating_system=self.image_operating_systems.get(
+                    image_id,
+                    "Oracle Linux",
+                )
+            )
         )
 
 
@@ -289,6 +351,8 @@ def _backend(cluster_network=None, instance_configuration=None, node_pools=None)
                 KeyValue=_Model,
                 NodePoolCyclingDetails=_Model,
                 NodeEvictionNodePoolSettings=_Model,
+                NodeEvictionSettings=_Model,
+                ReplaceBootVolumeClusterNodeDetails=_Model,
             )
         ),
         core=SimpleNamespace(
@@ -508,15 +572,196 @@ class OciBackendMutationTests(unittest.TestCase):
         work_request = backend.resize_managed_node_pool("node-pool-1", 3)
 
         self.assertEqual("wr-node-pool", work_request)
-        _, node_pool_id, details = backend._container_engine.calls[-1]
+        _, node_pool_id, details, kwargs = backend._container_engine.calls[-1]
         self.assertEqual("node-pool-1", node_pool_id)
         self.assertEqual({"size": 3}, details.node_config_details.__dict__)
+        self.assertEqual({}, kwargs)
 
     def test_resize_managed_node_pool_rejects_negative_size(self):
         backend = _backend()
 
         with self.assertRaises(OciDiscoveryError):
             backend.resize_managed_node_pool("node-pool-1", -1)
+
+    def test_individual_node_boot_volume_replace_uses_oke_api(self):
+        backend = _backend()
+        backend._compute = _Compute(
+            boot_volume_ids={"instance-1": "boot-volume-old"}
+        )
+
+        boot_volume_id = backend.get_instance_boot_volume_id("instance-1")
+        work_request_id = backend.replace_cluster_node_boot_volume(
+            "cluster-1",
+            "instance-1",
+            eviction_grace_duration="PT30M",
+            force_after_grace=True,
+        )
+
+        self.assertEqual("boot-volume-old", boot_volume_id)
+        self.assertEqual("wr-node-bvr", work_request_id)
+        call = backend._container_engine.calls[-1]
+        self.assertEqual("replace_boot_volume_cluster_node", call[0])
+        self.assertEqual("cluster-1", call[1])
+        self.assertEqual("instance-1", call[2])
+        self.assertEqual(
+            "PT30M",
+            call[3].node_eviction_settings.eviction_grace_duration,
+        )
+        self.assertTrue(
+            call[3].node_eviction_settings.is_force_action_after_grace_duration
+        )
+        self.assertIn("opc_retry_token", call[4])
+
+    def test_boot_volume_lookup_prefers_attached_during_transition(self):
+        backend = _backend()
+        backend._compute = _Compute()
+        backend._compute.list_boot_volume_attachments = (
+            lambda *_args, **_kwargs: SimpleNamespace(
+                data=[
+                    SimpleNamespace(
+                        boot_volume_id="boot-volume-old",
+                        lifecycle_state="ATTACHED",
+                    ),
+                    SimpleNamespace(
+                        boot_volume_id="boot-volume-new",
+                        lifecycle_state="ATTACHING",
+                    ),
+                ]
+            )
+        )
+
+        self.assertEqual(
+            "boot-volume-old",
+            backend.get_instance_boot_volume_id("instance-1"),
+        )
+
+    def test_boot_volume_lookup_distinguishes_pending_from_ambiguous(self):
+        backend = _backend()
+        backend._compute = _Compute()
+
+        with self.assertRaises(BootVolumeAttachmentPending):
+            backend.get_instance_boot_volume_id("instance-1")
+
+        backend._compute.list_boot_volume_attachments = (
+            lambda *_args, **_kwargs: SimpleNamespace(
+                data=[
+                    SimpleNamespace(
+                        boot_volume_id="boot-volume-a",
+                        lifecycle_state="ATTACHED",
+                    ),
+                    SimpleNamespace(
+                        boot_volume_id="boot-volume-b",
+                        lifecycle_state="ATTACHED",
+                    ),
+                ]
+            )
+        )
+        with self.assertRaises(OciDiscoveryError) as context:
+            backend.get_instance_boot_volume_id("instance-1")
+        self.assertNotIsInstance(
+            context.exception,
+            BootVolumeAttachmentPending,
+        )
+
+    def test_managed_pool_bvr_updates_image_and_cycles_boot_volumes(self):
+        source = _managed_node_pool("VM.GPU.A10.1")
+        backend = _backend(node_pools=[source])
+        spec = PoolBootVolumeReplaceSpec(
+            image_id="image-custom",
+            boot_volume_size_in_gbs=512,
+            boot_volume_kms_key_id="kms-key-1",
+            kubernetes_version="v1.36.1",
+            node_metadata=(("custom.example/mode", "training"),),
+            ssh_public_key="ssh-ed25519 replacement",
+            maximum_unavailable="50%",
+        )
+
+        preview = backend.preview_managed_pool_boot_volume_replace(
+            source.id,
+            spec,
+        )
+        work_request_id = backend.replace_managed_pool_boot_volumes(
+            source.id,
+            spec,
+        )
+
+        self.assertEqual("image-source", preview["current"]["image_id"])
+        self.assertEqual("image-custom", preview["effective"]["image_id"])
+        self.assertEqual("wr-node-pool", work_request_id)
+        call = backend._container_engine.calls[-1]
+        self.assertEqual("update_node_pool", call[0])
+        details = call[2]
+        self.assertEqual("image-custom", details.node_source_details.image_id)
+        self.assertEqual(
+            512,
+            details.node_source_details.boot_volume_size_in_gbs,
+        )
+        self.assertEqual("v1.36.1", details.kubernetes_version)
+        self.assertEqual(
+            "training",
+            details.node_metadata["custom.example/mode"],
+        )
+        self.assertEqual(
+            "inherited-cloud-init",
+            details.node_metadata["user_data"],
+        )
+        self.assertEqual("kms-key-1", details.node_config_details.kms_key_id)
+        self.assertEqual(
+            ["BOOT_VOLUME_REPLACE"],
+            details.node_pool_cycling_details.cycle_modes,
+        )
+        self.assertEqual(
+            "50%",
+            details.node_pool_cycling_details.maximum_unavailable,
+        )
+        self.assertEqual({"if_match": "node-pool-etag"}, call[3])
+
+    def test_managed_pool_bvr_verifies_applied_properties(self):
+        source = _managed_node_pool()
+        backend = _backend(node_pools=[source])
+        spec = PoolBootVolumeReplaceSpec(
+            image_id="image-new",
+            node_metadata=(("custom", "value"),),
+        )
+
+        self.assertFalse(
+            backend.managed_pool_boot_volume_replace_applied(source.id, spec)
+        )
+
+        source.node_source_details.image_id = "image-new"
+        source.node_metadata["custom"] = "value"
+        self.assertTrue(
+            backend.managed_pool_boot_volume_replace_applied(source.id, spec)
+        )
+
+    def test_managed_pool_bvr_refuses_boot_volume_reduction(self):
+        source = _managed_node_pool()
+        backend = _backend(node_pools=[source])
+
+        with self.assertRaisesRegex(OciDiscoveryError, "cannot reduce"):
+            backend.preview_managed_pool_boot_volume_replace(
+                source.id,
+                PoolBootVolumeReplaceSpec(boot_volume_size_in_gbs=128),
+            )
+
+    def test_managed_pool_bvr_requires_same_linux_distribution(self):
+        source = _managed_node_pool()
+        backend = _backend(node_pools=[source])
+        backend._compute = _Compute(
+            image_operating_systems={
+                "image-source": "Oracle Linux",
+                "image-ubuntu": "Canonical Ubuntu",
+            }
+        )
+
+        with self.assertRaisesRegex(
+            OciDiscoveryError,
+            "same Linux distribution",
+        ):
+            backend.preview_managed_pool_boot_volume_replace(
+                source.id,
+                PoolBootVolumeReplaceSpec(image_id="image-ubuntu"),
+            )
 
     def test_resize_cluster_network_preserves_pool_fields(self):
         pool = SimpleNamespace(
@@ -1058,6 +1303,17 @@ class OciBackendMutationTests(unittest.TestCase):
 
 
 class OciBackendDiscoveryTests(unittest.TestCase):
+    def test_get_cluster_type(self):
+        backend = _backend()
+        backend._container_engine.cluster = SimpleNamespace(
+            type="ENHANCED_CLUSTER"
+        )
+
+        self.assertEqual(
+            "ENHANCED_CLUSTER",
+            backend.get_cluster_type("cluster-1"),
+        )
+
     def test_get_cluster_compartment_id(self):
         backend = _backend()
         backend._container_engine = _ContainerEngine(

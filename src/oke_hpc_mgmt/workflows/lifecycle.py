@@ -6,6 +6,10 @@ from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 
+from oke_hpc_mgmt.backends.oci import (
+    BootVolumeAttachmentPending,
+    OciBackend,
+)
 from oke_hpc_mgmt.discovery import DiscoveryService
 from oke_hpc_mgmt.models import (
     ClusterNetworkCreateResult,
@@ -14,13 +18,18 @@ from oke_hpc_mgmt.models import (
     ManagedNodePoolCreateResult,
     NodeInfo,
     OperationPlan,
+    PoolBootVolumeReplaceSpec,
     PoolCreateSpec,
     PoolResourceReadiness,
     WorkerPoolInfo,
     WorkRequestInfo,
 )
 from oke_hpc_mgmt.selection import select_nodes
-from oke_hpc_mgmt.validation import normalize_pool_name
+from oke_hpc_mgmt.validation import (
+    normalize_pool_name,
+    validate_eviction_grace_duration,
+    validate_pool_boot_volume_replace_spec,
+)
 
 IAC_DRIFT_WARNING = (
     "This direct OCI mutation does not update Terraform or OCI Resource Manager "
@@ -86,6 +95,35 @@ class PreparedNodeRemoval:
     drain_pods: dict[str, tuple[DrainPod, ...]]
     target_sizes: dict[str, int]
     decrement_size: bool
+
+
+@dataclass(frozen=True)
+class PreparedNodeBootVolumeReplace:
+    snapshot: DiscoverySnapshot
+    nodes: tuple[NodeInfo, ...]
+    pools: dict[str, WorkerPoolInfo]
+    plans: tuple[OperationPlan, ...]
+    old_boot_volume_ids: dict[str, str]
+    drain_pods: dict[str, tuple[DrainPod, ...]]
+    delete_emptydir_data: bool
+    force_unmanaged: bool
+    allow_system_pool: bool
+    eviction_grace_duration: str
+    force_after_grace: bool
+
+
+@dataclass(frozen=True)
+class PreparedPoolBootVolumeReplace:
+    snapshot: DiscoverySnapshot
+    pool: WorkerPoolInfo
+    nodes: tuple[NodeInfo, ...]
+    old_boot_volume_ids: dict[str, str]
+    drain_pods: dict[str, tuple[DrainPod, ...]]
+    spec: PoolBootVolumeReplaceSpec
+    delete_emptydir_data: bool
+    force_unmanaged: bool
+    allow_system_pool: bool
+    plan: OperationPlan
 
 
 @dataclass(frozen=True)
@@ -949,6 +987,544 @@ def execute_node_removal(
     ]
 
 
+def prepare_node_boot_volume_replace(
+    service: DiscoveryService,
+    identifiers: Iterable[str] = (),
+    fields: str | None = None,
+    *,
+    delete_emptydir_data: bool = False,
+    force_unmanaged: bool = False,
+    allow_system_pool: bool = False,
+    eviction_grace_duration: str = "PT60M",
+    force_after_grace: bool = False,
+    drain_grace_period_seconds: int = 30,
+) -> PreparedNodeBootVolumeReplace:
+    if service.options.auth == "none" or service.options.skip_oci:
+        raise WorkflowError(
+            "Node boot volume replacement requires OCI discovery. Use "
+            "instance-principal authentication on the operator host."
+        )
+    identifier_tuple = tuple(identifiers)
+    if not identifier_tuple and not fields:
+        raise WorkflowError("Specify nodes by identifier or with --fields.")
+    try:
+        eviction_grace_duration = validate_eviction_grace_duration(
+            eviction_grace_duration
+        )
+    except ValueError as exc:
+        raise WorkflowError(str(exc)) from exc
+
+    target = service.resolve_oci_target(
+        require_compartment=True,
+        require_cluster=True,
+    )
+    if not target.cluster_id:
+        raise WorkflowError("Node boot volume replacement requires an OKE cluster.")
+    backend = service.oci_backend()
+    _require_enhanced_cluster(backend.get_cluster_type(target.cluster_id))
+
+    snapshot = service.discover()
+    _require_complete_pool_inventory(snapshot)
+    nodes, missing = select_nodes(
+        snapshot,
+        identifiers=identifier_tuple,
+        fields=fields,
+    )
+    if missing:
+        raise WorkflowNotFound(f"Nodes not found: {', '.join(missing)}")
+    if not nodes:
+        raise WorkflowNotFound("No nodes matched the requested selection.")
+
+    pools: dict[str, WorkerPoolInfo] = {}
+    node_pools: dict[str, WorkerPoolInfo] = {}
+    old_boot_volume_ids: dict[str, str] = {}
+    drain_pods: dict[str, tuple[DrainPod, ...]] = {}
+    kubernetes = service.kubernetes_backend()
+    for node in nodes:
+        if not node.instance_ocid:
+            raise WorkflowError(f"Node has no OCI instance OCID: {node.k8s_name}")
+        pool = _pool_for_node(snapshot, node)
+        _validate_boot_volume_pool(
+            snapshot,
+            pool,
+            allow_system_pool=allow_system_pool,
+            require_fully_ready=False,
+        )
+        if pool.slinky_managed or node.slinky_managed:
+            raise WorkflowError(
+                _slinky_node_bvr_error(node.k8s_name, pool.name)
+            )
+        pods = kubernetes.list_drain_pods(
+            node.k8s_name,
+            grace_period_seconds=drain_grace_period_seconds,
+            check_evictions=True,
+        )
+        _validate_drain_pods(
+            node,
+            pods,
+            delete_emptydir_data,
+            force_unmanaged,
+        )
+        pools[pool.name] = pool
+        node_pools[node.k8s_name] = pool
+        old_boot_volume_ids[node.instance_ocid] = (
+            backend.get_instance_boot_volume_id(node.instance_ocid)
+        )
+        drain_pods[node.k8s_name] = tuple(pods)
+
+    plans: list[OperationPlan] = []
+    for node in nodes:
+        pool = node_pools[node.k8s_name]
+        instance_ocid = node.instance_ocid
+        if not instance_ocid:
+            raise WorkflowError(
+                f"Node has no OCI instance OCID: {node.k8s_name}"
+            )
+        warnings = [
+            "The current boot volume is replaced; data stored only on that "
+            "boot volume is not preserved.",
+            "The instance OCID and network address are preserved, but workloads "
+            "are disrupted while OKE cordons, drains, stops, and restarts it.",
+            "Individual-node BVR preserves the node's existing image and "
+            "configuration. Use pools boot-volume-replace to change a managed "
+            "pool image.",
+        ]
+        if pool.kind != "node-pool":
+            warnings.append(
+                "For a self-managed node whose cluster CA was rotated after it "
+                "joined, refresh the OKE CA bootstrap metadata before BVR."
+            )
+        if force_after_grace:
+            warnings.append(
+                "OKE will force the BVR action after the eviction grace period "
+                "even if cordon or drain has not completed."
+            )
+        if not node.ready or not node.schedulable:
+            warnings.append(
+                "The selected node is not currently Ready and schedulable; "
+                "BVR will be treated as a repair and --wait must observe full "
+                "recovery."
+            )
+        blockers = [
+            pod for pod in drain_pods[node.k8s_name] if pod.eviction_blocker
+        ]
+        if blockers:
+            warnings.append(
+                "Eviction dry-run reported blockers: "
+                + ", ".join(
+                    f"{pod.namespace}/{pod.name} ({pod.eviction_blocker})"
+                    for pod in blockers
+                )
+            )
+        plans.append(
+            OperationPlan(
+                operation="node-boot-volume-replace",
+                target=node.k8s_name,
+                pool=pool.name,
+                owner="oke",
+                current_size=pool.desired_size,
+                target_size=pool.desired_size,
+                workload_pods=node.running_workload_pods,
+                steps=(
+                    "ask OKE to cordon and drain the selected worker",
+                    "stop the existing compute instance",
+                    "replace its boot volume while preserving node configuration",
+                    "restart the same instance",
+                    "verify node identity, Ready state, and GPU/RDMA resources",
+                ),
+                warnings=tuple(warnings),
+                details={
+                    "kind": pool.kind,
+                    "instance_ocid": instance_ocid,
+                    "old_boot_volume_id": old_boot_volume_ids[instance_ocid],
+                    "eviction_grace_duration": eviction_grace_duration,
+                    "force_after_grace": force_after_grace,
+                    "preserves_existing_configuration": True,
+                },
+            )
+        )
+
+    return PreparedNodeBootVolumeReplace(
+        snapshot=snapshot,
+        nodes=tuple(nodes),
+        pools=pools,
+        plans=tuple(plans),
+        old_boot_volume_ids=old_boot_volume_ids,
+        drain_pods=drain_pods,
+        delete_emptydir_data=delete_emptydir_data,
+        force_unmanaged=force_unmanaged,
+        allow_system_pool=allow_system_pool,
+        eviction_grace_duration=eviction_grace_duration,
+        force_after_grace=force_after_grace,
+    )
+
+
+def execute_node_boot_volume_replace(
+    service: DiscoveryService,
+    prepared: PreparedNodeBootVolumeReplace,
+    *,
+    wait: bool = False,
+    timeout_seconds: int = 3600,
+    poll_interval_seconds: int = 30,
+    lock: bool = True,
+    drain_grace_period_seconds: int = 30,
+    progress: Callable[[str], None] | None = None,
+) -> list[dict[str, object]]:
+    if len(prepared.nodes) > 1 and not wait:
+        raise WorkflowError(
+            "Multiple individual-node BVR operations require --wait so they run "
+            "sequentially."
+        )
+    target = service.resolve_oci_target(
+        require_compartment=True,
+        require_cluster=True,
+    )
+    if not target.cluster_id:
+        raise WorkflowError("Node boot volume replacement requires an OKE cluster.")
+    backend = service.oci_backend()
+    results: list[dict[str, object]] = []
+
+    with mutation_lock(service, lock, timeout_seconds):
+        _require_enhanced_cluster(backend.get_cluster_type(target.cluster_id))
+        current = service.discover()
+        _require_complete_pool_inventory(current)
+        current_nodes: dict[str, NodeInfo] = {}
+        current_pools: dict[str, WorkerPoolInfo] = {}
+        for original in prepared.nodes:
+            if not original.instance_ocid:
+                raise WorkflowError(
+                    f"Node has no OCI instance OCID: {original.k8s_name}"
+                )
+            node = current.node_by_identifier(original.instance_ocid)
+            if node is None or node.k8s_name != original.k8s_name:
+                raise WorkflowError(
+                    f"Node identity changed after BVR planning: "
+                    f"{original.k8s_name}"
+                )
+            pool = _pool_for_node(current, node)
+            original_pool = _pool_for_prepared_node(prepared, original)
+            if (
+                pool.kind != original_pool.kind
+                or pool.backing_id != original_pool.backing_id
+            ):
+                raise WorkflowError(
+                    f"Pool ownership changed after BVR planning: "
+                    f"{original.k8s_name}"
+                )
+            _validate_boot_volume_pool(
+                current,
+                pool,
+                allow_system_pool=prepared.allow_system_pool,
+                require_fully_ready=False,
+            )
+            if pool.slinky_managed or node.slinky_managed:
+                raise WorkflowError(
+                    _slinky_node_bvr_error(node.k8s_name, pool.name)
+                )
+            pods = service.kubernetes_backend().list_drain_pods(
+                node.k8s_name,
+                grace_period_seconds=drain_grace_period_seconds,
+                check_evictions=True,
+            )
+            _validate_drain_pods(
+                node,
+                pods,
+                prepared.delete_emptydir_data,
+                prepared.force_unmanaged,
+            )
+            old_boot_volume_id = prepared.old_boot_volume_ids[
+                original.instance_ocid
+            ]
+            if (
+                backend.get_instance_boot_volume_id(original.instance_ocid)
+                != old_boot_volume_id
+            ):
+                raise WorkflowError(
+                    f"Boot volume changed after BVR planning: "
+                    f"{original.k8s_name}"
+                )
+            current_nodes[original.instance_ocid] = node
+            current_pools[original.instance_ocid] = pool
+
+        for original in prepared.nodes:
+            instance_ocid = original.instance_ocid
+            if not instance_ocid:
+                raise WorkflowError(
+                    f"Node has no OCI instance OCID: {original.k8s_name}"
+                )
+            work_request_id = backend.replace_cluster_node_boot_volume(
+                target.cluster_id,
+                instance_ocid,
+                eviction_grace_duration=prepared.eviction_grace_duration,
+                force_after_grace=prepared.force_after_grace,
+            )
+            observed_node = current_nodes[instance_ocid]
+            observed_pool = current_pools[instance_ocid]
+            new_boot_volume_id: str | None = None
+            status = "submitted"
+            if wait:
+                (
+                    observed_node,
+                    observed_pool,
+                    new_boot_volume_id,
+                ) = wait_for_node_boot_volume_replace(
+                    service,
+                    original,
+                    observed_pool,
+                    prepared.old_boot_volume_ids[instance_ocid],
+                    work_request_id,
+                    timeout_seconds,
+                    poll_interval_seconds,
+                    progress=progress,
+                )
+                status = "ready"
+            results.append(
+                node_boot_volume_replace_result_row(
+                    observed_node,
+                    observed_pool,
+                    prepared.old_boot_volume_ids[instance_ocid],
+                    new_boot_volume_id,
+                    work_request_id,
+                    status,
+                )
+            )
+    return results
+
+
+def prepare_pool_boot_volume_replace(
+    service: DiscoveryService,
+    pool_identifier: str,
+    spec: PoolBootVolumeReplaceSpec,
+    *,
+    delete_emptydir_data: bool = False,
+    force_unmanaged: bool = False,
+    allow_system_pool: bool = False,
+    drain_grace_period_seconds: int = 30,
+) -> PreparedPoolBootVolumeReplace:
+    if service.options.auth == "none" or service.options.skip_oci:
+        raise WorkflowError(
+            "Pool boot volume replacement requires OCI discovery. Use "
+            "instance-principal authentication on the operator host."
+        )
+    try:
+        spec = validate_pool_boot_volume_replace_spec(spec)
+    except ValueError as exc:
+        raise WorkflowError(str(exc)) from exc
+    target = service.resolve_oci_target(
+        require_compartment=True,
+        require_cluster=True,
+    )
+    if not target.cluster_id:
+        raise WorkflowError("Pool boot volume replacement requires an OKE cluster.")
+    backend = service.oci_backend()
+    _require_enhanced_cluster(backend.get_cluster_type(target.cluster_id))
+
+    snapshot = service.discover()
+    _require_complete_pool_inventory(snapshot)
+    pool = snapshot.pool_by_name(pool_identifier)
+    if pool is None:
+        raise WorkflowNotFound(f"Pool not found: {pool_identifier}")
+    _validate_boot_volume_pool(
+        snapshot,
+        pool,
+        allow_system_pool=allow_system_pool,
+        require_fully_ready=True,
+    )
+    if pool.kind != "node-pool" or not pool.node_pool_id:
+        raise WorkflowError(
+            "Pool-wide BVR with property updates is supported only for managed "
+            f"OKE node pools: {pool.name}. Use nodes boot-volume-replace for an "
+            "individual self-managed worker."
+        )
+    if pool.slinky_managed:
+        raise WorkflowError(_slinky_pool_bvr_error(pool.name))
+
+    nodes = tuple(_nodes_for_pool(snapshot, pool))
+    old_boot_volume_ids: dict[str, str] = {}
+    drain_pods: dict[str, tuple[DrainPod, ...]] = {}
+    kubernetes = service.kubernetes_backend()
+    for node in nodes:
+        if not node.instance_ocid:
+            raise WorkflowError(f"Node has no OCI instance OCID: {node.k8s_name}")
+        old_boot_volume_ids[node.instance_ocid] = (
+            backend.get_instance_boot_volume_id(node.instance_ocid)
+        )
+        pods = kubernetes.list_drain_pods(
+            node.k8s_name,
+            grace_period_seconds=drain_grace_period_seconds,
+            check_evictions=True,
+        )
+        _validate_drain_pods(
+            node,
+            pods,
+            delete_emptydir_data,
+            force_unmanaged,
+        )
+        drain_pods[node.k8s_name] = tuple(pods)
+    preview = backend.preview_managed_pool_boot_volume_replace(
+        pool.node_pool_id,
+        spec,
+    )
+    warnings = [
+        "Every existing worker boot volume in the managed pool is replaced; "
+        "data stored only on those boot volumes is not preserved.",
+        "OKE preserves each compute instance OCID and network address while "
+        "cycling workers up to maximum-unavailable at a time.",
+        IAC_DRIFT_WARNING,
+    ]
+    blockers = [
+        f"{pod.namespace}/{pod.name} ({pod.eviction_blocker})"
+        for pods in drain_pods.values()
+        for pod in pods
+        if pod.eviction_blocker
+    ]
+    if blockers:
+        warnings.append(
+            "Eviction dry-run reported blockers: " + ", ".join(blockers)
+        )
+    return PreparedPoolBootVolumeReplace(
+        snapshot=snapshot,
+        pool=pool,
+        nodes=nodes,
+        old_boot_volume_ids=old_boot_volume_ids,
+        drain_pods=drain_pods,
+        spec=spec,
+        delete_emptydir_data=delete_emptydir_data,
+        force_unmanaged=force_unmanaged,
+        allow_system_pool=allow_system_pool,
+        plan=OperationPlan(
+            operation="pool-boot-volume-replace",
+            target=pool.name,
+            pool=pool.name,
+            owner="oke",
+            current_size=pool.desired_size,
+            target_size=pool.desired_size,
+            workload_pods=sum(node.running_workload_pods for node in nodes),
+            steps=(
+                "update the supported managed node-pool properties",
+                "enable BOOT_VOLUME_REPLACE node cycling",
+                "let OKE cordon, drain, stop, update, and restart each worker",
+                "verify instance identity, replacement boot volumes, Ready state, "
+                "and GPU/RDMA resources",
+            ),
+            warnings=tuple(warnings),
+            details={
+                "kind": pool.kind,
+                "nodes": [node.k8s_name for node in nodes],
+                "updates": spec.as_dict(),
+                **preview,
+            },
+        ),
+    )
+
+
+def execute_pool_boot_volume_replace(
+    service: DiscoveryService,
+    prepared: PreparedPoolBootVolumeReplace,
+    *,
+    wait: bool = False,
+    timeout_seconds: int = 7200,
+    poll_interval_seconds: int = 30,
+    lock: bool = True,
+    drain_grace_period_seconds: int = 30,
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, object]:
+    target = service.resolve_oci_target(
+        require_compartment=True,
+        require_cluster=True,
+    )
+    if not target.cluster_id:
+        raise WorkflowError("Pool boot volume replacement requires an OKE cluster.")
+    backend = service.oci_backend()
+    pool = prepared.pool
+    if not pool.node_pool_id:
+        raise WorkflowError(
+            f"Managed OKE pool is missing its node-pool OCID: {pool.name}"
+        )
+
+    with mutation_lock(service, lock, timeout_seconds):
+        _require_enhanced_cluster(backend.get_cluster_type(target.cluster_id))
+        current = service.discover()
+        _require_complete_pool_inventory(current)
+        current_pool = current.pool_by_name(pool.node_pool_id)
+        if (
+            current_pool is None
+            or current_pool.kind != "node-pool"
+            or current_pool.node_pool_id != pool.node_pool_id
+        ):
+            raise WorkflowError(
+                f"Pool ownership changed after BVR planning: {pool.name}"
+            )
+        _validate_boot_volume_pool(
+            current,
+            current_pool,
+            allow_system_pool=prepared.allow_system_pool,
+            require_fully_ready=True,
+        )
+        if current_pool.slinky_managed:
+            raise WorkflowError(_slinky_pool_bvr_error(current_pool.name))
+        current_nodes = tuple(_nodes_for_pool(current, current_pool))
+        if {
+            node.instance_ocid for node in current_nodes
+        } != {
+            node.instance_ocid for node in prepared.nodes
+        }:
+            raise WorkflowError(
+                f"Pool membership changed after BVR planning: {pool.name}"
+            )
+        for node in current_nodes:
+            if not node.instance_ocid:
+                raise WorkflowError(
+                    f"Node has no OCI instance OCID: {node.k8s_name}"
+                )
+            if (
+                backend.get_instance_boot_volume_id(node.instance_ocid)
+                != prepared.old_boot_volume_ids[node.instance_ocid]
+            ):
+                raise WorkflowError(
+                    f"Boot volume changed after BVR planning: {node.k8s_name}"
+                )
+            pods = service.kubernetes_backend().list_drain_pods(
+                node.k8s_name,
+                grace_period_seconds=drain_grace_period_seconds,
+                check_evictions=True,
+            )
+            _validate_drain_pods(
+                node,
+                pods,
+                prepared.delete_emptydir_data,
+                prepared.force_unmanaged,
+            )
+
+        work_request_id = backend.replace_managed_pool_boot_volumes(
+            pool.node_pool_id,
+            prepared.spec,
+        )
+        observed_pool = current_pool
+        new_boot_volume_ids: dict[str, str] = {}
+        status = "submitted"
+        if wait:
+            observed_pool, new_boot_volume_ids = (
+                wait_for_pool_boot_volume_replace(
+                    service,
+                    prepared,
+                    work_request_id,
+                    timeout_seconds,
+                    poll_interval_seconds,
+                    progress=progress,
+                )
+            )
+            status = "ready"
+
+    return pool_boot_volume_replace_result_row(
+        observed_pool,
+        prepared,
+        new_boot_volume_ids,
+        work_request_id,
+        status,
+    )
+
+
 def mutation_lock(
     service: DiscoveryService,
     enabled: bool,
@@ -1157,6 +1733,229 @@ def wait_for_nodes_removed(
         time.sleep(poll_interval_seconds)
 
 
+def wait_for_node_boot_volume_replace(
+    service: DiscoveryService,
+    original_node: NodeInfo,
+    original_pool: WorkerPoolInfo,
+    old_boot_volume_id: str,
+    work_request_id: str | None,
+    timeout_seconds: int,
+    poll_interval_seconds: int,
+    progress: Callable[[str], None] | None = None,
+) -> tuple[NodeInfo, WorkerPoolInfo, str]:
+    if not original_node.instance_ocid:
+        raise WorkflowError(
+            f"Node has no OCI instance OCID: {original_node.k8s_name}"
+        )
+    if original_pool.desired_size is None:
+        raise WorkflowError(
+            f"Cannot determine desired size for pool: {original_pool.name}"
+        )
+    deadline = time.monotonic() + timeout_seconds
+    last_status = ""
+    backend = service.oci_backend()
+    _configure_wait_discovery(service)
+    while True:
+        _raise_for_failed_work_requests(
+            service,
+            (work_request_id,) if work_request_id else (),
+        )
+        snapshot = service.discover()
+        node = snapshot.node_by_identifier(original_node.instance_ocid)
+        pool = snapshot.pool_by_name(
+            original_pool.backing_id or original_pool.name
+        )
+        new_boot_volume_id = _try_get_instance_boot_volume_id(
+            backend,
+            original_node.instance_ocid
+        )
+        boot_replaced = new_boot_volume_id != old_boot_volume_id
+        node_ready = bool(
+            node
+            and node.k8s_name == original_node.k8s_name
+            and (
+                not original_node.internal_ip
+                or node.internal_ip == original_node.internal_ip
+            )
+            and node.ready
+            and node.schedulable
+            and (
+                not original_node.boot_id
+                or (
+                    node.boot_id is not None
+                    and node.boot_id != original_node.boot_id
+                )
+            )
+        )
+        pool_capacity_stable = False
+        gpu_ready = False
+        rdma_ready = False
+        rdma_vf_ready = False
+        if pool:
+            pool.rdma_vf_required = (
+                pool.rdma_vf_required or original_pool.rdma_vf_required
+            )
+            pool_capacity_stable = bool(
+                pool.desired_size == original_pool.desired_size
+                and (
+                    pool.active_oci_instances is None
+                    or pool.active_oci_instances == original_pool.desired_size
+                )
+            )
+        if node:
+            gpu_ready = bool(
+                not original_pool.gpu_resource
+                or positive_resource(
+                    node.allocatable.get(original_pool.gpu_resource)
+                )
+            )
+            rdma_ready = bool(
+                not original_pool.rdma_enabled or node.rdma_topology_ready
+            )
+            rdma_vf_ready = bool(
+                not original_pool.rdma_vf_required
+                or positive_resource(node.rdma_vf_allocatable)
+            )
+        status = (
+            f"{original_node.k8s_name}: boot_volume_replaced={boot_replaced} "
+            f"node_ready={node_ready} "
+            f"pool_capacity_stable={pool_capacity_stable} "
+            f"gpu_ready={gpu_ready} rdma_ready={rdma_ready} "
+            f"rdma_vf_ready={rdma_vf_ready}"
+        )
+        if progress and status != last_status:
+            progress(status)
+            last_status = status
+        if (
+            node
+            and pool
+            and boot_replaced
+            and node_ready
+            and pool_capacity_stable
+            and gpu_ready
+            and rdma_ready
+            and rdma_vf_ready
+            and new_boot_volume_id
+        ):
+            return node, pool, new_boot_volume_id
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "Timed out waiting for node boot volume replacement. "
+                f"Last status: {status}"
+            )
+        time.sleep(poll_interval_seconds)
+
+
+def wait_for_pool_boot_volume_replace(
+    service: DiscoveryService,
+    prepared: PreparedPoolBootVolumeReplace,
+    work_request_id: str | None,
+    timeout_seconds: int,
+    poll_interval_seconds: int,
+    progress: Callable[[str], None] | None = None,
+) -> tuple[WorkerPoolInfo, dict[str, str]]:
+    pool = prepared.pool
+    if not pool.node_pool_id:
+        raise WorkflowError(
+            f"Managed OKE pool is missing its node-pool OCID: {pool.name}"
+        )
+    if pool.desired_size is None:
+        raise WorkflowError(
+            f"Cannot determine desired size for pool: {pool.name}"
+        )
+    original_nodes = {
+        node.instance_ocid: node
+        for node in prepared.nodes
+        if node.instance_ocid
+    }
+    deadline = time.monotonic() + timeout_seconds
+    last_status = ""
+    backend = service.oci_backend()
+    _configure_wait_discovery(service)
+    while True:
+        _raise_for_failed_work_requests(
+            service,
+            (work_request_id,) if work_request_id else (),
+        )
+        snapshot = service.discover()
+        observed_pool = snapshot.pool_by_name(pool.node_pool_id)
+        new_boot_volume_ids = {}
+        for instance_id in original_nodes:
+            boot_volume_id = _try_get_instance_boot_volume_id(
+                backend,
+                instance_id,
+            )
+            if boot_volume_id:
+                new_boot_volume_ids[instance_id] = boot_volume_id
+        replaced = {
+            instance_id
+            for instance_id, boot_volume_id in new_boot_volume_ids.items()
+            if boot_volume_id
+            != prepared.old_boot_volume_ids[instance_id]
+        }
+        identity_ready = True
+        for instance_id, original_node in original_nodes.items():
+            node = snapshot.node_by_identifier(instance_id)
+            identity_ready = identity_ready and bool(
+                node
+                and node.k8s_name == original_node.k8s_name
+                and (
+                    not original_node.internal_ip
+                    or node.internal_ip == original_node.internal_ip
+                )
+                and node.ready
+                and node.schedulable
+                and (
+                    not original_node.boot_id
+                    or (
+                        node.boot_id is not None
+                        and node.boot_id != original_node.boot_id
+                    )
+                )
+            )
+        pool_ready = False
+        readiness = PoolResourceReadiness()
+        if observed_pool:
+            observed_pool.rdma_vf_required = (
+                observed_pool.rdma_vf_required or pool.rdma_vf_required
+            )
+            readiness = pool_resource_readiness(snapshot, observed_pool)
+            pool_ready = _pool_matches_target(
+                observed_pool,
+                readiness,
+                pool.desired_size,
+            )
+        properties_applied = (
+            backend.managed_pool_boot_volume_replace_applied(
+                pool.node_pool_id,
+                prepared.spec,
+            )
+        )
+        status = (
+            f"{pool.name}: replaced={len(replaced)}/{len(original_nodes)} "
+            f"identity_ready={identity_ready} pool_ready={pool_ready} "
+            f"properties_applied={properties_applied}"
+            f"{readiness_status(readiness)}"
+        )
+        if progress and status != last_status:
+            progress(status)
+            last_status = status
+        if (
+            observed_pool
+            and len(replaced) == len(original_nodes)
+            and identity_ready
+            and pool_ready
+            and properties_applied
+        ):
+            return observed_pool, new_boot_volume_ids
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "Timed out waiting for managed-pool boot volume replacement. "
+                f"Last status: {status}"
+            )
+        time.sleep(poll_interval_seconds)
+
+
 def pool_resource_readiness(
     snapshot: DiscoverySnapshot,
     pool: WorkerPoolInfo,
@@ -1328,6 +2127,50 @@ def node_remove_result_row(
     }
 
 
+def node_boot_volume_replace_result_row(
+    node: NodeInfo,
+    pool: WorkerPoolInfo,
+    old_boot_volume_id: str,
+    new_boot_volume_id: str | None,
+    work_request_id: str | None,
+    status: str,
+) -> dict[str, object]:
+    return {
+        "node": node.k8s_name,
+        "ip": node.internal_ip,
+        "pool": pool.name,
+        "kind": pool.kind,
+        "shape": node.shape,
+        "instance_ocid": node.instance_ocid,
+        "same_instance": True,
+        "old_boot_volume_id": old_boot_volume_id,
+        "new_boot_volume_id": new_boot_volume_id,
+        "preserves_existing_configuration": True,
+        "status": status,
+        "work_request_id": work_request_id,
+    }
+
+
+def pool_boot_volume_replace_result_row(
+    pool: WorkerPoolInfo,
+    prepared: PreparedPoolBootVolumeReplace,
+    new_boot_volume_ids: dict[str, str],
+    work_request_id: str | None,
+    status: str,
+) -> dict[str, object]:
+    return {
+        "name": pool.name,
+        "kind": pool.kind,
+        "shape": pool.shape,
+        "size": pool.desired_size,
+        "replaced_nodes": len(new_boot_volume_ids),
+        "updates": prepared.spec.as_dict(),
+        "new_boot_volume_ids": new_boot_volume_ids,
+        "status": status,
+        "work_request_id": work_request_id,
+    }
+
+
 def _validate_pool_mutation(pool: WorkerPoolInfo) -> None:
     if pool.kind not in {"node-pool", "cluster-network", "instance-pool"}:
         raise WorkflowError(
@@ -1335,6 +2178,54 @@ def _validate_pool_mutation(pool: WorkerPoolInfo) -> None:
         )
     if pool.autoscaler_owned:
         raise WorkflowError(f"Refusing to mutate autoscaler-owned pool: {pool.name}")
+
+
+def _validate_boot_volume_pool(
+    snapshot: DiscoverySnapshot,
+    pool: WorkerPoolInfo,
+    *,
+    allow_system_pool: bool,
+    require_fully_ready: bool,
+) -> None:
+    _validate_pool_mutation(pool)
+    if pool.name.casefold() == "oke-system" and not allow_system_pool:
+        raise WorkflowError(
+            "Refusing to replace boot volumes in the OKE system pool. Use "
+            "--allow-system-pool only after another system-capable pool is ready."
+        )
+    if pool.desired_size is None:
+        raise WorkflowError(
+            f"Cannot determine desired size for pool: {pool.name}"
+        )
+    if not require_fully_ready:
+        return
+    readiness = pool_resource_readiness(snapshot, pool)
+    if not _pool_matches_target(pool, readiness, pool.desired_size):
+        raise WorkflowError(
+            f"Pool must be fully Ready before boot volume replacement: "
+            f"{pool.name} (desired={pool.desired_size}, "
+            f"oci_active={pool.active_oci_instances}, "
+            f"k8s_ready={pool.ready_k8s_nodes}"
+            f"{readiness_status(readiness)})"
+        )
+
+
+def _try_get_instance_boot_volume_id(
+    backend: OciBackend,
+    instance_id: str,
+) -> str | None:
+    try:
+        return backend.get_instance_boot_volume_id(instance_id)
+    except BootVolumeAttachmentPending:
+        return None
+
+
+def _require_enhanced_cluster(cluster_type: str) -> None:
+    if cluster_type.upper() != "ENHANCED_CLUSTER":
+        raise WorkflowError(
+            "OKE boot volume replacement requires an enhanced cluster; "
+            f"discovered cluster type: {cluster_type or 'unknown'}."
+        )
 
 
 def _select_pool_template(
@@ -1479,7 +2370,7 @@ def _nodes_for_pool(
 
 
 def _pool_for_prepared_node(
-    prepared: PreparedNodeRemoval,
+    prepared: PreparedNodeRemoval | PreparedNodeBootVolumeReplace,
     node: NodeInfo,
 ) -> WorkerPoolInfo:
     if node.pool_name and node.pool_name in prepared.pools:
@@ -1640,4 +2531,19 @@ def _slinky_node_mutation_error(node_name: str, pool_name: str) -> str:
     return (
         f"Refusing to remove Slinky-managed node {node_name} from {pool_name}: "
         "Slurm-aware drain is required before node deletion or replacement."
+    )
+
+
+def _slinky_pool_bvr_error(pool_name: str) -> str:
+    return (
+        f"Refusing to replace boot volumes in Slinky-managed pool {pool_name}: "
+        "Slurm-aware drain and resume coordination is required."
+    )
+
+
+def _slinky_node_bvr_error(node_name: str, pool_name: str) -> str:
+    return (
+        f"Refusing to replace the boot volume of Slinky-managed node "
+        f"{node_name} in {pool_name}: Slurm-aware drain and resume coordination "
+        "is required."
     )

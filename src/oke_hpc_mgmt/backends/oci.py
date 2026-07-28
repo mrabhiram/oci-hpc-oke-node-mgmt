@@ -11,6 +11,7 @@ from oke_hpc_mgmt.models import (
     AddonInfo,
     ClusterNetworkCreateResult,
     ManagedNodePoolCreateResult,
+    PoolBootVolumeReplaceSpec,
     PoolCreateSpec,
     WorkerPoolInfo,
     WorkRequestInfo,
@@ -20,6 +21,10 @@ from oke_hpc_mgmt.validation import normalize_pool_name
 
 class OciDiscoveryError(RuntimeError):
     """Raised when OCI discovery cannot run."""
+
+
+class BootVolumeAttachmentPending(OciDiscoveryError):
+    """Raised while a BVR instance has no active boot volume attachment."""
 
 
 T = TypeVar("T")
@@ -200,6 +205,19 @@ class OciBackend:
                 f"OKE cluster {cluster_id} did not return a compartment OCID."
             )
         return compartment_id
+
+    def get_cluster_type(self, cluster_id: str) -> str:
+        response = self._call(
+            "OKE cluster type lookup",
+            self.container_engine.get_cluster,
+            cluster_id,
+        )
+        cluster_type = str(getattr(response.data, "type", "") or "").upper()
+        if not cluster_type:
+            raise OciDiscoveryError(
+                f"OKE cluster {cluster_id} did not return its cluster type."
+            )
+        return cluster_type
 
     def list_cluster_addons(self, cluster_id: str) -> list[AddonInfo]:
         response = self.oci.pagination.list_call_get_all_results(
@@ -1322,6 +1340,386 @@ class OciBackend:
             **kwargs,
         )
         return response.headers.get("opc-work-request-id")
+
+    def get_instance_boot_volume_id(self, instance_id: str) -> str:
+        instance = self._call(
+            "Compute instance boot volume lookup",
+            self.compute.get_instance,
+            instance_id,
+        ).data
+        availability_domain = getattr(instance, "availability_domain", None)
+        compartment_id = getattr(instance, "compartment_id", None)
+        if not isinstance(availability_domain, str) or not availability_domain:
+            raise OciDiscoveryError(
+                f"Compute instance {instance_id} did not return its "
+                "availability domain."
+            )
+        if not isinstance(compartment_id, str) or not compartment_id:
+            raise OciDiscoveryError(
+                f"Compute instance {instance_id} did not return its compartment "
+                "OCID."
+            )
+        response = self._call(
+            "Compute boot volume attachment lookup",
+            self.oci.pagination.list_call_get_all_results,
+            self.compute.list_boot_volume_attachments,
+            availability_domain,
+            compartment_id,
+            instance_id=instance_id,
+        )
+        attached_ids: set[str] = set()
+        attaching_ids: set[str] = set()
+        for attachment in response.data:
+            lifecycle_state = str(
+                getattr(attachment, "lifecycle_state", "") or ""
+            ).upper()
+            boot_volume_id = getattr(attachment, "boot_volume_id", None)
+            if not isinstance(boot_volume_id, str) or not boot_volume_id:
+                continue
+            if lifecycle_state == "ATTACHED":
+                attached_ids.add(boot_volume_id)
+            elif lifecycle_state == "ATTACHING":
+                attaching_ids.add(boot_volume_id)
+        if len(attached_ids) == 1:
+            return next(iter(attached_ids))
+        if not attached_ids and len(attaching_ids) == 1:
+            return next(iter(attaching_ids))
+        active_count = len(attached_ids | attaching_ids)
+        if active_count == 0:
+            raise BootVolumeAttachmentPending(
+                f"Compute instance {instance_id} has no active boot volume "
+                "attachment."
+            )
+        raise OciDiscoveryError(
+            f"Compute instance {instance_id} has {active_count} "
+            "active boot volume attachments; exactly one is required."
+        )
+
+    def replace_cluster_node_boot_volume(
+        self,
+        cluster_id: str,
+        node_id: str,
+        *,
+        eviction_grace_duration: str,
+        force_after_grace: bool,
+    ) -> str | None:
+        eviction = self.oci.container_engine.models.NodeEvictionSettings(
+            eviction_grace_duration=eviction_grace_duration,
+            is_force_action_after_grace_duration=force_after_grace,
+        )
+        details = (
+            self.oci.container_engine.models.ReplaceBootVolumeClusterNodeDetails(
+                node_eviction_settings=eviction,
+            )
+        )
+        response = self._call(
+            "OKE node boot volume replacement",
+            self.container_engine.replace_boot_volume_cluster_node,
+            cluster_id,
+            node_id,
+            details,
+            opc_retry_token=str(uuid.uuid4()),
+        )
+        return (getattr(response, "headers", None) or {}).get(
+            "opc-work-request-id"
+        )
+
+    def preview_managed_pool_boot_volume_replace(
+        self,
+        node_pool_id: str,
+        spec: PoolBootVolumeReplaceSpec,
+    ) -> dict[str, Any]:
+        _details, _etag, preview = self._managed_pool_bvr_update(
+            node_pool_id,
+            spec,
+        )
+        return preview
+
+    def replace_managed_pool_boot_volumes(
+        self,
+        node_pool_id: str,
+        spec: PoolBootVolumeReplaceSpec,
+    ) -> str | None:
+        details, etag, _preview = self._managed_pool_bvr_update(
+            node_pool_id,
+            spec,
+        )
+        kwargs: dict[str, Any] = {}
+        if etag:
+            kwargs["if_match"] = etag
+        response = self._call(
+            "Managed OKE node-pool boot volume replacement",
+            self.container_engine.update_node_pool,
+            node_pool_id,
+            details,
+            **kwargs,
+        )
+        return (getattr(response, "headers", None) or {}).get(
+            "opc-work-request-id"
+        )
+
+    def managed_pool_boot_volume_replace_applied(
+        self,
+        node_pool_id: str,
+        spec: PoolBootVolumeReplaceSpec,
+    ) -> bool:
+        source = self._call(
+            "Managed OKE node-pool BVR verification lookup",
+            self.container_engine.get_node_pool,
+            node_pool_id,
+        ).data
+        source_details = getattr(source, "node_source_details", None)
+        node_config = getattr(source, "node_config_details", None)
+        metadata = dict(getattr(source, "node_metadata", None) or {})
+        if (
+            spec.image_id
+            and getattr(source_details, "image_id", None) != spec.image_id
+        ):
+            return False
+        if (
+            spec.boot_volume_size_in_gbs is not None
+            and getattr(source_details, "boot_volume_size_in_gbs", None)
+            != spec.boot_volume_size_in_gbs
+        ):
+            return False
+        if (
+            spec.boot_volume_kms_key_id
+            and getattr(node_config, "kms_key_id", None)
+            != spec.boot_volume_kms_key_id
+        ):
+            return False
+        if (
+            spec.kubernetes_version
+            and getattr(source, "kubernetes_version", None)
+            != spec.kubernetes_version
+        ):
+            return False
+        if any(metadata.get(key) != value for key, value in spec.node_metadata):
+            return False
+        if (
+            spec.ssh_public_key
+            and getattr(source, "ssh_public_key", None) != spec.ssh_public_key
+        ):
+            return False
+        return True
+
+    def _managed_pool_bvr_update(
+        self,
+        node_pool_id: str,
+        spec: PoolBootVolumeReplaceSpec,
+    ) -> tuple[Any, str | None, dict[str, Any]]:
+        response = self._call(
+            "Managed OKE node-pool BVR source lookup",
+            self.container_engine.get_node_pool,
+            node_pool_id,
+        )
+        source = response.data
+        lifecycle_state = str(
+            getattr(source, "lifecycle_state", "") or ""
+        ).upper()
+        if lifecycle_state and lifecycle_state not in {"ACTIVE", "RUNNING"}:
+            raise OciDiscoveryError(
+                f"Managed OKE node pool is not active: {lifecycle_state}"
+            )
+
+        source_details = getattr(source, "node_source_details", None)
+        current_image_id = getattr(source_details, "image_id", None)
+        current_boot_size = getattr(
+            source_details,
+            "boot_volume_size_in_gbs",
+            None,
+        )
+        if not current_image_id:
+            raise OciDiscoveryError(
+                "Managed OKE node pool does not expose its current image OCID."
+            )
+        if (
+            spec.boot_volume_size_in_gbs is not None
+            and current_boot_size is not None
+            and spec.boot_volume_size_in_gbs < current_boot_size
+        ):
+            raise OciDiscoveryError(
+                "Boot volume replacement cannot reduce boot volume size "
+                f"from {current_boot_size} GB to {spec.boot_volume_size_in_gbs} GB."
+            )
+
+        effective_image_id = spec.image_id or current_image_id
+        effective_boot_size = (
+            spec.boot_volume_size_in_gbs
+            if spec.boot_volume_size_in_gbs is not None
+            else current_boot_size
+        )
+        if spec.image_id:
+            compartment_id = getattr(source, "compartment_id", None)
+            shape = getattr(source, "node_shape", None)
+            if not isinstance(compartment_id, str) or not compartment_id:
+                raise OciDiscoveryError(
+                    "Managed OKE node pool does not expose its compartment OCID."
+                )
+            if not isinstance(shape, str) or not shape:
+                raise OciDiscoveryError(
+                    "Managed OKE node pool does not expose its worker shape."
+                )
+            self._validate_bvr_image_distribution(
+                current_image_id,
+                spec.image_id,
+            )
+            node_config = getattr(source, "node_config_details", None)
+            placement_configs = tuple(
+                getattr(node_config, "placement_configs", None) or ()
+            )
+            pod_network = getattr(
+                node_config,
+                "node_pool_pod_network_option_details",
+                None,
+            )
+            self._validate_create_compatibility(
+                compartment_id=compartment_id,
+                shape=shape,
+                image_id=spec.image_id,
+                availability_domains=tuple(
+                    getattr(placement, "availability_domain", "")
+                    for placement in placement_configs
+                ),
+                source_subnet_id=getattr(
+                    next(iter(placement_configs), None),
+                    "subnet_id",
+                    None,
+                ),
+                primary_subnet_ids=tuple(
+                    getattr(placement, "subnet_id", "")
+                    for placement in placement_configs
+                ),
+                pod_subnet_ids=tuple(
+                    getattr(pod_network, "pod_subnet_ids", None) or ()
+                ),
+                nsg_ids=tuple(
+                    dict.fromkeys(
+                        [
+                            *(getattr(node_config, "nsg_ids", None) or []),
+                            *(getattr(pod_network, "pod_nsg_ids", None) or []),
+                        ]
+                    )
+                ),
+                require_local_nvme=False,
+            )
+
+        update_values: dict[str, Any] = {
+            "node_pool_cycling_details": (
+                self.oci.container_engine.models.NodePoolCyclingDetails(
+                    maximum_unavailable=spec.maximum_unavailable,
+                    is_node_cycling_enabled=True,
+                    cycle_modes=["BOOT_VOLUME_REPLACE"],
+                )
+            ),
+        }
+        if spec.image_id or spec.boot_volume_size_in_gbs is not None:
+            update_values["node_source_details"] = (
+                self.oci.container_engine.models.NodeSourceViaImageDetails(
+                    source_type="IMAGE",
+                    image_id=effective_image_id,
+                    boot_volume_size_in_gbs=effective_boot_size,
+                )
+            )
+        if spec.kubernetes_version:
+            update_values["kubernetes_version"] = spec.kubernetes_version
+        if spec.node_metadata:
+            metadata = dict(getattr(source, "node_metadata", None) or {})
+            metadata.update(dict(spec.node_metadata))
+            update_values["node_metadata"] = metadata
+        if spec.ssh_public_key:
+            update_values["ssh_public_key"] = spec.ssh_public_key
+        if spec.boot_volume_kms_key_id:
+            update_values["node_config_details"] = (
+                self.oci.container_engine.models.UpdateNodePoolNodeConfigDetails(
+                    kms_key_id=spec.boot_volume_kms_key_id,
+                )
+            )
+
+        current_config = getattr(source, "node_config_details", None)
+        current = {
+            "image_id": current_image_id,
+            "boot_volume_size_in_gbs": current_boot_size,
+            "boot_volume_kms_key_id": getattr(
+                current_config,
+                "kms_key_id",
+                None,
+            ),
+            "kubernetes_version": getattr(
+                source,
+                "kubernetes_version",
+                None,
+            ),
+            "node_metadata_keys": sorted(
+                (getattr(source, "node_metadata", None) or {}).keys()
+            ),
+            "ssh_public_key_configured": bool(
+                getattr(source, "ssh_public_key", None)
+            ),
+        }
+        effective = {
+            "image_id": effective_image_id,
+            "boot_volume_size_in_gbs": effective_boot_size,
+            "boot_volume_kms_key_id": (
+                spec.boot_volume_kms_key_id
+                or current["boot_volume_kms_key_id"]
+            ),
+            "kubernetes_version": (
+                spec.kubernetes_version or current["kubernetes_version"]
+            ),
+            "node_metadata_keys": sorted(
+                set(current["node_metadata_keys"])
+                | {key for key, _value in spec.node_metadata}
+            ),
+            "ssh_public_key_configured": bool(
+                spec.ssh_public_key or current["ssh_public_key_configured"]
+            ),
+            "maximum_unavailable": spec.maximum_unavailable,
+            "cycle_modes": ["BOOT_VOLUME_REPLACE"],
+        }
+        details = self.oci.container_engine.models.UpdateNodePoolDetails(
+            **update_values
+        )
+        headers = getattr(response, "headers", None) or {}
+        return details, headers.get("etag"), {
+            "current": current,
+            "effective": effective,
+        }
+
+    def _validate_bvr_image_distribution(
+        self,
+        current_image_id: str,
+        replacement_image_id: str,
+    ) -> None:
+        operating_systems: list[str] = []
+        for label, image_id in (
+            ("current", current_image_id),
+            ("replacement", replacement_image_id),
+        ):
+            image = self._call(
+                f"Managed OKE {label} BVR image lookup",
+                self.compute.get_image,
+                image_id,
+            ).data
+            operating_system = str(
+                getattr(image, "operating_system", "") or ""
+            ).strip()
+            if not operating_system:
+                raise OciDiscoveryError(
+                    f"The {label} image {image_id} does not expose its operating "
+                    "system."
+                )
+            if operating_system.casefold() == "windows":
+                raise OciDiscoveryError(
+                    "OKE boot volume replacement supports Linux images only."
+                )
+            operating_systems.append(operating_system)
+        if operating_systems[0].casefold() != operating_systems[1].casefold():
+            raise OciDiscoveryError(
+                "The replacement image must use the same Linux distribution as "
+                f"the current image ({operating_systems[0]}); discovered "
+                f"{operating_systems[1]}."
+            )
 
     def detach_instance_pool_node(
         self,

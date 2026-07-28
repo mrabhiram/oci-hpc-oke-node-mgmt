@@ -14,6 +14,12 @@ Use `nodes terminate` instead of pool-level scale-down when the identity of the
 departing worker matters. `pools resize --delta -1` reduces capacity but leaves
 worker selection to the owning OCI service.
 
+To preserve the compute instance and replace only its boot volume, use
+`nodes boot-volume-replace`. Individual BVR preserves the current image and
+node configuration. To apply a new image to every worker in a managed pool, use
+`pools boot-volume-replace --image-id`. See
+[Replacing Worker Boot Volumes](./replacing-worker-boot-volumes.md).
+
 To drain and remove an entire owning pool rather than selected workers, use
 `pools delete`. See [Live Worker Pool Deletion
 Validation](./live-pool-deletion-validation.md) for a managed deletion and a

@@ -15,6 +15,7 @@ syntax:
 mgmt-oke --help
 mgmt-oke pools --help
 mgmt-oke nodes terminate --help
+mgmt-oke nodes boot-volume-replace --help
 ```
 
 Example top-level help excerpt:
@@ -125,6 +126,42 @@ option matrix and examples. [Live Worker Pool Creation
 Validation](./live-pool-creation-validation.md) contains sanitized output from
 live managed GPU and self-managed RDMA creation operations.
 
+Replace every boot volume in a managed pool while applying at least one
+supported property update:
+
+```bash
+mgmt-oke pools boot-volume-replace <managed-pool> \
+  --image-id <replacement-image-ocid> \
+  --maximum-unavailable 1 \
+  --dry-run \
+  --format json
+mgmt-oke pools boot-volume-replace <managed-pool> \
+  --image-id <replacement-image-ocid> \
+  --maximum-unavailable 1 \
+  --wait
+```
+
+Supported updates are image ID, boot volume size, boot volume KMS key,
+Kubernetes version, non-reserved node metadata, and SSH public key. The command
+is limited to managed OKE node pools and enhanced clusters. It refuses image
+changes across Linux distributions and boot volume size reductions.
+
+| Option | Purpose |
+| --- | --- |
+| `--image-id <ocid>` | Apply a compatible image to every worker. |
+| `--boot-volume-size <gib>` | Increase the worker boot volume size. |
+| `--boot-volume-kms-key-id <ocid>` | Change boot volume encryption key. |
+| `--kubernetes-version <version>` | Change the worker Kubernetes version. |
+| `--node-metadata KEY=VALUE` | Merge a non-reserved metadata key; repeatable. |
+| `--ssh-public-key-file <path>` | Apply the UTF-8 public key file. |
+| `--maximum-unavailable <value>` | Set positive rolling parallelism as a count or percentage. Default: `1`. |
+| `--delete-emptydir-data` | Acknowledge loss of pod-local data. |
+| `--force` | Acknowledge eviction of unmanaged pods. |
+| `--allow-system-pool` | Permit BVR of `oke-system` after explicit review. |
+
+`pools bvr` is an alias. See
+[Replacing Worker Boot Volumes](./replacing-worker-boot-volumes.md).
+
 Delete an entire pool:
 
 ```bash
@@ -204,6 +241,10 @@ All pool mutations support:
 | `--poll-interval <seconds>` | Set the readiness polling interval. Default: `30`. |
 | `--lock` / `--no-lock` | Enable or bypass the Kubernetes mutation Lease. |
 | `--yes` | Skip interactive typed confirmation. |
+
+Boot volume replacement commands use a `7200` second default timeout because
+OKE must drain, stop, update, restart, and revalidate workers. Other pool
+mutations retain the `1800` second default.
 
 Whole-pool deletion additionally supports:
 
@@ -333,6 +374,52 @@ mgmt-oke nodes drain <node-name> --delete-emptydir-data --force
 
 Node maintenance supports `--dry-run`, `--lock` / `--no-lock`, and `--yes`.
 Drain also supports `--grace-period` and `--timeout`.
+
+## Node Boot Volume Replacement
+
+Replace the boot volume of a selected managed or self-managed worker:
+
+```bash
+mgmt-oke nodes boot-volume-replace <node-name-or-ip> --dry-run
+mgmt-oke nodes boot-volume-replace <node-name-or-ip> --wait
+```
+
+The command invokes OKE `ReplaceBootVolumeClusterNode`. OKE cordons and drains
+the worker, stops the existing compute instance, replaces its boot volume, and
+restarts the same instance. The instance OCID, network address, image, and
+existing node configuration are preserved.
+
+An individual-node BVR does not accept a new image. Use
+`pools boot-volume-replace --image-id` for a managed-pool image update.
+
+Several nodes can be selected by identifiers or `--fields`. Multiple BVR
+requests require `--wait` and execute sequentially:
+
+```bash
+mgmt-oke nodes boot-volume-replace \
+  --nodes <node-a>,<node-b> \
+  --wait
+```
+
+| Option | Purpose |
+| --- | --- |
+| `--eviction-grace <duration>` | Set OKE drain grace from `PT0M` through `PT60M`. Default: `PT60M`. |
+| `--force-after-grace` | Continue after the grace period even if drain has not completed. |
+| `--delete-emptydir-data` | Acknowledge loss of pod-local data. |
+| `--force` | Acknowledge eviction of unmanaged pods. |
+| `--allow-system-pool` | Permit BVR of an `oke-system` worker after explicit review. |
+| `--wait` | Verify work request, instance identity, new boot volume, Ready state, GPU, and RDMA recovery. |
+| `--timeout <seconds>` | Set the per-node convergence timeout. Default: `7200`. |
+
+`nodes bvr` and `nodes boot-volume-swap` are aliases.
+
+Example dry-run output:
+
+```text
+operation                         target      pool     owner  current_size  target_size  status
+--------------------------------  ----------  -------  -----  ------------  -----------  -------
+node-boot-volume-replace          gpu-node-1  oke-gpu  oke    1             1            planned
+```
 
 ## Node Termination And Replacement
 

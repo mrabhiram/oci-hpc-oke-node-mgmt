@@ -269,6 +269,28 @@ Instance Pool lifecycle state together with `pools get` and `nodes list` as the
 authoritative progress view. Repeating the current exact target with `--wait`
 is non-mutating and can be used as a convergence barrier.
 
+## Boot Volume Replacement Refused
+
+BVR requires an enhanced OKE cluster. Pool-wide BVR requires a fully healthy
+pool, while individual BVR can repair a NotReady worker. The CLI also refuses
+autoscaler-owned, Slinky-managed, or unacknowledged system-pool operations.
+
+For an individual worker, do not pass an image update: the OKE API preserves
+the current image and node configuration. Apply a compatible image to a
+managed pool instead:
+
+```bash
+mgmt-oke pools boot-volume-replace <managed-pool> \
+  --image-id <replacement-image-ocid> \
+  --dry-run
+```
+
+The replacement must be a Linux image from the same distribution as the
+current image and must support the pool shape in every selected availability
+domain. A BVR timeout does not prove rollback. Inspect the OKE work request,
+current compute instance boot volume, node Ready state, and pool readiness
+before retrying.
+
 ## GPU or RDMA Readiness Is Incomplete
 
 Run:

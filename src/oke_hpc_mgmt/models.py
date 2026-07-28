@@ -76,6 +76,7 @@ class NodeInfo:
     daemonset_pods: int = 0
     system_pods: int = 0
     slinky_workload_pods: int = 0
+    boot_id: str | None = None
 
     @property
     def rdma_labels(self) -> dict[str, str]:
@@ -305,6 +306,33 @@ class ClusterNetworkCreateResult:
 class ManagedNodePoolCreateResult:
     node_pool_id: str | None = None
     work_request_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PoolBootVolumeReplaceSpec:
+    image_id: str | None = None
+    boot_volume_size_in_gbs: int | None = None
+    boot_volume_kms_key_id: str | None = None
+    kubernetes_version: str | None = None
+    node_metadata: tuple[tuple[str, str], ...] = ()
+    ssh_public_key: str | None = None
+    maximum_unavailable: str = "1"
+
+    def as_dict(self) -> dict[str, Any]:
+        values: dict[str, Any] = {
+            "image_id": self.image_id,
+            "boot_volume_size_in_gbs": self.boot_volume_size_in_gbs,
+            "boot_volume_kms_key_id": self.boot_volume_kms_key_id,
+            "kubernetes_version": self.kubernetes_version,
+            "node_metadata_keys": [key for key, _value in self.node_metadata],
+            "ssh_public_key_configured": bool(self.ssh_public_key),
+            "maximum_unavailable": self.maximum_unavailable,
+        }
+        return {
+            key: value
+            for key, value in values.items()
+            if value is not None and value not in ([], {})
+        }
 
 
 @dataclass(frozen=True)

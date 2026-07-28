@@ -293,6 +293,31 @@ that internal pool from standalone inventory.
 The expected output contains one `oke-rdma` worker pool, not both an OKE node
 pool and its internal Instance Pool. Mutations always target the OKE node pool.
 
+## RDMA Boot Volume Replacement
+
+Specific-node BVR is supported for both RDMA ownership models:
+
+```bash
+mgmt-oke --auth instance_principal nodes boot-volume-replace \
+  <rdma-node-name-or-ip> --wait
+```
+
+OKE preserves the compute instance, IP address, image, and current node
+configuration. The waiter requires RDMA topology, GPUs, and applicable Network
+Operator VFs to recover.
+
+Only a managed Compute Cluster-backed OKE pool supports pool-wide image or
+property updates:
+
+```bash
+mgmt-oke --auth instance_principal pools boot-volume-replace \
+  <managed-rdma-pool> --image-id <image-ocid> --wait
+```
+
+For a legacy self-managed Cluster Network, use specific-node BVR without an
+image update. See
+[Replacing Worker Boot Volumes](./replacing-worker-boot-volumes.md).
+
 ## Slinky Slurm Pools
 
 The tool detects Slinky ownership from upstream labels, annotations, and slurmd

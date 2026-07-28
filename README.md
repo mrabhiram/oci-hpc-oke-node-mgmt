@@ -32,6 +32,10 @@ management for OCI HPC OKE clusters:
 - serialize concurrent mutations with a Kubernetes Lease `[Implemented]`
 - cordon, drain, and uncordon selected Kubernetes workers `[Implemented]`
 - remove, replace, or terminate one or more managed or self-managed workers `[Implemented]`
+- replace the boot volume of a specific managed or self-managed worker while
+  preserving its instance identity and existing node configuration `[Implemented]`
+- roll every worker in a managed OKE pool through boot volume replacement while
+  updating supported properties such as its image `[Implemented]`
 - select nodes by identifiers or exact operational fields `[Implemented]`
 - project and sort node output for shell and automation workflows `[Implemented]`
 - wait for OCI, Kubernetes, GPU, RDMA topology, and applicable RDMA VF readiness `[Implemented]`
@@ -40,10 +44,11 @@ management for OCI HPC OKE clusters:
 - validate OKE accelerator add-ons against discovered GPU and RDMA capacity `[Implemented]`
 
 Inventory, status, health, recommendation, topology, autoscaler, add-on status,
-and reconciliation commands are read-only. Pool creation, deletion, capacity
-commands, and node termination mutate OCI resources. Node maintenance commands
-mutate Kubernetes. Every mutation supports `--dry-run`, uses a Kubernetes Lease
-by default, and requires either `--yes` or an interactive typed confirmation.
+and reconciliation commands are read-only. Pool creation, deletion, capacity,
+boot volume replacement, and node termination commands mutate OCI resources.
+Node maintenance commands mutate Kubernetes. Every mutation supports
+`--dry-run`, uses a Kubernetes Lease by default, and requires either `--yes` or
+an interactive typed confirmation.
 
 ## Install
 
@@ -126,10 +131,12 @@ Command groups:
 | `pools resize <pool> (--size <n> \| --delta <n>)` | Resize a managed OKE node pool, cluster network, or instance pool. |
 | `pools add <pool> --count <n>` | Add `n` workers to desired pool capacity. |
 | `pools remove <pool> --count <n>` | Remove `n` workers from desired pool capacity; OCI selects the workers. |
+| `pools boot-volume-replace <pool> <property-update>` | Replace every managed worker boot volume while applying a supported image, boot, Kubernetes, metadata, or SSH-key update. |
 | `nodes list` | List and filter Kubernetes nodes. |
 | `nodes get <identifier...>` | Get nodes by Kubernetes name, Slurm name, internal IP, provider ID, or instance OCID. |
 | `nodes terminate <identifier...>` | Drain and terminate selected managed or self-managed workers. |
 | `nodes remove <identifier...>` | Compatibility alias for `nodes terminate`. |
+| `nodes boot-volume-replace <identifier...>` | Replace selected managed or self-managed worker boot volumes while preserving the current image and configuration. |
 | `nodes cordon <identifier...>` | Mark selected workers unschedulable. |
 | `nodes drain <identifier...>` | Cordon workers and evict non-DaemonSet pods through the Eviction API. |
 | `nodes uncordon <identifier...>` | Mark selected workers schedulable. |
@@ -198,6 +205,17 @@ Node removal options:
 | `--dry-run` | Validate selection, ownership, drain constraints, and eviction admission without mutation. |
 | `--lock` / `--no-lock` | Use or bypass the Kubernetes mutation Lease. Locking is enabled by default. |
 | `--yes` | Do not prompt for confirmation. |
+
+Boot volume replacement commands require an enhanced OKE cluster. Individual
+node BVR preserves the current image and node configuration. Managed-pool BVR
+requires at least one supported update and accepts `--image-id`,
+`--boot-volume-size`, `--boot-volume-kms-key-id`, `--kubernetes-version`,
+`--node-metadata`, or `--ssh-public-key-file`. Both paths preflight eviction,
+preserve compute instance identity, and verify replacement boot volume, node,
+GPU, and RDMA readiness with `--wait`.
+
+See [Replacing Worker Boot Volumes](docs/replacing-worker-boot-volumes.md) for
+the complete behavior, safety options, and image constraints.
 
 ## Authentication
 
@@ -301,6 +319,10 @@ not resize or detach its OKE-internal backing Instance Pool directly. Discovery
 suppresses that internal resource from standalone pool output, preventing one
 managed RDMA pool from appearing twice.
 
+Specific-node BVR is routed through OKE for every managed and self-managed pool
+model. Pool-wide BVR with image or property updates is available only for
+managed OKE node pools, including Compute Cluster-backed RDMA pools.
+
 Create a managed CPU pool:
 
 ```bash
@@ -362,6 +384,26 @@ Instance Configurations are preserved.
 
 See [Creating Worker Pools](docs/creating-worker-pools.md) for complete examples,
 validation behavior, and infrastructure-as-code ownership guidance.
+
+Replace all boot volumes in a managed GPU pool while applying a compatible new
+image:
+
+```bash
+mgmt-oke pools boot-volume-replace oke-gpu \
+  --image-id <replacement-image-ocid> \
+  --maximum-unavailable 1 \
+  --dry-run \
+  --format json
+mgmt-oke pools boot-volume-replace oke-gpu \
+  --image-id <replacement-image-ocid> \
+  --maximum-unavailable 1 \
+  --wait
+```
+
+The image must use the same Linux distribution as the current image and remain
+compatible with the pool shape and availability domains. Direct node-pool
+property changes must also be reconciled with Terraform or OCI Resource
+Manager inputs.
 
 Add one node to a pool:
 
@@ -439,9 +481,13 @@ mgmt-oke nodes get ocid1.instance.oc1.iad.example
 mgmt-oke nodes get <slurm-node-name>
 mgmt-oke nodes terminate 10.0.127.32 --wait --yes
 mgmt-oke nodes terminate 10.0.127.32 --keep-size --wait --yes
+mgmt-oke nodes boot-volume-replace 10.0.127.32 --dry-run
+mgmt-oke nodes boot-volume-replace 10.0.127.32 --wait
 ```
 
 `nodes remove` is an alias for `nodes terminate`.
+`nodes bvr` and `nodes boot-volume-swap` are aliases for
+`nodes boot-volume-replace`.
 
 Node termination drains by default. Preflight lists pods, checks eviction
 admission, rejects unacknowledged `emptyDir` data and unmanaged pods, then the
@@ -478,6 +524,19 @@ Replace a specific RDMA worker while keeping the pool at its current size:
 ```bash
 mgmt-oke nodes terminate <rdma-node-name> --keep-size --wait --yes
 ```
+
+Replace the boot volume of a specific managed or self-managed worker without
+terminating its compute instance:
+
+```bash
+mgmt-oke nodes boot-volume-replace <node-name-or-ip> \
+  --eviction-grace PT60M \
+  --wait
+```
+
+OKE preserves the instance OCID and network address. Individual BVR also
+preserves the current image and node configuration; use managed-pool BVR when a
+new image must be applied.
 
 Without `--keep-size`, the selected worker is removed and desired pool size is
 decremented. With `--keep-size`, the selected worker is removed and the owning

@@ -17,11 +17,14 @@ from oke_hpc_mgmt.models import (
     DiscoverySnapshot,
     NodeInfo,
     OperationPlan,
+    PoolBootVolumeReplaceSpec,
     PoolCreateSpec,
     WorkerPoolInfo,
 )
 from oke_hpc_mgmt.workflows.lifecycle import (
+    PreparedNodeBootVolumeReplace,
     PreparedNodeRemoval,
+    PreparedPoolBootVolumeReplace,
     PreparedPoolCreate,
     PreparedPoolDelete,
     PreparedPoolResize,
@@ -55,8 +58,37 @@ class CliTests(unittest.TestCase):
         result = self.runner.invoke(cli, ["nodes", "--help"])
 
         self.assertEqual(0, result.exit_code)
-        for command in ("remove", "terminate", "cordon", "drain", "uncordon"):
+        for command in (
+            "remove",
+            "terminate",
+            "boot-volume-replace",
+            "boot-volume-swap",
+            "bvr",
+            "cordon",
+            "drain",
+            "uncordon",
+        ):
             self.assertIn(command, result.output)
+
+    def test_bvr_help_distinguishes_individual_and_pool_image_behavior(self):
+        node_result = self.runner.invoke(
+            cli,
+            ["nodes", "boot-volume-replace", "--help"],
+        )
+        pool_result = self.runner.invoke(
+            cli,
+            ["pools", "boot-volume-replace", "--help"],
+        )
+
+        self.assertEqual(0, node_result.exit_code, node_result.output)
+        self.assertIn(
+            "preserves the current image",
+            " ".join(node_result.output.split()),
+        )
+        self.assertNotIn("--image-id", node_result.output)
+        self.assertEqual(0, pool_result.exit_code, pool_result.output)
+        self.assertIn("--image-id", pool_result.output)
+        self.assertIn("--maximum-unavailable", pool_result.output)
 
     def test_pool_resize_help_defines_delta_signs(self):
         result = self.runner.invoke(cli, ["pools", "resize", "--help"])
@@ -517,6 +549,129 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(0, result.exit_code, result.output)
         self.assertEqual("node-remove", json.loads(result.output)[0]["operation"])
+        execute.assert_not_called()
+
+    def test_individual_node_bvr_dry_run_never_executes(self):
+        node = NodeInfo(
+            "gpu-1",
+            pool_name="oke-gpu",
+            instance_ocid="instance-1",
+        )
+        pool = WorkerPoolInfo(
+            "oke-gpu",
+            "node-pool",
+            desired_size=1,
+            node_pool_id="node-pool-1",
+        )
+        prepared = PreparedNodeBootVolumeReplace(
+            snapshot=DiscoverySnapshot(pools=[pool], nodes=[node]),
+            nodes=(node,),
+            pools={"oke-gpu": pool},
+            plans=(
+                OperationPlan(
+                    "node-boot-volume-replace",
+                    "gpu-1",
+                    pool="oke-gpu",
+                ),
+            ),
+            old_boot_volume_ids={"instance-1": "boot-volume-old"},
+            drain_pods={},
+            delete_emptydir_data=False,
+            force_unmanaged=False,
+            allow_system_pool=False,
+            eviction_grace_duration="PT60M",
+            force_after_grace=False,
+        )
+        with (
+            patch(
+                "oke_hpc_mgmt.commands.nodes.prepare_node_boot_volume_replace",
+                return_value=prepared,
+            ),
+            patch(
+                "oke_hpc_mgmt.commands.nodes.execute_node_boot_volume_replace"
+            ) as execute,
+        ):
+            result = self.runner.invoke(
+                cli,
+                [
+                    "nodes",
+                    "bvr",
+                    "gpu-1",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(
+            "node-boot-volume-replace",
+            json.loads(result.output)[0]["operation"],
+        )
+        execute.assert_not_called()
+
+    def test_managed_pool_bvr_dry_run_builds_image_update(self):
+        pool = WorkerPoolInfo(
+            "oke-gpu",
+            "node-pool",
+            desired_size=1,
+            node_pool_id="node-pool-1",
+        )
+        node = NodeInfo(
+            "gpu-1",
+            pool_name=pool.name,
+            instance_ocid="instance-1",
+        )
+        prepared = PreparedPoolBootVolumeReplace(
+            snapshot=DiscoverySnapshot(pools=[pool], nodes=[node]),
+            pool=pool,
+            nodes=(node,),
+            old_boot_volume_ids={"instance-1": "boot-volume-old"},
+            drain_pods={},
+            spec=PoolBootVolumeReplaceSpec(image_id="image-new"),
+            delete_emptydir_data=False,
+            force_unmanaged=False,
+            allow_system_pool=False,
+            plan=OperationPlan(
+                "pool-boot-volume-replace",
+                pool.name,
+                pool=pool.name,
+            ),
+        )
+        with (
+            patch(
+                "oke_hpc_mgmt.commands.pools.prepare_pool_boot_volume_replace",
+                return_value=prepared,
+            ) as prepare,
+            patch(
+                "oke_hpc_mgmt.commands.pools.execute_pool_boot_volume_replace"
+            ) as execute,
+        ):
+            result = self.runner.invoke(
+                cli,
+                [
+                    "pools",
+                    "bvr",
+                    "oke-gpu",
+                    "--image-id",
+                    "image-new",
+                    "--maximum-unavailable",
+                    "1",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(
+            "pool-boot-volume-replace",
+            json.loads(result.output)[0]["operation"],
+        )
+        self.assertEqual(
+            "image-new",
+            prepare.call_args.args[2].image_id,
+        )
         execute.assert_not_called()
 
     def test_node_maintenance_dry_run_never_executes(self):

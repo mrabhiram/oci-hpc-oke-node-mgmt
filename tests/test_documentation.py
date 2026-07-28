@@ -229,6 +229,21 @@ class DocumentationTests(unittest.TestCase):
             self.assertIn(field, readiness_guide)
         self.assertIn("node_present=False", readiness_guide)
 
+    def test_bvr_docs_distinguish_individual_and_pool_image_updates(self):
+        guide = (
+            PROJECT_ROOT / "docs" / "replacing-worker-boot-volumes.md"
+        ).read_text(encoding="utf-8")
+        scope = (PROJECT_ROOT / "docs" / "scope.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("nodes boot-volume-replace", guide)
+        self.assertIn("pools boot-volume-replace", guide)
+        self.assertIn("does not accept `--image-id`", guide)
+        self.assertIn("ReplaceBootVolumeClusterNode", guide)
+        self.assertIn('cycleModes=["BOOT_VOLUME_REPLACE"]', guide)
+        self.assertNotIn("- boot volume replacement wrapper", scope)
+
 
 if __name__ == "__main__":
     unittest.main()
