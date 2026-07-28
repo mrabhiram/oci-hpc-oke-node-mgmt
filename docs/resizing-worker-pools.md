@@ -207,7 +207,7 @@ Configuration, cloud-init, tags, and other embedded pool fields are preserved.
 mgmt-oke --auth instance_principal pools resize oke-rdma --size 3 --wait
 ```
 
-No separate worker creation command is required. New instances use the
+Resizing an existing pool does not invoke `pools create`. New instances use the
 existing Instance Configuration and its OKE bootstrap cloud-init.
 
 ## Safety Checks

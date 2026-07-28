@@ -72,7 +72,7 @@ Verify the package entrypoints:
 Example version output:
 
 ```text
-mgmt-oke, version 0.4.0
+mgmt-oke, version 0.5.0
 ```
 
 ## Upgrade An Existing Installation
@@ -210,6 +210,7 @@ these checks when the operator kubeconfig identifies one OKE cluster.
 The current mutating commands are:
 
 ```bash
+mgmt-oke pools create <name> --count <n> [--from-pool <pool>] [--dry-run] [--wait]
 mgmt-oke pools resize <pool> (--size <n> | --delta <n>) [--dry-run] [--wait]
 mgmt-oke pools add <pool> --count <n> [--dry-run] [--wait]
 mgmt-oke pools remove <pool> --count <n> [--dry-run] [--wait]
@@ -250,6 +251,24 @@ Example managed or self-managed pool resize:
 mgmt-oke pools add oke-cpu --count 1 --dry-run
 mgmt-oke pools add oke-cpu --count 1 --wait
 ```
+
+Example Cluster Network pool creation:
+
+```bash
+mgmt-oke pools create oke-rdma-2 \
+  --count 2 \
+  --from-pool oke-rdma \
+  --dry-run
+mgmt-oke pools create oke-rdma-2 \
+  --count 2 \
+  --from-pool oke-rdma \
+  --wait
+```
+
+Creation derives a new Instance Configuration from the source, applies the new
+pool identity, and reuses the source placement. It then creates a new Cluster
+Network and embedded Instance Pool; it does not create an OKE managed node-pool
+object.
 
 A negative delta reduces capacity but does not select the departing worker. Use
 `nodes terminate` when a particular worker must be removed.

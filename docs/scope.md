@@ -34,6 +34,8 @@ Management Tool.
 - fail-closed Slinky protection for node removal, replacement, and pool scale-down
 - guarded managed OKE node pool resize through a size-only `node_config_details` update
 - guarded self-managed cluster-network and instance-pool resize
+- guarded creation of self-managed Cluster Network pools by deriving a new
+  Instance Configuration from an existing RDMA pool and reusing its placement
 - explicit `pools add` and `pools remove` capacity commands
 - validated dry-run plans for every mutation
 - Kubernetes Lease serialization for concurrent mutations
@@ -58,6 +60,7 @@ Management Tool.
 
 ## Not Implemented Yet
 
+- whole worker-pool and Cluster Network deletion
 - boot volume replacement wrapper
 - automatic Kueue `ClusterQueue` quota updates after worker-pool capacity changes
 - Cluster Autoscaler bounds updates

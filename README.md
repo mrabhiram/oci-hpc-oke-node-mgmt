@@ -20,6 +20,7 @@ management for OCI HPC OKE clusters:
 - show Kueue resource counts and ResourceFlavor-to-pool matches `[Implemented]`
 - discover Slinky Slurm node aliases and protect Slinky workers from unsafe removal `[Implemented]`
 - resize standard and Compute Cluster-backed OKE node pools and self-managed cluster-network pools `[Implemented]`
+- create a self-managed Cluster Network pool from an existing RDMA pool configuration `[Implemented]`
 - add or remove pool capacity with explicit `pools add` and `pools remove` commands `[Implemented]`
 - preview every mutation as a validated operation plan with `--dry-run` `[Implemented]`
 - serialize concurrent mutations with a Kubernetes Lease `[Implemented]`
@@ -33,10 +34,10 @@ management for OCI HPC OKE clusters:
 - validate OKE accelerator add-ons against discovered GPU and RDMA capacity `[Implemented]`
 
 Inventory, status, health, recommendation, topology, autoscaler, add-on status,
-and reconciliation commands are read-only. Pool capacity commands and node
-termination mutate OCI resources. Node maintenance commands mutate Kubernetes.
-Every mutation supports `--dry-run`, uses a Kubernetes Lease by default, and
-requires either `--yes` or an interactive typed confirmation.
+and reconciliation commands are read-only. Pool creation, pool capacity
+commands, and node termination mutate OCI resources. Node maintenance commands
+mutate Kubernetes. Every mutation supports `--dry-run`, uses a Kubernetes Lease
+by default, and requires either `--yes` or an interactive typed confirmation.
 
 ## Install
 
@@ -114,6 +115,7 @@ Command groups:
 | --- | --- |
 | `pools list` | List discovered worker pools. |
 | `pools get <pool>` | Get one worker pool by name or OCID. |
+| `pools create <name> --count <n>` | Create a self-managed Cluster Network pool from an existing RDMA pool template. |
 | `pools resize <pool> (--size <n> \| --delta <n>)` | Resize a managed OKE node pool, cluster network, or instance pool. |
 | `pools add <pool> --count <n>` | Add `n` workers to desired pool capacity. |
 | `pools remove <pool> --count <n>` | Remove `n` workers from desired pool capacity; OCI selects the workers. |
@@ -133,12 +135,24 @@ Command groups:
 | `recommendations list` | Show actionable warnings and failures. |
 | `reconcile` | Show a full discovery snapshot. |
 
-Resize options:
+Pool creation options:
+
+| Option | Description |
+| --- | --- |
+| `--count <n>` | Initial worker count. The value must be at least one. |
+| `--from-pool <pool>` | Select the source Cluster Network pool. If omitted, `oke-rdma` is used when present; otherwise the only eligible Cluster Network pool is used. |
+
+Pool resize options:
 
 | Option | Description |
 | --- | --- |
 | `--size <n>` | Set the worker pool to an exact desired size. |
 | `--delta <n>` | Change the current desired size by `n`. Positive values add nodes; negative values remove nodes. For example, `--delta 2` adds two nodes and `--delta -1` removes one node. |
+
+Shared pool mutation options:
+
+| Option | Description |
+| --- | --- |
 | `--wait` | Monitor the submitted OCI work request and wait for target OCI and Kubernetes counts. OCI failures are reported immediately. GPU/RDMA pools also wait for allocatable GPUs and valid RDMA topology; when `NvidiaNetworkOperator` is active, RDMA pools also wait for `nvidia.com/rdma-vf`. |
 | `--timeout <seconds>` | Maximum seconds to wait. Default: `1800`. |
 | `--poll-interval <seconds>` | Wait polling interval. Default: `30`. |
@@ -256,17 +270,43 @@ placed in Compute Clusters by default. Legacy deployments can expose a
 self-managed Cluster Network with an embedded Instance Pool. The tool supports
 both ownership models:
 
-| Pool model | Inventory | Resize operation | Specific node removal |
-| --- | --- | --- | --- |
-| Standard managed OKE node pool | `kind=node-pool`, `placement=standard` | OKE `UpdateNodePool` with only the desired size | OKE `DeleteNode` |
-| Managed OKE node pool placed in a Compute Cluster | `kind=node-pool`, `placement=compute-cluster` | OKE `UpdateNodePool` with only the desired size | OKE `DeleteNode` |
-| Self-managed Cluster Network instance pool | `kind=cluster-network`, `placement=cluster-network` | Compute Management `UpdateClusterNetwork` | Instance-pool detach with automatic termination |
-| Standalone Instance Pool | `kind=instance-pool` | Compute Management `UpdateInstancePool` | Instance-pool detach with automatic termination |
+| Pool model | Inventory | Create operation | Resize operation | Specific node removal |
+| --- | --- | --- | --- | --- |
+| Standard managed OKE node pool | `kind=node-pool`, `placement=standard` | Not supported | OKE `UpdateNodePool` with only the desired size | OKE `DeleteNode` |
+| Managed OKE node pool placed in a Compute Cluster | `kind=node-pool`, `placement=compute-cluster` | Not supported | OKE `UpdateNodePool` with only the desired size | OKE `DeleteNode` |
+| Self-managed Cluster Network instance pool | `kind=cluster-network`, `placement=cluster-network` | Compute Management `CreateInstanceConfiguration` and `CreateClusterNetwork` from an existing pool template | Compute Management `UpdateClusterNetwork` | Instance-pool detach with automatic termination |
+| Standalone Instance Pool | `kind=instance-pool` | Not supported | Compute Management `UpdateInstancePool` | Instance-pool detach with automatic termination |
 
 The Compute Cluster is placement metadata for a managed OKE pool. The tool does
 not resize or detach its OKE-internal backing Instance Pool directly. Discovery
 suppresses that internal resource from standalone pool output, preventing one
 managed RDMA pool from appearing twice.
+
+Create a second self-managed Cluster Network pool:
+
+```bash
+mgmt-oke pools create oke-rdma-2 \
+  --count 2 \
+  --from-pool oke-rdma \
+  --dry-run
+```
+
+After reviewing the plan:
+
+```bash
+mgmt-oke pools create oke-rdma-2 \
+  --count 2 \
+  --from-pool oke-rdma \
+  --wait
+```
+
+Creation derives a new Instance Configuration from the source and reuses its
+placement. The image, cloud-init, OKE bootstrap metadata, and networking are
+preserved. Instance and VNIC tags plus the initial Kubernetes pool label are
+retargeted to the new pool name, and Terraform ownership markers are removed.
+The source resources remain unchanged. See
+[`docs/creating-cluster-network-pools.md`](docs/creating-cluster-network-pools.md)
+for ownership and infrastructure-as-code guidance.
 
 Add one node to a pool:
 

@@ -1,29 +1,35 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from oke_hpc_mgmt.models import (
+    ClusterNetworkCreateResult,
     DiscoverySnapshot,
     DrainPod,
     NodeInfo,
+    PoolResourceReadiness,
     WorkerPoolInfo,
     WorkRequestInfo,
 )
 from oke_hpc_mgmt.workflows.lifecycle import (
+    IAC_CREATE_DRIFT_WARNING,
     IAC_DRIFT_WARNING,
+    INSTANCE_CONFIGURATION_DERIVATION_NOTICE,
     WorkflowError,
     WorkflowNotFound,
     execute_node_removal,
+    execute_pool_create,
     execute_pool_resize,
     prepare_node_removal,
+    prepare_pool_create,
     prepare_pool_resize,
     readiness_status,
     resource_counts_match,
+    wait_for_pool_creation,
     wait_for_pool_size,
 )
-from oke_hpc_mgmt.models import PoolResourceReadiness
 
 
 def _service(snapshot: DiscoverySnapshot) -> Mock:
@@ -45,6 +51,230 @@ def _service(snapshot: DiscoverySnapshot) -> Mock:
 
 
 class LifecycleWorkflowTests(unittest.TestCase):
+    def test_prepare_pool_create_selects_conventional_template_and_builds_plan(self):
+        conventional = WorkerPoolInfo(
+            name="oke-rdma",
+            kind="cluster-network",
+            cluster_network_id="cluster-network-1",
+            instance_pool_id="instance-pool-1",
+            desired_size=2,
+        )
+        other = WorkerPoolInfo(
+            name="other-rdma",
+            kind="cluster-network",
+            cluster_network_id="cluster-network-2",
+            instance_pool_id="instance-pool-2",
+            desired_size=2,
+        )
+        service = _service(DiscoverySnapshot(pools=[other, conventional]))
+
+        prepared = prepare_pool_create(service, "oke-rdma-2", 2)
+
+        self.assertEqual(conventional, prepared.source_pool)
+        self.assertEqual("pool-create", prepared.plan.operation)
+        self.assertEqual("compute-management", prepared.plan.owner)
+        self.assertEqual(0, prepared.plan.current_size)
+        self.assertEqual(2, prepared.plan.target_size)
+        self.assertIn(IAC_CREATE_DRIFT_WARNING, prepared.plan.warnings)
+        self.assertIn(
+            INSTANCE_CONFIGURATION_DERIVATION_NOTICE,
+            prepared.plan.warnings,
+        )
+        service.resolve_oci_target.assert_called_once_with(require_compartment=True)
+        service.oci_backend.return_value.validate_cluster_network_pool_template.assert_called_once_with(
+            "cluster-network-1",
+            "instance-pool-1",
+            "oke-rdma-2",
+        )
+
+    def test_prepare_pool_create_supports_explicit_template(self):
+        source = WorkerPoolInfo(
+            name="source-rdma",
+            kind="cluster-network",
+            cluster_network_id="cluster-network-1",
+            instance_pool_id="instance-pool-1",
+        )
+        service = _service(DiscoverySnapshot(pools=[source]))
+
+        prepared = prepare_pool_create(
+            service,
+            "new-rdma",
+            1,
+            source_identifier="cluster-network-1",
+        )
+
+        self.assertEqual(source, prepared.source_pool)
+
+    def test_prepare_pool_create_rejects_duplicates_and_ambiguous_templates(self):
+        first = WorkerPoolInfo(
+            name="rdma-a",
+            kind="cluster-network",
+            cluster_network_id="cluster-network-1",
+            instance_pool_id="instance-pool-1",
+        )
+        second = WorkerPoolInfo(
+            name="rdma-b",
+            kind="cluster-network",
+            cluster_network_id="cluster-network-2",
+            instance_pool_id="instance-pool-2",
+        )
+        service = _service(DiscoverySnapshot(pools=[first, second]))
+
+        with self.assertRaisesRegex(WorkflowError, "already exists"):
+            prepare_pool_create(service, "RDMA-A", 1)
+        with self.assertRaisesRegex(WorkflowError, "--from-pool"):
+            prepare_pool_create(service, "rdma-c", 1)
+        with self.assertRaisesRegex(WorkflowError, "1-63 characters"):
+            prepare_pool_create(service, "invalid/pool", 1)
+
+    def test_prepare_pool_create_requires_complete_oci_inventory(self):
+        source = WorkerPoolInfo(
+            name="oke-rdma",
+            kind="cluster-network",
+            cluster_network_id="cluster-network-1",
+            instance_pool_id="instance-pool-1",
+        )
+        snapshot = DiscoverySnapshot(
+            pools=[source],
+            warnings=["Cluster network discovery skipped: access denied"],
+        )
+
+        with self.assertRaisesRegex(WorkflowError, "complete OCI pool discovery"):
+            prepare_pool_create(_service(snapshot), "new-rdma", 1)
+
+    def test_prepare_pool_create_rejects_non_cluster_network_source(self):
+        source = WorkerPoolInfo(
+            name="oke-rdma",
+            kind="node-pool",
+            node_pool_id="node-pool-1",
+        )
+        service = _service(DiscoverySnapshot(pools=[source]))
+
+        with self.assertRaisesRegex(WorkflowError, "Cluster Network-backed"):
+            prepare_pool_create(
+                service,
+                "new-rdma",
+                1,
+                source_identifier="oke-rdma",
+            )
+
+    def test_execute_pool_create_submits_clone_operation(self):
+        source = WorkerPoolInfo(
+            name="oke-rdma",
+            kind="cluster-network",
+            shape="BM.GPU4.8",
+            cluster_network_id="cluster-network-1",
+            instance_pool_id="instance-pool-1",
+        )
+        service = _service(DiscoverySnapshot(pools=[source]))
+        created = ClusterNetworkCreateResult(
+            cluster_network_id="cluster-network-new",
+            instance_configuration_id="instance-configuration-new",
+            instance_pool_id="instance-pool-new",
+            work_request_id="work-request-new",
+        )
+        backend = service.oci_backend.return_value
+        backend.create_cluster_network_pool.return_value = created
+        prepared = prepare_pool_create(service, "oke-rdma-2", 2)
+
+        result = execute_pool_create(service, prepared, lock=False)
+
+        backend.create_cluster_network_pool.assert_called_once_with(
+            "cluster-network-1",
+            "instance-pool-1",
+            "oke-rdma-2",
+            2,
+        )
+        self.assertEqual("submitted", result["status"])
+        self.assertEqual("cluster-network-new", result["cluster_network_id"])
+        self.assertEqual(
+            "instance-configuration-new",
+            result["instance_configuration_id"],
+        )
+        self.assertEqual("instance-pool-new", result["instance_pool_id"])
+
+    def test_execute_pool_create_rechecks_name_under_mutation_lock(self):
+        source = WorkerPoolInfo(
+            name="oke-rdma",
+            kind="cluster-network",
+            cluster_network_id="cluster-network-1",
+            instance_pool_id="instance-pool-1",
+        )
+        service = _service(DiscoverySnapshot(pools=[source]))
+        prepared = prepare_pool_create(service, "oke-rdma-2", 1)
+        duplicate = WorkerPoolInfo(
+            name="oke-rdma-2",
+            kind="cluster-network",
+            cluster_network_id="cluster-network-2",
+            instance_pool_id="instance-pool-2",
+        )
+        service.discover.return_value = DiscoverySnapshot(pools=[source, duplicate])
+
+        with self.assertRaisesRegex(WorkflowError, "already exists"):
+            execute_pool_create(service, prepared, lock=False)
+
+        service.oci_backend.return_value.create_cluster_network_pool.assert_not_called()
+
+    def test_wait_for_pool_creation_tolerates_discovery_delay_and_checks_readiness(self):
+        source = WorkerPoolInfo(
+            name="oke-rdma",
+            kind="cluster-network",
+            shape="BM.GPU4.8",
+            cluster_network_id="cluster-network-1",
+            instance_pool_id="instance-pool-1",
+            rdma_enabled=True,
+        )
+        created = ClusterNetworkCreateResult(
+            cluster_network_id="cluster-network-new",
+            instance_configuration_id="instance-configuration-new",
+            work_request_id="work-request-new",
+        )
+        observed = WorkerPoolInfo(
+            name="oke-rdma-2",
+            kind="cluster-network",
+            shape="BM.GPU4.8",
+            cluster_network_id="cluster-network-new",
+            instance_pool_id="instance-pool-new",
+            desired_size=1,
+            active_oci_instances=1,
+            ready_k8s_nodes=1,
+            gpu_resource="nvidia.com/gpu",
+            rdma_enabled=True,
+        )
+        ready_node = NodeInfo(
+            "rdma-new",
+            pool_name="oke-rdma-2",
+            shape="BM.GPU4.8",
+            ready=True,
+            allocatable={"nvidia.com/gpu": "8"},
+            labels={
+                "oci.oraclecloud.com/rdma.hpc_island_id": "island-1",
+                "oci.oraclecloud.com/rdma.network_block_id": "block-1",
+                "oci.oraclecloud.com/rdma.local_block_id": "local-1",
+            },
+        )
+        service = _service(DiscoverySnapshot(pools=[source]))
+        service.discover.side_effect = [
+            DiscoverySnapshot(),
+            DiscoverySnapshot(pools=[observed], nodes=[ready_node]),
+        ]
+        service.oci_backend.return_value.get_work_request_status.return_value = (
+            WorkRequestInfo("work-request-new", "SUCCEEDED")
+        )
+
+        with patch("oke_hpc_mgmt.workflows.lifecycle.time.sleep") as sleep:
+            result = wait_for_pool_creation(
+                service,
+                "oke-rdma-2",
+                1,
+                created,
+                timeout_seconds=10,
+                poll_interval_seconds=1,
+            )
+
+        self.assertEqual(observed, result)
+        sleep.assert_called_once_with(1)
+
     def test_prepare_pool_resize_builds_auditable_plan(self):
         pool = WorkerPoolInfo(
             name="oke-cpu",

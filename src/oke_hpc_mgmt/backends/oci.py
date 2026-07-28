@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import uuid
 from collections.abc import Callable
+from copy import deepcopy
 from typing import Any, TypeVar
 
-from oke_hpc_mgmt.models import AddonInfo, WorkerPoolInfo, WorkRequestInfo
+from oke_hpc_mgmt.models import (
+    AddonInfo,
+    ClusterNetworkCreateResult,
+    WorkerPoolInfo,
+    WorkRequestInfo,
+)
+from oke_hpc_mgmt.validation import normalize_pool_name
 
 
 class OciDiscoveryError(RuntimeError):
@@ -337,6 +345,296 @@ class OciBackend:
         )
         return response.headers.get("opc-work-request-id")
 
+    def create_cluster_network_pool(
+        self,
+        source_cluster_network_id: str,
+        source_instance_pool_id: str,
+        name: str,
+        size: int,
+    ) -> ClusterNetworkCreateResult:
+        try:
+            normalized_name = normalize_pool_name(name)
+        except ValueError as exc:
+            raise OciDiscoveryError(str(exc)) from exc
+        if size < 1:
+            raise OciDiscoveryError("Cluster Network pool size must be at least one.")
+
+        source, source_pool, placement = self._get_cluster_network_pool_source(
+            source_cluster_network_id,
+            source_instance_pool_id,
+        )
+        compartment_id = source.compartment_id
+        source_instance_configuration = self._get_instance_configuration_template(
+            source_pool.instance_configuration_id
+        )
+        instance_configuration_details = self._build_instance_configuration_details(
+            source_instance_configuration,
+            compartment_id,
+            normalized_name,
+        )
+        instance_configuration_response = self._call(
+            "Instance Configuration creation",
+            self.compute_mgmt.create_instance_configuration,
+            instance_configuration_details,
+            opc_retry_token=str(uuid.uuid4()),
+        )
+        instance_configuration_id = getattr(
+            instance_configuration_response.data,
+            "id",
+            None,
+        )
+        if not instance_configuration_id:
+            raise OciDiscoveryError(
+                "Instance Configuration creation did not return the new resource OCID."
+            )
+
+        primary_vnic_subnets = getattr(placement, "primary_vnic_subnets", None)
+        placement_details = self.oci.core.models.ClusterNetworkPlacementConfigurationDetails(
+            availability_domain=placement.availability_domain,
+            placement_constraint=placement.placement_constraint,
+            primary_subnet_id=(
+                None
+                if primary_vnic_subnets
+                else getattr(placement, "primary_subnet_id", None)
+            ),
+            primary_vnic_subnets=primary_vnic_subnets,
+            secondary_vnic_subnets=getattr(placement, "secondary_vnic_subnets", None),
+        )
+        instance_pool_details = (
+            self.oci.core.models.CreateClusterNetworkInstancePoolDetails(
+                display_name=normalized_name,
+                freeform_tags=_clone_pool_freeform_tags(
+                    getattr(source_pool, "freeform_tags", None),
+                    normalized_name,
+                ),
+                instance_configuration_id=instance_configuration_id,
+                size=size,
+            )
+        )
+        create_details = self.oci.core.models.CreateClusterNetworkDetails(
+            compartment_id=compartment_id,
+            display_name=normalized_name,
+            freeform_tags=_clone_pool_freeform_tags(
+                getattr(source, "freeform_tags", None),
+                normalized_name,
+            ),
+            instance_pools=[instance_pool_details],
+            placement_configuration=placement_details,
+        )
+        try:
+            response = self._call(
+                "Cluster Network pool creation",
+                self.compute_mgmt.create_cluster_network,
+                create_details,
+                opc_retry_token=str(uuid.uuid4()),
+            )
+        except OciDiscoveryError as exc:
+            raise OciDiscoveryError(
+                f"{exc} The derived Instance Configuration was created as "
+                f"{instance_configuration_id}; verify whether a Cluster Network "
+                "was created before removing it."
+            ) from exc
+        created = response.data
+        cluster_network_id = getattr(created, "id", None)
+        if not cluster_network_id:
+            raise OciDiscoveryError(
+                "Cluster Network creation did not return the new resource OCID. "
+                f"The derived Instance Configuration is {instance_configuration_id}."
+            )
+        created_pools = list(getattr(created, "instance_pools", None) or [])
+        headers = getattr(response, "headers", None) or {}
+        return ClusterNetworkCreateResult(
+            cluster_network_id=cluster_network_id,
+            instance_configuration_id=instance_configuration_id,
+            instance_pool_id=(
+                getattr(created_pools[0], "id", None) if created_pools else None
+            ),
+            work_request_id=headers.get("opc-work-request-id"),
+        )
+
+    def validate_cluster_network_pool_template(
+        self,
+        source_cluster_network_id: str,
+        source_instance_pool_id: str,
+        name: str,
+    ) -> None:
+        try:
+            normalized_name = normalize_pool_name(name)
+        except ValueError as exc:
+            raise OciDiscoveryError(str(exc)) from exc
+        source, source_pool, _placement = self._get_cluster_network_pool_source(
+            source_cluster_network_id,
+            source_instance_pool_id,
+        )
+        source_instance_configuration = self._get_instance_configuration_template(
+            source_pool.instance_configuration_id
+        )
+        self._build_instance_configuration_details(
+            source_instance_configuration,
+            source.compartment_id,
+            normalized_name,
+        )
+
+    def _get_instance_configuration_template(
+        self,
+        instance_configuration_id: str,
+    ) -> Any:
+        source = self._call(
+            "Source Instance Configuration lookup",
+            self.compute_mgmt.get_instance_configuration,
+            instance_configuration_id,
+        ).data
+        if getattr(source, "deferred_fields", None):
+            raise OciDiscoveryError(
+                "Source Instance Configuration contains deferred fields and cannot "
+                "be cloned safely."
+            )
+        return source
+
+    def _build_instance_configuration_details(
+        self,
+        source: Any,
+        compartment_id: str,
+        name: str,
+    ) -> Any:
+        instance_details = deepcopy(getattr(source, "instance_details", None))
+        launch_details = getattr(instance_details, "launch_details", None)
+        if launch_details is None:
+            raise OciDiscoveryError(
+                "Source Instance Configuration does not expose compute launch details."
+            )
+
+        metadata = dict(getattr(launch_details, "metadata", None) or {})
+        required_metadata = (
+            "apiserver_host",
+            "cluster_ca_cert",
+            "oke-initial-node-labels",
+            "user_data",
+        )
+        missing_metadata = [
+            key for key in required_metadata if not metadata.get(key)
+        ]
+        if missing_metadata:
+            raise OciDiscoveryError(
+                "Source Instance Configuration is missing required OKE bootstrap "
+                f"metadata: {', '.join(missing_metadata)}"
+            )
+
+        metadata["oke-initial-node-labels"] = _retarget_oke_node_labels(
+            metadata["oke-initial-node-labels"],
+            name,
+        )
+        launch_details.metadata = metadata
+        launch_details.display_name = name
+        launch_details.freeform_tags = _clone_pool_freeform_tags(
+            getattr(launch_details, "freeform_tags", None),
+            name,
+        )
+        _retarget_vnic_tags(
+            getattr(launch_details, "create_vnic_details", None),
+            name,
+        )
+        for secondary_vnic in list(
+            getattr(instance_details, "secondary_vnics", None) or []
+        ):
+            _retarget_vnic_tags(
+                getattr(secondary_vnic, "create_vnic_details", None),
+                name,
+            )
+        for block_volume in list(
+            getattr(instance_details, "block_volumes", None) or []
+        ):
+            create_details = getattr(block_volume, "create_details", None)
+            if create_details is not None and getattr(
+                create_details,
+                "freeform_tags",
+                None,
+            ):
+                create_details.freeform_tags = _clone_pool_freeform_tags(
+                    create_details.freeform_tags,
+                    name,
+                )
+
+        return self.oci.core.models.CreateInstanceConfigurationDetails(
+            compartment_id=compartment_id,
+            display_name=name,
+            freeform_tags=_clone_pool_freeform_tags(
+                getattr(source, "freeform_tags", None),
+                name,
+            ),
+            source="NONE",
+            instance_details=instance_details,
+        )
+
+    def _get_cluster_network_pool_source(
+        self,
+        source_cluster_network_id: str,
+        source_instance_pool_id: str,
+    ) -> tuple[Any, Any, Any]:
+        source = self._call(
+            "Source Cluster Network lookup",
+            self.compute_mgmt.get_cluster_network,
+            source_cluster_network_id,
+        ).data
+        lifecycle_state = str(getattr(source, "lifecycle_state", "") or "").upper()
+        if lifecycle_state and lifecycle_state not in {"ACTIVE", "RUNNING"}:
+            raise OciDiscoveryError(
+                f"Source Cluster Network is not running: {lifecycle_state}"
+            )
+
+        source_pools = list(getattr(source, "instance_pools", None) or [])
+        source_pool = next(
+            (
+                pool
+                for pool in source_pools
+                if getattr(pool, "id", None) == source_instance_pool_id
+            ),
+            None,
+        )
+        if source_pool is None:
+            raise OciDiscoveryError(
+                f"Instance pool {source_instance_pool_id} is not part of "
+                f"cluster network {source_cluster_network_id}."
+            )
+
+        compartment_id = getattr(source, "compartment_id", None)
+        instance_configuration_id = getattr(
+            source_pool,
+            "instance_configuration_id",
+            None,
+        )
+        placement = getattr(source, "placement_configuration", None)
+        if not compartment_id:
+            raise OciDiscoveryError(
+                "Source Cluster Network does not expose its compartment OCID."
+            )
+        if not instance_configuration_id:
+            raise OciDiscoveryError(
+                "Source Cluster Network instance pool does not expose an "
+                "Instance Configuration OCID."
+            )
+        if placement is None:
+            raise OciDiscoveryError(
+                "Source Cluster Network does not expose its placement configuration."
+            )
+        if not getattr(placement, "availability_domain", None):
+            raise OciDiscoveryError(
+                "Source Cluster Network placement does not expose an availability domain."
+            )
+        if not (
+            getattr(placement, "primary_subnet_id", None)
+            or getattr(placement, "primary_vnic_subnets", None)
+        ):
+            raise OciDiscoveryError(
+                "Source Cluster Network placement does not expose primary VNIC "
+                "subnet configuration."
+            )
+        if not getattr(placement, "placement_constraint", None):
+            raise OciDiscoveryError(
+                "Source Cluster Network placement does not expose its placement constraint."
+            )
+        return source, source_pool, placement
+
     def resize_instance_pool(self, instance_pool_id: str, size: int) -> str | None:
         if size < 0:
             raise OciDiscoveryError("Instance pool size cannot be negative.")
@@ -585,3 +883,68 @@ def _gpu_resource_for_shape(shape: str | None) -> str | None:
     if ".MI" in shape:
         return "amd.com/gpu"
     return "nvidia.com/gpu"
+
+
+def _clone_pool_freeform_tags(
+    source_tags: dict[str, str] | None,
+    name: str,
+) -> dict[str, str]:
+    tags = dict(source_tags or {})
+    tags.pop("state_id", None)
+    tags["pool"] = name
+    tags.setdefault("role", "worker")
+    return tags
+
+
+def _retarget_vnic_tags(vnic_details: Any, name: str) -> None:
+    if vnic_details is None:
+        return
+    vnic_details.freeform_tags = _clone_pool_freeform_tags(
+        getattr(vnic_details, "freeform_tags", None),
+        name,
+    )
+
+
+def _retarget_oke_node_labels(labels: str, name: str) -> str:
+    replacements = {
+        "oke.oraclecloud.com/pool.mode": "cluster-network",
+        "oke.oraclecloud.com/pool.name": name,
+    }
+    removed = {
+        "oke.oraclecloud.com/tf.module",
+        "oke.oraclecloud.com/tf.state_id",
+    }
+    parsed: list[tuple[str, str, bool]] = []
+    seen: set[str] = set()
+
+    for raw_entry in labels.split(","):
+        entry = raw_entry.strip()
+        if not entry:
+            raise OciDiscoveryError(
+                "Source Instance Configuration contains an empty initial node label."
+            )
+        key, separator, value = entry.partition("=")
+        if not key or key != key.strip():
+            raise OciDiscoveryError(
+                "Source Instance Configuration contains an invalid initial node label."
+            )
+        if key in seen:
+            raise OciDiscoveryError(
+                f"Source Instance Configuration repeats initial node label: {key}"
+            )
+        seen.add(key)
+        if key in removed:
+            continue
+        if key in replacements:
+            parsed.append((key, replacements[key], True))
+        else:
+            parsed.append((key, value, bool(separator)))
+
+    for key, value in replacements.items():
+        if key not in seen:
+            parsed.append((key, value, True))
+
+    return ",".join(
+        f"{key}={value}" if has_separator else key
+        for key, value, has_separator in parsed
+    )

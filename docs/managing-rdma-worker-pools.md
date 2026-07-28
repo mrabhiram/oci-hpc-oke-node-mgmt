@@ -51,6 +51,39 @@ mgmt-oke --auth instance_principal --format json pools get oke-rdma
 A managed pool exposes `node_pool_id` and `compute_cluster_id`. A legacy pool
 exposes `cluster_network_id` and `instance_pool_id`.
 
+## Create A Cluster Network RDMA Pool
+
+Create a second self-managed Cluster Network pool from the existing `oke-rdma`
+configuration and placement:
+
+```bash
+mgmt-oke --auth instance_principal pools create oke-rdma-2 \
+  --count 2 \
+  --from-pool oke-rdma \
+  --dry-run \
+  --format json
+```
+
+Apply after reviewing the plan:
+
+```bash
+mgmt-oke --auth instance_principal pools create oke-rdma-2 \
+  --count 2 \
+  --from-pool oke-rdma \
+  --wait
+```
+
+This derives a new Instance Configuration from the source, preserving its
+image, cloud-init, OKE bootstrap metadata, and networking while retargeting
+instance tags, VNIC tags, and the initial Kubernetes pool label. It then creates
+a new Cluster Network and embedded Instance Pool. It does not create a managed
+OKE node pool or alter the source pool.
+
+See
+[Creating Cluster Network Worker Pools](./creating-cluster-network-pools.md)
+for source selection, safety checks, dry-run output, and infrastructure-as-code
+ownership.
+
 ## Add an RDMA Worker
 
 ```bash
@@ -94,9 +127,8 @@ For the legacy model, Compute Management increases the embedded Instance Pool
 size through `UpdateClusterNetwork`. Its existing Instance Configuration
 already contains cloud-init and OKE bootstrap configuration.
 
-No worker-pool creation command or per-instance bootstrap step is performed by
-`mgmt-oke`. The owning service launches capacity from the existing pool
-configuration.
+`pools add` changes the size of an existing pool. It does not invoke the
+separate `pools create` workflow.
 
 ## Remove RDMA Capacity
 

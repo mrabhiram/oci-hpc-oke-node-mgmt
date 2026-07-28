@@ -17,12 +17,14 @@ from oke_hpc_mgmt.commands.common import (
 from oke_hpc_mgmt.render import POOL_COLUMNS, pool_rows, print_records
 from oke_hpc_mgmt.workflows.lifecycle import (
     WorkflowNotFound,
+    execute_pool_create,
     execute_pool_resize,
+    prepare_pool_create,
     prepare_pool_resize,
 )
 
 
-@click.group(help="Discover and resize OCI HPC OKE worker pools.")
+@click.group(help="Discover, create, and resize OCI HPC OKE worker pools.")
 def pools() -> None:
     pass
 
@@ -57,6 +59,70 @@ def get_pool(state: CliState, pool: str, output_override: str | None) -> int:
     output = resolve_output(state, output_override)
     print_records(pool_rows([selected]), output, None if output == "json" else POOL_COLUMNS)
     print_discovery_warnings(snapshot.warnings)
+    return 0
+
+
+@pools.command(
+    "create",
+    help="Create a Cluster Network-backed pool from an existing RDMA pool.",
+)
+@click.argument("name")
+@click.option(
+    "--count",
+    type=click.IntRange(min=1),
+    required=True,
+    help="Initial number of workers.",
+)
+@click.option(
+    "--from-pool",
+    "source_identifier",
+    help="Source Cluster Network pool. Defaults to oke-rdma or the only eligible pool.",
+)
+@wait_options
+@mutation_options
+@output_option
+@pass_state
+def create_pool(
+    state: CliState,
+    name: str,
+    count: int,
+    source_identifier: str | None,
+    wait: bool,
+    timeout: int,
+    poll_interval: int,
+    dry_run: bool,
+    lock: bool,
+    yes: bool,
+    output_override: str | None,
+) -> int:
+    service = state.service(
+        include_pod_counts=False,
+        include_autoscaler=False,
+        include_kueue=False,
+    )
+    prepared = prepare_pool_create(
+        service,
+        name,
+        count,
+        source_identifier=source_identifier,
+    )
+    if dry_run:
+        emit_plans(state, output_override, [prepared.plan])
+        print_discovery_warnings(prepared.snapshot.warnings)
+        return 0
+
+    confirm_plans([prepared.plan], prepared.name, approved=yes)
+    result = execute_pool_create(
+        service,
+        prepared,
+        wait=wait,
+        timeout_seconds=timeout,
+        poll_interval_seconds=poll_interval,
+        lock=lock,
+        progress=progress,
+    )
+    print_records([result], resolve_output(state, output_override))
+    print_discovery_warnings(prepared.snapshot.warnings)
     return 0
 
 

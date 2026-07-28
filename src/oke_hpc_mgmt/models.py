@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-
 RDMA_LABEL_KEYS = (
     "oci.oraclecloud.com/rdma.hpc_island_id",
     "oci.oraclecloud.com/rdma.network_block_id",
@@ -280,6 +279,14 @@ class WorkRequestInfo:
     @property
     def failed(self) -> bool:
         return self.status.upper() in {"FAILED", "CANCELED", "CANCELLED"}
+
+
+@dataclass(frozen=True)
+class ClusterNetworkCreateResult:
+    cluster_network_id: str
+    instance_configuration_id: str
+    instance_pool_id: str | None = None
+    work_request_id: str | None = None
 
 
 def _valid_topology_value(value: str | None) -> bool:

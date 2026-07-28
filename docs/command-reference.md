@@ -27,7 +27,7 @@ Commands:
   autoscaler       Inspect Cluster Autoscaler ownership of worker pools.
   health           Run deterministic AI/HPC readiness checks.
   nodes            Discover, maintain, replace, or terminate workers.
-  pools            Discover and resize OCI HPC OKE worker pools.
+  pools            Discover, create, and resize OCI HPC OKE worker pools.
   recommendations  Show actionable findings derived from cluster health.
   reconcile        Run full OCI and Kubernetes discovery.
   status           Show concise AI/HPC cluster health and capacity status.
@@ -96,6 +96,26 @@ oke-cpu     node-pool        standard         VM.Standard.E5.Flex  1        1   
 oke-gpu     node-pool        standard         VM.GPU.A10.1         1        1           1          nvidia.com/gpu  no
 oke-system  node-pool        standard         VM.Standard.E5.Flex  2        2           2          -               no
 ```
+
+Create a self-managed Cluster Network pool from an existing RDMA pool:
+
+```bash
+mgmt-oke pools create <new-pool-name> \
+  --count 2 \
+  --from-pool <source-cluster-network-pool> \
+  --dry-run
+mgmt-oke pools create <new-pool-name> \
+  --count 2 \
+  --from-pool <source-cluster-network-pool> \
+  --wait
+```
+
+If `--from-pool` is omitted, the command uses `oke-rdma` when present or the
+only eligible Cluster Network pool. It validates and derives a new Instance
+Configuration with the new pool identity, then creates the Cluster Network. It
+refuses ambiguous source selection. See
+[Creating Cluster Network Worker Pools](./creating-cluster-network-pools.md)
+for the complete workflow and dry-run output.
 
 Set an exact desired size:
 

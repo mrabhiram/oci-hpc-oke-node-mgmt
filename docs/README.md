@@ -6,12 +6,12 @@ HPC OKE operator node. For the project overview and command summary, see the
 
 ## Output examples
 
-Every operational guide includes representative `mgmt-oke` output captured
-from version 0.4.0 against a running OCI HPC OKE cluster. Node names, IP
-addresses, topology identifiers, and OCI resource identifiers are replaced
-with stable example values. Pool counts, shapes, ownership classifications,
-resource counts, status values, and command behavior are retained. Add-on
-versions and capacity naturally vary by deployment.
+Operational guides include representative `mgmt-oke` output captured from live
+commands against a running OCI HPC OKE cluster. Node names, IP addresses,
+topology identifiers, and OCI resource identifiers are replaced with stable
+example values. Pool counts, shapes, ownership classifications, resource
+counts, status values, and command behavior are retained. Add-on versions and
+capacity naturally vary by deployment.
 
 ## Getting started
 
@@ -40,6 +40,9 @@ versions and capacity naturally vary by deployment.
 - [Resizing Worker Pools](./resizing-worker-pools.md): Add or remove capacity
   from managed OKE, Compute Cluster-backed, Cluster Network, and standalone
   Instance Pools.
+- [Creating Cluster Network Worker Pools](./creating-cluster-network-pools.md):
+  Create a self-managed RDMA pool by deriving a new launch template from an
+  existing Cluster Network pool.
 - [Removing and Replacing Worker Nodes](./removing-and-replacing-worker-nodes.md):
   Drain and terminate selected workers or replace them while preserving pool size.
 - [Managing RDMA Worker Pools](./managing-rdma-worker-pools.md): Operate both the

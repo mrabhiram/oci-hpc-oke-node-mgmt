@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import io
+import json
 import os
 import sys
 import unittest
@@ -19,7 +19,11 @@ from oke_hpc_mgmt.models import (
     OperationPlan,
     WorkerPoolInfo,
 )
-from oke_hpc_mgmt.workflows.lifecycle import PreparedNodeRemoval, PreparedPoolResize
+from oke_hpc_mgmt.workflows.lifecycle import (
+    PreparedNodeRemoval,
+    PreparedPoolCreate,
+    PreparedPoolResize,
+)
 from oke_hpc_mgmt.workflows.node_maintenance import PreparedNodeMaintenance
 
 
@@ -60,6 +64,13 @@ class CliTests(unittest.TestCase):
             "positive adds nodes; negative removes nodes",
             " ".join(result.output.split()),
         )
+
+    def test_pool_help_exposes_create_command(self):
+        result = self.runner.invoke(cli, ["pools", "--help"])
+
+        self.assertEqual(0, result.exit_code)
+        self.assertIn("create", result.output)
+        self.assertIn("Discover, create, and resize", result.output)
 
     def test_kube_context_environment_variable_is_not_used(self):
         service = Mock()
@@ -180,6 +191,55 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(0, result.exit_code, result.output)
         self.assertEqual(3, json.loads(result.output)[0]["target_size"])
+        execute.assert_not_called()
+
+    def test_pool_create_dry_run_prints_plan_without_execution(self):
+        source = WorkerPoolInfo(
+            name="oke-rdma",
+            kind="cluster-network",
+            cluster_network_id="cluster-network-1",
+            instance_pool_id="instance-pool-1",
+        )
+        prepared = PreparedPoolCreate(
+            snapshot=DiscoverySnapshot(pools=[source]),
+            source_pool=source,
+            name="oke-rdma-2",
+            count=2,
+            plan=OperationPlan(
+                operation="pool-create",
+                target="oke-rdma-2",
+                pool="oke-rdma-2",
+                current_size=0,
+                target_size=2,
+            ),
+        )
+        with (
+            patch(
+                "oke_hpc_mgmt.commands.pools.prepare_pool_create",
+                return_value=prepared,
+            ) as prepare,
+            patch("oke_hpc_mgmt.commands.pools.execute_pool_create") as execute,
+        ):
+            result = self.runner.invoke(
+                cli,
+                [
+                    "pools",
+                    "create",
+                    "oke-rdma-2",
+                    "--count",
+                    "2",
+                    "--from-pool",
+                    "oke-rdma",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual("pool-create", json.loads(result.output)[0]["operation"])
+        prepare.assert_called_once()
+        self.assertEqual("oke-rdma", prepare.call_args.kwargs["source_identifier"])
         execute.assert_not_called()
 
     def test_pool_add_translates_count_to_positive_delta(self):

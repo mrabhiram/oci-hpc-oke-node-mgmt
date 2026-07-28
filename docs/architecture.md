@@ -283,6 +283,51 @@ rerun a separate worker-pool creation workflow.
 Pool-level size reduction delegates instance selection to Compute Management.
 Use specific node removal when worker identity matters.
 
+### Legacy Cluster Network Creation
+
+`pools create` creates a second self-managed RDMA pool from an existing Cluster
+Network pool. The preparation phase requires complete OCI pool discovery,
+rejects duplicate names, and selects the source through `--from-pool`,
+conventional `oke-rdma` naming, or an unambiguous single candidate.
+
+The OCI backend reads the source Cluster Network and validates:
+
+- running lifecycle state
+- source Instance Pool membership
+- compartment OCID
+- Instance Configuration OCID
+- placement configuration
+- source Instance Configuration launch details
+- required OKE API server, CA certificate, node-label, and cloud-init metadata
+
+The backend deep-copies the source launch details and calls
+`CreateInstanceConfiguration`. The copy preserves the image, shape, cloud-init,
+OKE join metadata, agent settings, boot-volume settings, and networking. It
+updates instance and VNIC free-form tags, updates
+`oke.oraclecloud.com/pool.name`, enforces
+`oke.oraclecloud.com/pool.mode=cluster-network`, and removes the source
+Terraform module and state labels.
+
+It then calls `CreateClusterNetwork` with a new display name and initial size,
+one embedded Instance Pool, the derived Instance Configuration, and the source
+availability domain, subnet, and placement constraint. The source `state_id`
+free-form tag is removed from newly derived resources. Other free-form tags are
+preserved, and `pool` is set to the new name.
+
+The source Cluster Network and Instance Configuration remain unchanged. Cluster
+configuration fields that identify already allocated network blocks are not
+copied; Compute Management allocates placement for the new Cluster Network.
+
+If Instance Configuration creation succeeds but Cluster Network creation
+fails, the error reports the derived Instance Configuration OCID. Operators
+must first verify whether the Cluster Network request succeeded before removing
+that configuration.
+
+With `--wait`, the workflow tolerates the new resource not appearing in early
+inventory polls, monitors the returned work request, and then uses the same OCI,
+Kubernetes, GPU, RDMA topology, and applicable RDMA VF convergence checks as a
+resize.
+
 ### Legacy Node Removal Or Replacement
 
 For a node in a self-managed Cluster Network or standalone Instance Pool, the

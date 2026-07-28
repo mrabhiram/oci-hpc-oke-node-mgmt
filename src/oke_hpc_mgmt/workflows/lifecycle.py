@@ -3,12 +3,12 @@ from __future__ import annotations
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from typing import ContextManager
 
 from oke_hpc_mgmt.discovery import DiscoveryService
 from oke_hpc_mgmt.models import (
+    ClusterNetworkCreateResult,
     DiscoverySnapshot,
     DrainPod,
     NodeInfo,
@@ -18,11 +18,19 @@ from oke_hpc_mgmt.models import (
     WorkRequestInfo,
 )
 from oke_hpc_mgmt.selection import select_nodes
-
+from oke_hpc_mgmt.validation import normalize_pool_name
 
 IAC_DRIFT_WARNING = (
     "This direct OCI mutation does not update Terraform or OCI Resource Manager "
     "input values; reconcile the declared pool size before the next apply."
+)
+IAC_CREATE_DRIFT_WARNING = (
+    "This direct OCI mutation creates resources outside Terraform or OCI Resource "
+    "Manager state; import or declare the new pool before the next apply."
+)
+INSTANCE_CONFIGURATION_DERIVATION_NOTICE = (
+    "A new Instance Configuration is derived from the source; image, cloud-init, "
+    "and OKE bootstrap settings are preserved while pool identity is updated."
 )
 
 
@@ -42,6 +50,15 @@ class PreparedPoolResize:
 
 
 @dataclass(frozen=True)
+class PreparedPoolCreate:
+    snapshot: DiscoverySnapshot
+    source_pool: WorkerPoolInfo
+    name: str
+    count: int
+    plan: OperationPlan
+
+
+@dataclass(frozen=True)
 class PreparedNodeRemoval:
     snapshot: DiscoverySnapshot
     nodes: tuple[NodeInfo, ...]
@@ -57,6 +74,129 @@ class ResourceWorkRequestWatch:
     compartment_id: str
     resource_id: str
     ignored_ids: frozenset[str]
+
+
+def prepare_pool_create(
+    service: DiscoveryService,
+    name: str,
+    count: int,
+    source_identifier: str | None = None,
+) -> PreparedPoolCreate:
+    try:
+        normalized_name = normalize_pool_name(name)
+    except ValueError as exc:
+        raise WorkflowError(str(exc)) from exc
+    if count < 1:
+        raise WorkflowError("Pool count must be at least one.")
+    if service.options.auth == "none" or service.options.skip_oci:
+        raise WorkflowError(
+            "Pool creation requires OCI discovery. Use instance-principal "
+            "authentication on the operator host."
+        )
+
+    service.resolve_oci_target(require_compartment=True)
+    snapshot = service.discover()
+    _require_complete_pool_inventory(snapshot)
+    _ensure_pool_name_available(snapshot, normalized_name)
+
+    source_pool = _select_cluster_network_template(snapshot, source_identifier)
+    if not source_pool.cluster_network_id or not source_pool.instance_pool_id:
+        raise WorkflowError(
+            f"Source pool is missing its Cluster Network backing identifiers: "
+            f"{source_pool.name}"
+        )
+    service.oci_backend().validate_cluster_network_pool_template(
+        source_pool.cluster_network_id,
+        source_pool.instance_pool_id,
+        normalized_name,
+    )
+    plan = OperationPlan(
+        operation="pool-create",
+        target=normalized_name,
+        pool=normalized_name,
+        owner="compute-management",
+        current_size=0,
+        target_size=count,
+        steps=(
+            f"derive an Instance Configuration from {source_pool.name}",
+            "retarget instance, VNIC, and Kubernetes node pool identity",
+            "create a Cluster Network with one embedded Instance Pool",
+            "allow the inherited cloud-init to bootstrap workers into OKE",
+        ),
+        warnings=(
+            INSTANCE_CONFIGURATION_DERIVATION_NOTICE,
+            IAC_CREATE_DRIFT_WARNING,
+        ),
+    )
+    return PreparedPoolCreate(
+        snapshot=snapshot,
+        source_pool=source_pool,
+        name=normalized_name,
+        count=count,
+        plan=plan,
+    )
+
+
+def execute_pool_create(
+    service: DiscoveryService,
+    prepared: PreparedPoolCreate,
+    wait: bool = False,
+    timeout_seconds: int = 1800,
+    poll_interval_seconds: int = 30,
+    lock: bool = True,
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, object]:
+    source_pool = prepared.source_pool
+    if not source_pool.cluster_network_id or not source_pool.instance_pool_id:
+        raise WorkflowError(
+            f"Source pool is missing its Cluster Network backing identifiers: "
+            f"{source_pool.name}"
+        )
+
+    with mutation_lock(service, lock, timeout_seconds):
+        current_snapshot = service.discover()
+        _require_complete_pool_inventory(current_snapshot)
+        _ensure_pool_name_available(current_snapshot, prepared.name)
+        current_source = current_snapshot.pool_by_name(
+            source_pool.cluster_network_id
+        )
+        if (
+            current_source is None
+            or current_source.kind != "cluster-network"
+            or not current_source.cluster_network_id
+            or not current_source.instance_pool_id
+        ):
+            raise WorkflowError(
+                f"Source Cluster Network pool changed after planning: "
+                f"{source_pool.name}"
+            )
+
+        created = service.oci_backend().create_cluster_network_pool(
+            current_source.cluster_network_id,
+            current_source.instance_pool_id,
+            prepared.name,
+            prepared.count,
+        )
+        observed_pool: WorkerPoolInfo | None = None
+        status = "submitted"
+        if wait:
+            observed_pool = wait_for_pool_creation(
+                service,
+                prepared.name,
+                prepared.count,
+                created,
+                timeout_seconds,
+                poll_interval_seconds,
+                require_rdma_vf=source_pool.rdma_vf_required,
+                progress=progress,
+            )
+            status = "ready"
+    return pool_create_result_row(
+        prepared,
+        created,
+        observed_pool=observed_pool,
+        status=status,
+    )
 
 
 def prepare_pool_resize(
@@ -417,7 +557,7 @@ def mutation_lock(
     service: DiscoveryService,
     enabled: bool,
     timeout_seconds: int,
-) -> ContextManager[str | None]:
+) -> AbstractContextManager[str | None]:
     if not enabled:
         return nullcontext(None)
     if service.options.skip_kubernetes:
@@ -467,6 +607,53 @@ def wait_for_pool_size(
         if time.monotonic() >= deadline:
             raise TimeoutError(
                 f"Timed out waiting for {pool_name} to reach size {target_size}. Last status: {status}"
+            )
+        time.sleep(poll_interval_seconds)
+
+
+def wait_for_pool_creation(
+    service: DiscoveryService,
+    pool_name: str,
+    target_size: int,
+    created: ClusterNetworkCreateResult,
+    timeout_seconds: int,
+    poll_interval_seconds: int,
+    require_rdma_vf: bool = False,
+    progress: Callable[[str], None] | None = None,
+) -> WorkerPoolInfo:
+    deadline = time.monotonic() + timeout_seconds
+    last_status = ""
+    _configure_wait_discovery(service)
+    while True:
+        _raise_for_failed_work_requests(
+            service,
+            (created.work_request_id,) if created.work_request_id else (),
+        )
+        snapshot = service.discover()
+        pool = snapshot.pool_by_name(created.cluster_network_id)
+        if pool is None:
+            pool = snapshot.pool_by_name(pool_name)
+
+        if pool is None:
+            status = f"{pool_name}: awaiting OCI discovery"
+        else:
+            pool.rdma_vf_required = pool.rdma_vf_required or require_rdma_vf
+            readiness = pool_resource_readiness(snapshot, pool)
+            status = (
+                f"{pool.name}: desired={pool.desired_size} "
+                f"oci_active={pool.active_oci_instances} "
+                f"k8s_ready={pool.ready_k8s_nodes}{readiness_status(readiness)}"
+            )
+            if _pool_matches_target(pool, readiness, target_size):
+                return pool
+
+        if progress and status != last_status:
+            progress(status)
+            last_status = status
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Timed out waiting for {pool_name} to be created at size "
+                f"{target_size}. Last status: {status}"
             )
         time.sleep(poll_interval_seconds)
 
@@ -600,6 +787,36 @@ def resize_result_row(
     }
 
 
+def pool_create_result_row(
+    prepared: PreparedPoolCreate,
+    created: ClusterNetworkCreateResult,
+    observed_pool: WorkerPoolInfo | None,
+    status: str,
+) -> dict[str, object]:
+    source_pool = prepared.source_pool
+    return {
+        "name": prepared.name,
+        "kind": "cluster-network",
+        "placement": "cluster-network",
+        "source_pool": source_pool.name,
+        "shape": observed_pool.shape if observed_pool else source_pool.shape,
+        "target_size": prepared.count,
+        "oci_active": (
+            observed_pool.active_oci_instances if observed_pool else None
+        ),
+        "k8s_ready": observed_pool.ready_k8s_nodes if observed_pool else 0,
+        "status": status,
+        "cluster_network_id": created.cluster_network_id,
+        "instance_pool_id": (
+            observed_pool.instance_pool_id
+            if observed_pool and observed_pool.instance_pool_id
+            else created.instance_pool_id
+        ),
+        "work_request_id": created.work_request_id,
+        "instance_configuration_id": created.instance_configuration_id,
+    }
+
+
 def node_remove_result_row(
     pool: WorkerPoolInfo,
     node: NodeInfo,
@@ -630,6 +847,71 @@ def _validate_pool_mutation(pool: WorkerPoolInfo) -> None:
         )
     if pool.autoscaler_owned:
         raise WorkflowError(f"Refusing to mutate autoscaler-owned pool: {pool.name}")
+
+
+def _select_cluster_network_template(
+    snapshot: DiscoverySnapshot,
+    source_identifier: str | None,
+) -> WorkerPoolInfo:
+    candidates = [
+        pool
+        for pool in snapshot.pools
+        if pool.kind == "cluster-network"
+        and pool.cluster_network_id
+        and pool.instance_pool_id
+    ]
+    if source_identifier:
+        selected = snapshot.pool_by_name(source_identifier)
+        if selected is None:
+            raise WorkflowNotFound(f"Source pool not found: {source_identifier}")
+        if selected not in candidates:
+            raise WorkflowError(
+                f"Source pool must be a Cluster Network-backed pool: {selected.name}"
+            )
+        return selected
+
+    conventional = [pool for pool in candidates if pool.name == "oke-rdma"]
+    if len(conventional) == 1:
+        return conventional[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise WorkflowError(
+            "No Cluster Network-backed pool is available as a creation template."
+        )
+    names = ", ".join(sorted(pool.name for pool in candidates))
+    raise WorkflowError(
+        "Multiple Cluster Network-backed pools are available. Select one with "
+        f"--from-pool: {names}"
+    )
+
+
+def _ensure_pool_name_available(
+    snapshot: DiscoverySnapshot,
+    name: str,
+) -> None:
+    if any(pool.name.casefold() == name.casefold() for pool in snapshot.pools):
+        raise WorkflowError(f"A worker pool named '{name}' already exists.")
+
+
+def _require_complete_pool_inventory(snapshot: DiscoverySnapshot) -> None:
+    if not snapshot.oci_discovery_enabled:
+        raise WorkflowError("Pool creation requires complete OCI pool discovery.")
+    failure_prefixes = (
+        "Managed node pool discovery skipped:",
+        "Cluster network discovery skipped:",
+        "Standalone instance pool discovery skipped:",
+    )
+    failures = [
+        warning
+        for warning in snapshot.warnings
+        if warning.startswith(failure_prefixes)
+    ]
+    if failures:
+        raise WorkflowError(
+            "Pool creation requires complete OCI pool discovery: "
+            + " ".join(failures)
+        )
 
 
 def _pool_owner(pool: WorkerPoolInfo) -> tuple[str, str]:
