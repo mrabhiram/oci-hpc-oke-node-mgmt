@@ -591,6 +591,10 @@ mypy src
   prerequisites, installation, authentication, validation, and troubleshooting
 - [`docs/command-reference.md`](docs/command-reference.md): complete command,
   selector, mutation-option, output, and exit-status reference
+- [`docs/live-pool-creation-validation.md`](docs/live-pool-creation-validation.md):
+  sanitized output from live managed GPU and self-managed RDMA creation validation
+- [`docs/live-pool-deletion-validation.md`](docs/live-pool-deletion-validation.md):
+  sanitized output from live managed GPU deletion and RDMA deletion planning
 - [`docs/scope.md`](docs/scope.md): implemented features and planned items
 
 ## Cluster Validation

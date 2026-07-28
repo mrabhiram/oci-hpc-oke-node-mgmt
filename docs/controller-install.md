@@ -284,6 +284,9 @@ CPU and GPU submit OKE `CreateNodePool`. RDMA derives a new Instance
 Configuration and creates a Cluster Network with an embedded Instance Pool.
 See [`creating-worker-pools.md`](creating-worker-pools.md) and
 [`worker-bootstrap-and-storage.md`](worker-bootstrap-and-storage.md).
+Sanitized live lifecycle output is available in
+[`live-pool-creation-validation.md`](live-pool-creation-validation.md) and
+[`live-pool-deletion-validation.md`](live-pool-deletion-validation.md).
 
 A negative delta reduces capacity but does not select the departing worker. Use
 `nodes terminate` when a particular worker must be removed.

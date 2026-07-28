@@ -51,6 +51,15 @@ capacity naturally vary by deployment.
 - [Managing RDMA Worker Pools](./managing-rdma-worker-pools.md): Operate both the
   OKE v26.7 Compute Cluster model and legacy self-managed Cluster Network model.
 
+## Live lifecycle validation
+
+- [Live Worker Pool Creation Validation](./live-pool-creation-validation.md):
+  Review sanitized output from managed GPU creation, self-managed RDMA
+  creation planning, and a capacity-limited RDMA submission.
+- [Live Worker Pool Deletion Validation](./live-pool-deletion-validation.md):
+  Review sanitized output from managed GPU deletion, RDMA deletion planning,
+  ownership-aware cleanup, and system-pool protection.
+
 ## Safety and troubleshooting
 
 - [Cluster Autoscaler and Slinky Safety](./cluster-autoscaler-and-slinky-safety.md):

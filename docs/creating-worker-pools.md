@@ -252,6 +252,11 @@ mgmt-oke health run --type rdma --pool <new-pool>
 mgmt-oke addons validate --target rdma --pool <new-pool>
 ```
 
+See [Live Worker Pool Creation Validation](./live-pool-creation-validation.md)
+for sanitized output from a successful managed GPU creation, an inherited RDMA
+plan, and an RDMA submission that reached OCI but was rejected for unavailable
+Cluster Network capacity.
+
 ## Delete a Complete Pool
 
 Preview deletion before draining or terminating anything:
@@ -274,3 +279,7 @@ is supplied. With `--wait`, a Cluster Network created by `mgmt-oke` also has
 its derived Instance Configuration removed after termination. The ownership
 tag is revalidated immediately before deletion; stack-owned configurations are
 preserved. `--no-wait` retains and reports the derived configuration.
+
+See [Live Worker Pool Deletion Validation](./live-pool-deletion-validation.md)
+for managed deletion output, the self-managed RDMA termination plan, and the
+system-pool protection result captured from live commands.

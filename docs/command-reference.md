@@ -121,7 +121,9 @@ values are inherited from the matching source.
 
 See [Creating Worker Pools](./creating-worker-pools.md) and
 [Worker Bootstrap and Storage](./worker-bootstrap-and-storage.md) for the full
-option matrix and examples.
+option matrix and examples. [Live Worker Pool Creation
+Validation](./live-pool-creation-validation.md) contains sanitized output from
+live managed GPU and self-managed RDMA creation operations.
 
 Delete an entire pool:
 
@@ -137,6 +139,9 @@ Slinky-managed pools and protects `oke-system` unless
 For a Cluster Network created by this tool, `--wait` also removes its derived
 Instance Configuration after termination. `--no-wait` retains and reports that
 configuration. Stack-owned configurations are never removed by this cleanup.
+See [Live Worker Pool Deletion
+Validation](./live-pool-deletion-validation.md) for live managed deletion
+output and the reviewed RDMA deletion plan.
 
 Set an exact desired size:
 

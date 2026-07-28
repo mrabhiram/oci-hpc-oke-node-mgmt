@@ -69,6 +69,9 @@ Management Tool.
 - [`architecture.md`](architecture.md)
 - [`controller-install.md`](controller-install.md)
 - [`command-reference.md`](command-reference.md)
+- [`creating-worker-pools.md`](creating-worker-pools.md)
+- [`live-pool-creation-validation.md`](live-pool-creation-validation.md)
+- [`live-pool-deletion-validation.md`](live-pool-deletion-validation.md)
 
 ## Not Implemented Yet
 

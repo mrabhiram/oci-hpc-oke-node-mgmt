@@ -14,6 +14,11 @@ Use `nodes terminate` instead of pool-level scale-down when the identity of the
 departing worker matters. `pools resize --delta -1` reduces capacity but leaves
 worker selection to the owning OCI service.
 
+To drain and remove an entire owning pool rather than selected workers, use
+`pools delete`. See [Live Worker Pool Deletion
+Validation](./live-pool-deletion-validation.md) for a managed deletion and a
+self-managed RDMA deletion plan captured from live commands.
+
 Default behavior removes the selected node and decrements desired pool size.
 `--keep-size` removes the selected node without decrementing desired size, so
 the owning service launches a replacement.
