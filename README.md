@@ -25,6 +25,8 @@ management for OCI HPC OKE clusters:
 - compose the official OCI HPC OKE worker bootstrap for existing FSS and Lustre
   mounts and local NVMe RAID `[Implemented]`
 - resize standard and Compute Cluster-backed OKE node pools and self-managed cluster-network pools `[Implemented]`
+- drain and delete complete managed OKE, Cluster Network, or standalone Instance
+  Pool worker pools `[Implemented]`
 - add or remove pool capacity with explicit `pools add` and `pools remove` commands `[Implemented]`
 - preview every mutation as a validated operation plan with `--dry-run` `[Implemented]`
 - serialize concurrent mutations with a Kubernetes Lease `[Implemented]`
@@ -38,7 +40,7 @@ management for OCI HPC OKE clusters:
 - validate OKE accelerator add-ons against discovered GPU and RDMA capacity `[Implemented]`
 
 Inventory, status, health, recommendation, topology, autoscaler, add-on status,
-and reconciliation commands are read-only. Pool creation, capacity
+and reconciliation commands are read-only. Pool creation, deletion, capacity
 commands, and node termination mutate OCI resources. Node maintenance commands
 mutate Kubernetes. Every mutation supports `--dry-run`, uses a Kubernetes Lease
 by default, and requires either `--yes` or an interactive typed confirmation.
@@ -120,6 +122,7 @@ Command groups:
 | `pools list` | List discovered worker pools. |
 | `pools get <pool>` | Get one worker pool by name or OCID. |
 | `pools create <name> --type <cpu\|gpu\|rdma> --count <n>` | Create a managed CPU/GPU pool or self-managed RDMA Cluster Network pool from an existing stack pool template. |
+| `pools delete <pool>` | Drain workers and delete the complete owning pool resource. |
 | `pools resize <pool> (--size <n> \| --delta <n>)` | Resize a managed OKE node pool, cluster network, or instance pool. |
 | `pools add <pool> --count <n>` | Add `n` workers to desired pool capacity. |
 | `pools remove <pool> --count <n>` | Remove `n` workers from desired pool capacity; OCI selects the workers. |
@@ -138,7 +141,7 @@ Command groups:
 | `health run` | Run deterministic health checks by category or pool. |
 | `recommendations list` | Show actionable warnings and failures. |
 | `reconcile` | Show a full discovery snapshot. |
-| `clusters list\|create\|add node` | Slurm-style compatibility aliases for worker-pool lifecycle commands. These aliases do not create the OKE control plane. |
+| `clusters list\|create\|delete\|add node` | Slurm-style compatibility aliases for worker-pool lifecycle commands. These aliases do not create or delete the OKE control plane. |
 
 Pool creation options:
 
@@ -151,7 +154,7 @@ Pool creation options:
 | `--pod-subnet-id`, `--node-nsg-id`, `--pod-nsg-id` | Override worker and VCN-native pod networking. Repeat where supported. |
 | `--boot-volume-*`, `--ocpus`, `--memory-in-gbs` | Override boot-volume and Flex-shape settings. |
 | `--kubernetes-version`, `--max-pods-per-node`, `--node-label`, `--node-metadata` | Override worker bootstrap and Kubernetes registration settings. |
-| `--storage-mode append\|replace` with `--nvme-*`, `--fss-*`, or `--lustre-*` | Compose selected official OCI HPC OKE storage bootstrap scripts into inherited cloud-init. |
+| `--storage-mode inherit\|append\|replace` with `--nvme-*`, `--fss-*`, or `--lustre-*` | Preserve inherited storage bootstrap by default, or compose selected official OCI HPC OKE storage scripts. |
 
 Run `mgmt-oke pools create --help` for the complete authoritative option list.
 See [Creating Worker Pools](docs/creating-worker-pools.md) and
@@ -346,6 +349,17 @@ retargeted, and the source remains unchanged. CPU and GPU use OKE
 Management `CreateClusterNetwork`. Apply a reviewed plan by removing
 `--dry-run`, adding `--wait`, and completing the typed confirmation.
 
+Delete a complete pool after reviewing its drain and ownership plan:
+
+```bash
+mgmt-oke pools delete gpu-training --dry-run --format json
+mgmt-oke pools delete gpu-training --wait
+```
+
+For an RDMA pool created by `mgmt-oke`, `--wait` also removes the derived
+Instance Configuration after the Cluster Network terminates. Stack-owned
+Instance Configurations are preserved.
+
 See [Creating Worker Pools](docs/creating-worker-pools.md) for complete examples,
 validation behavior, and infrastructure-as-code ownership guidance.
 
@@ -525,7 +539,7 @@ addition to GPU and OCI RDMA topology readiness.
 
 ## Resource Ownership
 
-Pool creation, capacity changes, and node termination update live OCI
+Pool creation, deletion, capacity changes, and node termination update live OCI
 resources. Before confirmation, the CLI reports that these direct mutations do
 not update Terraform or OCI Resource Manager state or input values. Import,
 declare, or remove the corresponding resources and variables before a later

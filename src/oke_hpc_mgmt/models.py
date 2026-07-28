@@ -167,6 +167,8 @@ class WorkerPoolInfo:
     autoscaler_max: int | None = None
     kueue_flavor: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
+    instance_configuration_id: str | None = None
+    created_by_mgmt_oke: bool = False
 
     @property
     def backing_id(self) -> str | None:

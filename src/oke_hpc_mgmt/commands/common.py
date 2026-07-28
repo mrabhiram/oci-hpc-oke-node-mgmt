@@ -13,7 +13,6 @@ from oke_hpc_mgmt.models import HealthResult, OperationPlan
 from oke_hpc_mgmt.render import operation_plan_rows, print_records, print_warnings
 from oke_hpc_mgmt.selection import split_identifiers
 
-
 OUTPUT_FORMATS = ("table", "json", "csv")
 AUTH_METHODS = ("config_file", "instance_principal", "resource_principal", "none")
 
@@ -106,7 +105,7 @@ def wait_options(function: CommandFunction) -> CommandFunction:
         type=click.IntRange(min=1),
         default=30,
         show_default=True,
-        help="Seconds between readiness checks.",
+        help="Seconds between operation-state checks.",
     )(function)
     function = click.option(
         "--timeout",
@@ -118,7 +117,7 @@ def wait_options(function: CommandFunction) -> CommandFunction:
     function = click.option(
         "--wait/--no-wait",
         default=False,
-        help="Wait for OCI, Kubernetes, GPU, and applicable RDMA readiness.",
+        help="Wait for the operation and observed OCI/Kubernetes state to converge.",
     )(function)
     return function
 

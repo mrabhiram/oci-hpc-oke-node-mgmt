@@ -56,6 +56,18 @@ class PreparedPoolResize:
 
 
 @dataclass(frozen=True)
+class PreparedPoolDelete:
+    snapshot: DiscoverySnapshot
+    pool: WorkerPoolInfo
+    nodes: tuple[NodeInfo, ...]
+    drain_pods: dict[str, tuple[DrainPod, ...]]
+    allow_workloads: bool
+    delete_emptydir_data: bool
+    force_unmanaged: bool
+    plan: OperationPlan
+
+
+@dataclass(frozen=True)
 class PreparedPoolCreate:
     snapshot: DiscoverySnapshot
     source_pool: WorkerPoolInfo
@@ -260,22 +272,326 @@ def execute_pool_create(
         observed_pool: WorkerPoolInfo | None = None
         status = "submitted"
         if wait:
-            observed_pool = wait_for_pool_creation(
-                service,
-                prepared.name,
-                prepared.count,
-                created,
-                timeout_seconds,
-                poll_interval_seconds,
-                require_rdma_vf=source_pool.rdma_vf_required,
-                progress=progress,
-            )
+            try:
+                observed_pool = wait_for_pool_creation(
+                    service,
+                    prepared.name,
+                    prepared.count,
+                    created,
+                    timeout_seconds,
+                    poll_interval_seconds,
+                    require_rdma_vf=source_pool.rdma_vf_required,
+                    progress=progress,
+                )
+            except Exception as exc:
+                if isinstance(created, ClusterNetworkCreateResult):
+                    raise WorkflowError(
+                        f"{exc} Created Cluster Network "
+                        f"{created.cluster_network_id} and derived Instance "
+                        f"Configuration {created.instance_configuration_id} "
+                        "may require cleanup."
+                    ) from exc
+                raise
             status = "ready"
     return pool_create_result_row(
         prepared,
         created,
         observed_pool=observed_pool,
         status=status,
+    )
+
+
+def prepare_pool_delete(
+    service: DiscoveryService,
+    pool_identifier: str,
+    *,
+    drain: bool = True,
+    allow_workloads: bool = False,
+    delete_emptydir_data: bool = False,
+    force_unmanaged: bool = False,
+    allow_system_pool: bool = False,
+    drain_grace_period_seconds: int = 30,
+) -> PreparedPoolDelete:
+    if service.options.auth == "none" or service.options.skip_oci:
+        raise WorkflowError(
+            "Pool deletion requires OCI discovery. Use instance-principal "
+            "authentication on the operator host."
+        )
+    service.resolve_oci_target(require_compartment=True)
+    snapshot = service.discover()
+    _require_complete_pool_inventory(snapshot)
+    kubernetes_unavailable = (
+        service.options.skip_kubernetes
+        or any(
+            warning.startswith("Kubernetes discovery skipped:")
+            for warning in snapshot.warnings
+        )
+    )
+    if kubernetes_unavailable:
+        if drain:
+            raise WorkflowError(
+                "Pool deletion with drain requires successful Kubernetes discovery."
+            )
+        if not allow_workloads:
+            raise WorkflowError(
+                "Kubernetes discovery is unavailable, so workload presence cannot "
+                "be verified. Use --no-drain with --allow-workloads only after "
+                "explicit review."
+            )
+    pool = snapshot.pool_by_name(pool_identifier)
+    if pool is None:
+        raise WorkflowNotFound(f"Pool not found: {pool_identifier}")
+    _validate_pool_mutation(pool)
+    if pool.name == "oke-system" and not allow_system_pool:
+        raise WorkflowError(
+            "Refusing to delete the OKE system pool. Use --allow-system-pool "
+            "only after another system-capable pool is ready."
+        )
+    if pool.slinky_managed:
+        raise WorkflowError(_slinky_pool_mutation_error(pool.name))
+
+    nodes = tuple(_nodes_for_pool(snapshot, pool))
+    if not drain and not allow_workloads:
+        busy = [node for node in nodes if node.running_workload_pods]
+        if busy:
+            raise WorkflowError(
+                f"Refusing to delete {pool.name} without drain: "
+                f"{sum(node.running_workload_pods for node in busy)} workload "
+                "pod(s) are running. Use --drain or --allow-workloads."
+            )
+
+    drain_pods: dict[str, tuple[DrainPod, ...]] = {}
+    if drain:
+        kubernetes = service.kubernetes_backend()
+        for node in nodes:
+            pods = kubernetes.list_drain_pods(
+                node.k8s_name,
+                grace_period_seconds=drain_grace_period_seconds,
+                check_evictions=True,
+            )
+            _validate_drain_pods(
+                node,
+                pods,
+                delete_emptydir_data,
+                force_unmanaged,
+            )
+            drain_pods[node.k8s_name] = tuple(pods)
+
+    owner, delete_step = _pool_delete_owner(pool)
+    owned_instance_configuration_id = (
+        pool.instance_configuration_id
+        if (
+            pool.kind == "cluster-network"
+            and pool.created_by_mgmt_oke
+            and pool.instance_configuration_id
+        )
+        else None
+    )
+    steps: list[str] = []
+    warnings = [
+        "Pool deletion permanently removes its workers and their boot volumes.",
+        IAC_DRIFT_WARNING,
+    ]
+    if drain and nodes:
+        blockers = [
+            f"{pod.namespace}/{pod.name} ({pod.eviction_blocker})"
+            for pods in drain_pods.values()
+            for pod in pods
+            if pod.eviction_blocker
+        ]
+        if blockers:
+            warnings.append(
+                "Eviction dry-run reported blockers: " + ", ".join(blockers)
+            )
+        steps.extend(
+            (
+                "cordon every Kubernetes node in the pool",
+                "evict non-DaemonSet pods through the Eviction API",
+            )
+        )
+    elif nodes:
+        warnings.insert(0, "Pool deletion will proceed without Kubernetes drain.")
+    steps.append(delete_step)
+    if owned_instance_configuration_id:
+        steps.append(
+            "with --wait, delete the mgmt-oke-owned Instance Configuration "
+            "after Cluster Network termination"
+        )
+        warnings.append(
+            "Automatic cleanup of the derived Instance Configuration requires "
+            "--wait; --no-wait retains it for manual cleanup."
+        )
+    return PreparedPoolDelete(
+        snapshot=snapshot,
+        pool=pool,
+        nodes=nodes,
+        drain_pods=drain_pods,
+        allow_workloads=allow_workloads,
+        delete_emptydir_data=delete_emptydir_data,
+        force_unmanaged=force_unmanaged,
+        plan=OperationPlan(
+            operation="pool-delete",
+            target=pool.name,
+            pool=pool.name,
+            owner=owner,
+            current_size=pool.desired_size,
+            target_size=0,
+            workload_pods=sum(node.running_workload_pods for node in nodes),
+            steps=tuple(steps),
+            warnings=tuple(warnings),
+            details={
+                "kind": pool.kind,
+                "placement": pool.placement_type,
+                "nodes": [node.k8s_name for node in nodes],
+                "instance_configuration_id": owned_instance_configuration_id,
+            },
+        ),
+    )
+
+
+def execute_pool_delete(
+    service: DiscoveryService,
+    prepared: PreparedPoolDelete,
+    *,
+    drain: bool = True,
+    drain_grace_period_seconds: int = 30,
+    drain_timeout_seconds: int = 600,
+    wait: bool = False,
+    timeout_seconds: int = 1800,
+    poll_interval_seconds: int = 30,
+    lock: bool = True,
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, object]:
+    pool = prepared.pool
+    kubernetes = service.kubernetes_backend() if drain or lock else None
+    cordoned: list[str] = []
+    submitted = False
+    owned_instance_configuration_id = (
+        pool.instance_configuration_id
+        if (
+            pool.kind == "cluster-network"
+            and pool.created_by_mgmt_oke
+            and pool.instance_configuration_id
+        )
+        else None
+    )
+    instance_configuration_status: str | None = (
+        "retained" if owned_instance_configuration_id else None
+    )
+    with mutation_lock(
+        service,
+        lock,
+        max(timeout_seconds, drain_timeout_seconds),
+    ):
+        try:
+            current = service.discover()
+            current_pool = current.pool_by_name(pool.backing_id or pool.name)
+            if (
+                current_pool is None
+                or current_pool.kind != pool.kind
+                or current_pool.backing_id != pool.backing_id
+            ):
+                raise WorkflowError(
+                    f"Pool changed after deletion planning: {pool.name}"
+                )
+            _validate_pool_mutation(current_pool)
+            if current_pool.slinky_managed:
+                raise WorkflowError(
+                    _slinky_pool_mutation_error(current_pool.name)
+                )
+            current_nodes = tuple(_nodes_for_pool(current, current_pool))
+            if {node.k8s_name for node in current_nodes} != {
+                node.k8s_name for node in prepared.nodes
+            }:
+                raise WorkflowError(
+                    f"Pool membership changed after deletion planning: {pool.name}"
+                )
+            if not drain and not prepared.allow_workloads:
+                busy = [node for node in current_nodes if node.running_workload_pods]
+                if busy:
+                    raise WorkflowError(
+                        f"Refusing to delete {pool.name} without drain: "
+                        f"{sum(node.running_workload_pods for node in busy)} workload "
+                        "pod(s) are now running. Use --allow-workloads."
+                    )
+
+            if drain and kubernetes:
+                for node in prepared.nodes:
+                    kubernetes.cordon_node(node.k8s_name)
+                    cordoned.append(node.k8s_name)
+                for node in prepared.nodes:
+                    pods = kubernetes.list_drain_pods(
+                        node.k8s_name,
+                        grace_period_seconds=drain_grace_period_seconds,
+                        check_evictions=True,
+                    )
+                    _validate_drain_pods(
+                        node,
+                        pods,
+                        prepared.delete_emptydir_data,
+                        prepared.force_unmanaged,
+                    )
+                    kubernetes.evict_drain_pods(
+                        pods,
+                        grace_period_seconds=drain_grace_period_seconds,
+                        timeout_seconds=drain_timeout_seconds,
+                    )
+
+            backend = service.oci_backend()
+            if current_pool.kind == "node-pool" and current_pool.node_pool_id:
+                work_request_id = backend.delete_managed_node_pool(
+                    current_pool.node_pool_id
+                )
+            elif (
+                current_pool.kind == "cluster-network"
+                and current_pool.cluster_network_id
+            ):
+                work_request_id = backend.terminate_cluster_network(
+                    current_pool.cluster_network_id
+                )
+            elif (
+                current_pool.kind == "instance-pool"
+                and current_pool.instance_pool_id
+            ):
+                work_request_id = backend.terminate_instance_pool(
+                    current_pool.instance_pool_id
+                )
+            else:
+                raise WorkflowError(
+                    f"Pool is missing the OCI resource required for deletion: "
+                    f"{pool.name}"
+                )
+            submitted = True
+            status = "submitted"
+            if wait:
+                wait_for_pool_deleted(
+                    service,
+                    pool,
+                    work_request_id,
+                    timeout_seconds,
+                    poll_interval_seconds,
+                    progress=progress,
+                )
+                if owned_instance_configuration_id:
+                    backend.delete_mgmt_created_instance_configuration(
+                        owned_instance_configuration_id
+                    )
+                    instance_configuration_status = "deleted"
+                status = "deleted"
+        except Exception:
+            if kubernetes and not submitted:
+                for node_name in cordoned:
+                    try:
+                        kubernetes.uncordon_node(node_name)
+                    except Exception:
+                        pass
+            raise
+    return pool_delete_result_row(
+        pool,
+        work_request_id,
+        status,
+        instance_configuration_id=owned_instance_configuration_id,
+        instance_configuration_status=instance_configuration_status,
     )
 
 
@@ -743,6 +1059,47 @@ def wait_for_pool_creation(
         time.sleep(poll_interval_seconds)
 
 
+def wait_for_pool_deleted(
+    service: DiscoveryService,
+    original_pool: WorkerPoolInfo,
+    work_request_id: str | None,
+    timeout_seconds: int,
+    poll_interval_seconds: int,
+    progress: Callable[[str], None] | None = None,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    last_status = ""
+    _configure_wait_discovery(service)
+    while True:
+        _raise_for_failed_work_requests(
+            service,
+            (work_request_id,) if work_request_id else (),
+        )
+        snapshot = service.discover()
+        pool = snapshot.pool_by_name(
+            original_pool.backing_id or original_pool.name
+        )
+        status = (
+            f"{original_pool.name}: deleted"
+            if pool is None
+            else (
+                f"{pool.name}: desired={pool.desired_size} "
+                f"oci_active={pool.active_oci_instances} "
+                f"k8s_ready={pool.ready_k8s_nodes}"
+            )
+        )
+        if progress and status != last_status:
+            progress(status)
+            last_status = status
+        if pool is None:
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Timed out waiting for pool deletion. Last status: {status}"
+            )
+        time.sleep(poll_interval_seconds)
+
+
 def wait_for_nodes_removed(
     service: DiscoveryService,
     nodes: tuple[NodeInfo, ...],
@@ -925,6 +1282,29 @@ def pool_create_result_row(
     return result
 
 
+def pool_delete_result_row(
+    pool: WorkerPoolInfo,
+    work_request_id: str | None,
+    status: str,
+    *,
+    instance_configuration_id: str | None = None,
+    instance_configuration_status: str | None = None,
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "name": pool.name,
+        "kind": pool.kind,
+        "placement": pool.placement_type,
+        "old_size": pool.desired_size,
+        "target_size": 0,
+        "status": status,
+        "work_request_id": work_request_id,
+    }
+    if instance_configuration_id:
+        result["instance_configuration_id"] = instance_configuration_id
+        result["instance_configuration_status"] = instance_configuration_status
+    return result
+
+
 def node_remove_result_row(
     pool: WorkerPoolInfo,
     node: NodeInfo,
@@ -1023,7 +1403,7 @@ def _ensure_pool_name_available(
 
 def _require_complete_pool_inventory(snapshot: DiscoverySnapshot) -> None:
     if not snapshot.oci_discovery_enabled:
-        raise WorkflowError("Pool creation requires complete OCI pool discovery.")
+        raise WorkflowError("Pool mutation requires complete OCI pool discovery.")
     failure_prefixes = (
         "Managed node pool discovery skipped:",
         "Cluster network discovery skipped:",
@@ -1036,7 +1416,7 @@ def _require_complete_pool_inventory(snapshot: DiscoverySnapshot) -> None:
     ]
     if failures:
         raise WorkflowError(
-            "Pool creation requires complete OCI pool discovery: "
+            "Pool mutation requires complete OCI pool discovery: "
             + " ".join(failures)
         )
 
@@ -1049,6 +1429,21 @@ def _pool_owner(pool: WorkerPoolInfo) -> tuple[str, str]:
     if pool.kind == "instance-pool" and pool.instance_pool_id:
         return "compute-management", "update the standalone Instance Pool size"
     raise WorkflowError(f"Pool is missing its required OCI backing identifier: {pool.name}")
+
+
+def _pool_delete_owner(pool: WorkerPoolInfo) -> tuple[str, str]:
+    if pool.kind == "node-pool" and pool.node_pool_id:
+        return "oke", "delete the managed OKE node-pool resource"
+    if pool.kind == "cluster-network" and pool.cluster_network_id:
+        return (
+            "compute-management",
+            "terminate the Cluster Network and its embedded Instance Pool",
+        )
+    if pool.kind == "instance-pool" and pool.instance_pool_id:
+        return "compute-management", "terminate the standalone Instance Pool"
+    raise WorkflowError(
+        f"Pool is missing its required OCI backing identifier: {pool.name}"
+    )
 
 
 def _node_owner(pool: WorkerPoolInfo) -> tuple[str, str]:

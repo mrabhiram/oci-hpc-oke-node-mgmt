@@ -5,6 +5,7 @@ import click
 from oke_hpc_mgmt.commands.pools import (
     add_pool_capacity,
     create_pool,
+    delete_pool,
     list_pools,
 )
 
@@ -26,5 +27,6 @@ def add_cluster_resource() -> None:
 
 clusters.add_command(list_pools, "list")
 clusters.add_command(create_pool, "create")
+clusters.add_command(delete_pool, "delete")
 add_cluster_resource.add_command(add_pool_capacity, "node")
 clusters.add_command(add_cluster_resource)

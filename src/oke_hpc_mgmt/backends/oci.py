@@ -167,6 +167,9 @@ class OciBackend:
                     desired_size=desired_size,
                     active_oci_instances=len(active_nodes) if nodes else desired_size,
                     node_pool_id=summary.id,
+                    created_by_mgmt_oke=_is_mgmt_oke_created(
+                        getattr(node_pool, "freeform_tags", None)
+                    ),
                     placement_type="compute-cluster" if compute_cluster_id else "standard",
                     compute_cluster_id=compute_cluster_id,
                     host_group_ids={
@@ -1245,6 +1248,58 @@ class OciBackend:
         )
         return response.headers.get("opc-work-request-id")
 
+    def delete_managed_node_pool(self, node_pool_id: str) -> str | None:
+        response = self._call(
+            "Managed OKE node pool deletion",
+            self.container_engine.delete_node_pool,
+            node_pool_id,
+        )
+        return (getattr(response, "headers", None) or {}).get(
+            "opc-work-request-id"
+        )
+
+    def terminate_cluster_network(self, cluster_network_id: str) -> str | None:
+        response = self._call(
+            "Cluster Network termination",
+            self.compute_mgmt.terminate_cluster_network,
+            cluster_network_id,
+        )
+        return (getattr(response, "headers", None) or {}).get(
+            "opc-work-request-id"
+        )
+
+    def terminate_instance_pool(self, instance_pool_id: str) -> str | None:
+        response = self._call(
+            "Instance Pool termination",
+            self.compute_mgmt.terminate_instance_pool,
+            instance_pool_id,
+        )
+        return (getattr(response, "headers", None) or {}).get(
+            "opc-work-request-id"
+        )
+
+    def delete_mgmt_created_instance_configuration(
+        self,
+        instance_configuration_id: str,
+    ) -> None:
+        instance_configuration = self._call(
+            "Instance Configuration ownership lookup",
+            self.compute_mgmt.get_instance_configuration,
+            instance_configuration_id,
+        ).data
+        if not _is_mgmt_oke_created(
+            getattr(instance_configuration, "freeform_tags", None)
+        ):
+            raise OciDiscoveryError(
+                "Refusing to delete an Instance Configuration that is not "
+                f"tagged mgmt-oke-created=true: {instance_configuration_id}"
+            )
+        self._call(
+            "Instance Configuration deletion",
+            self.compute_mgmt.delete_instance_configuration,
+            instance_configuration_id,
+        )
+
     def delete_node(
         self,
         node_pool_id: str,
@@ -1309,6 +1364,9 @@ class OciBackend:
                 compartment_id=compartment_id,
                 cluster_network_id=getattr(cluster_network, "id", None),
                 instance_pool_id=instance_pool_id,
+                created_by_mgmt_oke=_is_mgmt_oke_created(
+                    getattr(cluster_network, "freeform_tags", None)
+                ),
                 placement_type="cluster-network",
                 rdma_enabled=True,
             )
@@ -1365,6 +1423,17 @@ class OciBackend:
         if instance_pool is None:
             instance_pool = self.compute_mgmt.get_instance_pool(instance_pool_id).data
         pool.desired_size = getattr(instance_pool, "size", None)
+        pool.instance_configuration_id = getattr(
+            instance_pool,
+            "instance_configuration_id",
+            None,
+        )
+        pool.created_by_mgmt_oke = (
+            pool.created_by_mgmt_oke
+            or _is_mgmt_oke_created(
+                getattr(instance_pool, "freeform_tags", None)
+            )
+        )
         pool.availability_domain = _first_placement_ad(instance_pool)
         compute_cluster_ids = _placement_compute_cluster_ids(instance_pool)
         if compute_cluster_ids:
@@ -1930,6 +1999,10 @@ def _clone_pool_freeform_tags(
     tags.setdefault("role", "worker")
     tags["mgmt-oke-created"] = "true"
     return tags
+
+
+def _is_mgmt_oke_created(tags: dict[str, str] | None) -> bool:
+    return str((tags or {}).get("mgmt-oke-created", "")).lower() == "true"
 
 
 def _retarget_vnic_tags(vnic_details: Any, name: str) -> None:

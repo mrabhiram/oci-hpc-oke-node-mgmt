@@ -43,7 +43,10 @@ Management Tool.
   overrides with effective-request dry-run output
 - official OCI HPC OKE worker cloud-init composition for local NVMe RAID and
   existing FSS and Lustre mounts
-- Slurm-style `clusters list`, `clusters create`, and
+- guarded whole-pool deletion for managed OKE node pools, self-managed Cluster
+  Networks, and standalone Instance Pools, including ownership-checked cleanup
+  of derived RDMA Instance Configurations on waited deletion
+- Slurm-style `clusters list`, `clusters create`, `clusters delete`, and
   `clusters add node` worker-pool aliases
 - explicit `pools add` and `pools remove` capacity commands
 - validated dry-run plans for every mutation
@@ -69,7 +72,6 @@ Management Tool.
 
 ## Not Implemented Yet
 
-- whole worker-pool and Cluster Network deletion
 - boot volume replacement wrapper
 - automatic Kueue `ClusterQueue` quota updates after worker-pool capacity changes
 - Cluster Autoscaler bounds updates

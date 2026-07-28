@@ -123,6 +123,21 @@ See [Creating Worker Pools](./creating-worker-pools.md) and
 [Worker Bootstrap and Storage](./worker-bootstrap-and-storage.md) for the full
 option matrix and examples.
 
+Delete an entire pool:
+
+```bash
+mgmt-oke pools delete <pool-name> --dry-run --format json
+mgmt-oke pools delete <pool-name> --wait
+```
+
+Deletion drains by default. It refuses Cluster Autoscaler-owned and
+Slinky-managed pools and protects `oke-system` unless
+`--allow-system-pool` is selected explicitly.
+
+For a Cluster Network created by this tool, `--wait` also removes its derived
+Instance Configuration after termination. `--no-wait` retains and reports that
+configuration. Stack-owned configurations are never removed by this cleanup.
+
 Set an exact desired size:
 
 ```bash
@@ -185,6 +200,18 @@ All pool mutations support:
 | `--lock` / `--no-lock` | Enable or bypass the Kubernetes mutation Lease. |
 | `--yes` | Skip interactive typed confirmation. |
 
+Whole-pool deletion additionally supports:
+
+| Option | Purpose |
+| --- | --- |
+| `--drain` / `--no-drain` | Enable or bypass Kubernetes drain. Drain is the default. |
+| `--allow-workloads` | Permit `--no-drain` while workload pods are present. |
+| `--delete-emptydir-data` | Acknowledge deletion of pod-local data. |
+| `--force` | Acknowledge eviction of pods without a controller. |
+| `--allow-system-pool` | Permit deletion of `oke-system` after explicit review. |
+| `--grace-period <seconds>` | Set pod termination grace. Default: `30`. |
+| `--drain-timeout <seconds>` | Set the Kubernetes drain timeout. Default: `600`. |
+
 ## Slurm-Style Pool Aliases
 
 The following aliases mirror the command style of the OCI HPC Slurm management
@@ -194,10 +221,11 @@ tool while retaining OKE worker-pool semantics:
 mgmt-oke clusters list
 mgmt-oke clusters create <name> --type <cpu|gpu|rdma> --count <n>
 mgmt-oke clusters add node <pool> --count <n>
+mgmt-oke clusters delete <pool>
 ```
 
-These aliases create and add capacity to worker pools. They do not create the
-OKE control plane.
+These aliases create, add capacity to, and delete worker pools. They do not
+create or delete the OKE control plane.
 
 ## Node Inventory
 

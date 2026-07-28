@@ -23,6 +23,7 @@ from oke_hpc_mgmt.models import (
 from oke_hpc_mgmt.workflows.lifecycle import (
     PreparedNodeRemoval,
     PreparedPoolCreate,
+    PreparedPoolDelete,
     PreparedPoolResize,
 )
 from oke_hpc_mgmt.workflows.node_maintenance import PreparedNodeMaintenance
@@ -347,11 +348,60 @@ class CliTests(unittest.TestCase):
         add_result = self.runner.invoke(cli, ["clusters", "add", "--help"])
 
         self.assertEqual(0, result.exit_code, result.output)
-        for command in ("list", "create", "add"):
+        for command in ("list", "create", "delete", "add"):
             self.assertIn(command, result.output)
         self.assertEqual(0, add_result.exit_code, add_result.output)
         self.assertIn("node", add_result.output)
         self.assertIn("OKE control plane", result.output)
+
+    def test_pool_delete_dry_run_does_not_execute(self):
+        pool = WorkerPoolInfo(
+            name="cpu-batch",
+            kind="node-pool",
+            node_pool_id="node-pool-1",
+            desired_size=1,
+        )
+        prepared = PreparedPoolDelete(
+            snapshot=DiscoverySnapshot(pools=[pool]),
+            pool=pool,
+            nodes=(),
+            drain_pods={},
+            allow_workloads=False,
+            delete_emptydir_data=False,
+            force_unmanaged=False,
+            plan=OperationPlan(
+                operation="pool-delete",
+                target="cpu-batch",
+                pool="cpu-batch",
+            ),
+        )
+        with (
+            patch(
+                "oke_hpc_mgmt.commands.pools.prepare_pool_delete",
+                return_value=prepared,
+            ),
+            patch(
+                "oke_hpc_mgmt.commands.pools.execute_pool_delete"
+            ) as execute,
+        ):
+            result = self.runner.invoke(
+                cli,
+                [
+                    "pools",
+                    "delete",
+                    "cpu-batch",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(
+            "pool-delete",
+            json.loads(result.output)[0]["operation"],
+        )
+        execute.assert_not_called()
 
     def test_pool_add_translates_count_to_positive_delta(self):
         pool = WorkerPoolInfo(name="oke-cpu", kind="node-pool", desired_size=1)

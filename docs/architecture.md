@@ -342,6 +342,30 @@ CLI calls `DetachInstancePoolInstance` with automatic termination enabled:
 Managed OKE eviction options are rejected for this path because Kubernetes
 eviction is not controlled by the OKE `DeleteNode` API.
 
+### Whole-Pool Deletion
+
+`pools delete` snapshots the pool and complete Kubernetes membership, validates
+drain admission, and acquires the mutation Lease. Immediately before mutation,
+it rediscovers the pool and refuses execution if ownership or membership
+changed after planning.
+
+The default workflow cordons every member, evicts eligible pods, and routes
+deletion to the owner:
+
+- managed pool: OKE `DeleteNodePool`
+- self-managed RDMA pool: Compute Management `TerminateClusterNetwork`
+- standalone Instance Pool: Compute Management `TerminateInstancePool`
+
+Deletion refuses autoscaler-owned and Slinky-managed pools. `oke-system` also
+requires a dedicated override. If execution fails before the OCI request is
+submitted, nodes cordoned by the operation are uncordoned.
+
+Cluster Network discovery also records the embedded Instance Configuration.
+After a waited deletion, the tool removes that configuration only when both the
+pool and configuration carry the `mgmt-oke-created=true` ownership tag.
+Configurations owned by the OCI HPC OKE stack are not deleted. A no-wait
+deletion reports the retained configuration for manual cleanup.
+
 ## Node And Resource Readiness
 
 After a mutation with `--wait`, the tool reconciles the selected pool until:

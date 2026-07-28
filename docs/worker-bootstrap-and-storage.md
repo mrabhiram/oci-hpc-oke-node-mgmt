@@ -39,6 +39,9 @@ pod paths onto the array before OKE starts those services.
 | `append` | Preserve inherited commands and append the selected storage bootstrap. |
 | `replace` | Remove inherited official NVMe, FSS, and Lustre commands/files, then add only the selected configuration. |
 
+`inherit` is the default. A normal `--from-pool` create therefore preserves
+existing storage bootstrap without requiring a storage option.
+
 Use `replace` when changing an inherited mount or RAID configuration. Selecting
 `replace` without a storage option removes official storage bootstrap from the
 new pool while preserving OKE bootstrap.

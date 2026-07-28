@@ -36,6 +36,14 @@ _RESERVED_NODE_METADATA_KEYS = frozenset(
         "user_data",
     }
 )
+_RESERVED_FREEFORM_TAG_KEYS = frozenset(
+    {
+        "mgmt-oke-created",
+        "pool",
+        "role",
+        "state_id",
+    }
+)
 
 
 def normalize_pool_name(value: str) -> str:
@@ -113,6 +121,15 @@ def validate_pool_create_spec(spec: PoolCreateSpec) -> PoolCreateSpec:
         raise ValueError(
             "Use dedicated pool-create options instead of overriding reserved OKE "
             f"node metadata: {', '.join(reserved)}."
+        )
+    freeform_tag_keys = {key for key, _value in spec.freeform_tags}
+    reserved_tags = sorted(
+        freeform_tag_keys.intersection(_RESERVED_FREEFORM_TAG_KEYS)
+    )
+    if reserved_tags:
+        raise ValueError(
+            "Worker ownership tags are managed by mgmt-oke and cannot be "
+            f"overridden: {', '.join(reserved_tags)}."
         )
 
     if spec.pool_type == "rdma":

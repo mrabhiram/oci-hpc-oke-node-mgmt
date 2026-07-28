@@ -56,7 +56,7 @@ mgmt-oke --help
 Example version output:
 
 ```text
-mgmt-oke, version 0.6.0
+mgmt-oke, version 0.7.0
 ```
 
 The examples use the direct entrypoint. `kubectl oke` exposes the same commands

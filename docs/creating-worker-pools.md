@@ -18,7 +18,8 @@ uses the self-managed Cluster Network model.
 A source pool is required because OCI HPC OKE workers carry cluster-specific
 certificate, API endpoint, CNI, OKE bootstrap, agent, and network settings.
 `mgmt-oke` inherits those working settings and applies only the requested
-overrides.
+overrides. This includes the complete source cloud-init and any existing NVMe,
+FSS, or Lustre bootstrap.
 
 Select the source explicitly with `--from-pool`. When omitted, the command uses
 the matching conventional pool name (`oke-cpu`, `oke-gpu`, or `oke-rdma`) when
@@ -59,7 +60,7 @@ mgmt-oke pools create cpu-batch \
 ```
 
 The command submits OKE `CreateNodePool`. OKE remains the owner of provisioning,
-registration, resize, and specific-node deletion.
+registration, resize, specific-node deletion, and whole-pool deletion.
 
 ## Managed GPU Pool
 
@@ -86,6 +87,21 @@ settings, and eviction settings are retained unless their dedicated options
 override them.
 
 ## Self-Managed RDMA Pool
+
+To change only the name, AD, shape, and size while inheriting every other
+setting from the existing RDMA pool:
+
+```bash
+mgmt-oke pools create <new-rdma-pool> \
+  --type rdma \
+  --count 1 \
+  --from-pool oke-rdma \
+  --availability-domain <different-availability-domain> \
+  --shape <rdma-capable-shape> \
+  --wait
+```
+
+`--storage-mode inherit` is the default and does not need to be specified.
 
 Preview a Cluster Network pool in a selected availability domain:
 
@@ -121,7 +137,8 @@ The RDMA workflow:
 
 The source Instance Configuration and source Cluster Network are not changed.
 If Cluster Network creation fails after Instance Configuration creation, the
-error identifies the derived configuration for inspection and cleanup.
+error identifies both created resources and the derived configuration for
+inspection and cleanup.
 
 ## Customization
 
@@ -234,3 +251,26 @@ mgmt-oke topology list --pool <new-pool>
 mgmt-oke health run --type rdma --pool <new-pool>
 mgmt-oke addons validate --target rdma --pool <new-pool>
 ```
+
+## Delete a Complete Pool
+
+Preview deletion before draining or terminating anything:
+
+```bash
+mgmt-oke pools delete <pool> --dry-run --format json
+```
+
+Apply after reviewing the node membership and workload count:
+
+```bash
+mgmt-oke pools delete <pool> --wait
+```
+
+Managed pools are deleted through OKE. Cluster Network pools are terminated
+through Compute Management. Standalone Instance Pools use their owning Compute
+Management API. The command drains by default, refuses autoscaler-owned and
+Slinky-managed pools, and protects `oke-system` unless the dedicated override
+is supplied. With `--wait`, a Cluster Network created by `mgmt-oke` also has
+its derived Instance Configuration removed after termination. The ownership
+tag is revalidated immediately before deletion; stack-owned configurations are
+preserved. `--no-wait` retains and reports the derived configuration.

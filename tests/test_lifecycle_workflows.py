@@ -22,13 +22,16 @@ from oke_hpc_mgmt.workflows.lifecycle import (
     WorkflowNotFound,
     execute_node_removal,
     execute_pool_create,
+    execute_pool_delete,
     execute_pool_resize,
     prepare_node_removal,
     prepare_pool_create,
+    prepare_pool_delete,
     prepare_pool_resize,
     readiness_status,
     resource_counts_match,
     wait_for_pool_creation,
+    wait_for_pool_deleted,
     wait_for_pool_size,
 )
 
@@ -59,6 +62,375 @@ def _service(snapshot: DiscoverySnapshot) -> Mock:
 
 
 class LifecycleWorkflowTests(unittest.TestCase):
+    def test_prepare_pool_delete_protects_system_autoscaler_and_slinky_pools(self):
+        system = WorkerPoolInfo(
+            name="oke-system",
+            kind="node-pool",
+            node_pool_id="node-pool-system",
+            desired_size=2,
+        )
+        with self.assertRaisesRegex(WorkflowError, "system pool"):
+            prepare_pool_delete(
+                _service(DiscoverySnapshot(pools=[system])),
+                "oke-system",
+                drain=False,
+            )
+
+        autoscaled = WorkerPoolInfo(
+            name="autoscaled",
+            kind="node-pool",
+            node_pool_id="node-pool-autoscaled",
+            autoscaler_owned=True,
+        )
+        with self.assertRaisesRegex(WorkflowError, "autoscaler-owned"):
+            prepare_pool_delete(
+                _service(DiscoverySnapshot(pools=[autoscaled])),
+                "autoscaled",
+                drain=False,
+            )
+
+        slinky = WorkerPoolInfo(
+            name="slurm-workers",
+            kind="node-pool",
+            node_pool_id="node-pool-slinky",
+            slinky_managed=True,
+        )
+        with self.assertRaisesRegex(WorkflowError, "Slurm-aware drain"):
+            prepare_pool_delete(
+                _service(DiscoverySnapshot(pools=[slinky])),
+                "slurm-workers",
+                drain=False,
+            )
+
+    def test_execute_pool_delete_routes_managed_and_cluster_network_pools(self):
+        managed = WorkerPoolInfo(
+            name="cpu-batch",
+            kind="node-pool",
+            node_pool_id="node-pool-1",
+            desired_size=0,
+        )
+        managed_service = _service(DiscoverySnapshot(pools=[managed]))
+        managed_prepared = prepare_pool_delete(
+            managed_service,
+            "cpu-batch",
+            drain=False,
+        )
+
+        managed_result = execute_pool_delete(
+            managed_service,
+            managed_prepared,
+            drain=False,
+            lock=False,
+        )
+
+        managed_service.oci_backend.return_value.delete_managed_node_pool.assert_called_once_with(
+            "node-pool-1"
+        )
+        self.assertEqual("submitted", managed_result["status"])
+
+        rdma = WorkerPoolInfo(
+            name="rdma-batch",
+            kind="cluster-network",
+            cluster_network_id="cluster-network-1",
+            instance_pool_id="instance-pool-1",
+            instance_configuration_id="instance-configuration-1",
+            created_by_mgmt_oke=True,
+            desired_size=0,
+        )
+        rdma_service = _service(DiscoverySnapshot(pools=[rdma]))
+        rdma_prepared = prepare_pool_delete(
+            rdma_service,
+            "rdma-batch",
+            drain=False,
+        )
+
+        rdma_result = execute_pool_delete(
+            rdma_service,
+            rdma_prepared,
+            drain=False,
+            lock=False,
+        )
+
+        rdma_service.oci_backend.return_value.terminate_cluster_network.assert_called_once_with(
+            "cluster-network-1"
+        )
+        rdma_service.oci_backend.return_value.delete_mgmt_created_instance_configuration.assert_not_called()
+        self.assertEqual(
+            "retained",
+            rdma_result["instance_configuration_status"],
+        )
+
+        rdma_wait_service = _service(DiscoverySnapshot(pools=[rdma]))
+        rdma_wait_prepared = prepare_pool_delete(
+            rdma_wait_service,
+            "rdma-batch",
+            drain=False,
+        )
+        with patch(
+            "oke_hpc_mgmt.workflows.lifecycle.wait_for_pool_deleted"
+        ) as wait_for_delete:
+            rdma_wait_result = execute_pool_delete(
+                rdma_wait_service,
+                rdma_wait_prepared,
+                drain=False,
+                wait=True,
+                lock=False,
+            )
+
+        wait_for_delete.assert_called_once()
+        rdma_wait_service.oci_backend.return_value.delete_mgmt_created_instance_configuration.assert_called_once_with(
+            "instance-configuration-1"
+        )
+        self.assertEqual(
+            "deleted",
+            rdma_wait_result["instance_configuration_status"],
+        )
+
+        standalone = WorkerPoolInfo(
+            name="standalone-batch",
+            kind="instance-pool",
+            instance_pool_id="instance-pool-2",
+            desired_size=0,
+        )
+        standalone_service = _service(DiscoverySnapshot(pools=[standalone]))
+        standalone_prepared = prepare_pool_delete(
+            standalone_service,
+            "standalone-batch",
+            drain=False,
+        )
+
+        execute_pool_delete(
+            standalone_service,
+            standalone_prepared,
+            drain=False,
+            lock=False,
+        )
+
+        standalone_service.oci_backend.return_value.terminate_instance_pool.assert_called_once_with(
+            "instance-pool-2"
+        )
+
+    def test_prepare_pool_delete_validates_workloads_and_drain_data(self):
+        pool = WorkerPoolInfo(
+            name="cpu-batch",
+            kind="node-pool",
+            node_pool_id="node-pool-1",
+            desired_size=1,
+        )
+        node = NodeInfo(
+            "cpu-1",
+            pool_name="cpu-batch",
+            node_pool_id="node-pool-1",
+            running_workload_pods=1,
+        )
+        snapshot = DiscoverySnapshot(pools=[pool], nodes=[node])
+
+        with self.assertRaisesRegex(WorkflowError, "without drain"):
+            prepare_pool_delete(
+                _service(snapshot),
+                "cpu-batch",
+                drain=False,
+            )
+
+        no_drain = prepare_pool_delete(
+            _service(snapshot),
+            "cpu-batch",
+            drain=False,
+            allow_workloads=True,
+        )
+        self.assertEqual(1, no_drain.plan.workload_pods)
+
+        service = _service(snapshot)
+        service.kubernetes_backend.return_value.list_drain_pods.return_value = [
+            DrainPod(
+                "default",
+                "scratch",
+                controller="Job/scratch",
+                has_empty_dir=True,
+            )
+        ]
+        with self.assertRaisesRegex(WorkflowError, "emptyDir"):
+            prepare_pool_delete(service, "cpu-batch")
+
+        prepared = prepare_pool_delete(
+            service,
+            "cpu-batch",
+            delete_emptydir_data=True,
+        )
+        self.assertTrue(prepared.delete_emptydir_data)
+        self.assertFalse(prepared.force_unmanaged)
+
+        service.kubernetes_backend.return_value.list_drain_pods.return_value = [
+            DrainPod(
+                "default",
+                "pdb-blocked",
+                controller="Deployment/pdb-blocked",
+                eviction_blocker="PodDisruptionBudget denied eviction",
+            )
+        ]
+        blocked = prepare_pool_delete(service, "cpu-batch")
+        self.assertIn("pdb-blocked", " ".join(blocked.plan.warnings))
+
+    def test_prepare_pool_delete_requires_explicit_kubernetes_bypass(self):
+        pool = WorkerPoolInfo(
+            name="cpu-batch",
+            kind="node-pool",
+            node_pool_id="node-pool-1",
+            desired_size=1,
+        )
+        snapshot = DiscoverySnapshot(
+            pools=[pool],
+            warnings=["Kubernetes discovery skipped: unavailable"],
+        )
+
+        with self.assertRaisesRegex(WorkflowError, "successful Kubernetes discovery"):
+            prepare_pool_delete(_service(snapshot), "cpu-batch")
+        with self.assertRaisesRegex(WorkflowError, "workload presence cannot be verified"):
+            prepare_pool_delete(
+                _service(snapshot),
+                "cpu-batch",
+                drain=False,
+            )
+
+        prepared = prepare_pool_delete(
+            _service(snapshot),
+            "cpu-batch",
+            drain=False,
+            allow_workloads=True,
+        )
+        self.assertTrue(prepared.allow_workloads)
+
+    def test_execute_pool_delete_revalidates_drain_after_cordon(self):
+        pool = WorkerPoolInfo(
+            name="cpu-batch",
+            kind="node-pool",
+            node_pool_id="node-pool-1",
+            desired_size=1,
+        )
+        node = NodeInfo(
+            "cpu-1",
+            pool_name="cpu-batch",
+            node_pool_id="node-pool-1",
+        )
+        service = _service(DiscoverySnapshot(pools=[pool], nodes=[node]))
+        kubernetes = service.kubernetes_backend.return_value
+        kubernetes.list_drain_pods.side_effect = [
+            [],
+            [
+                DrainPod(
+                    "default",
+                    "late-scratch",
+                    controller="Job/late-scratch",
+                    has_empty_dir=True,
+                )
+            ],
+        ]
+        prepared = prepare_pool_delete(service, "cpu-batch")
+
+        with self.assertRaisesRegex(WorkflowError, "late-scratch"):
+            execute_pool_delete(service, prepared, lock=False)
+
+        kubernetes.cordon_node.assert_called_once_with("cpu-1")
+        kubernetes.uncordon_node.assert_called_once_with("cpu-1")
+        kubernetes.evict_drain_pods.assert_not_called()
+        service.oci_backend.return_value.delete_managed_node_pool.assert_not_called()
+
+    def test_execute_pool_delete_refuses_membership_change(self):
+        pool = WorkerPoolInfo(
+            name="cpu-batch",
+            kind="node-pool",
+            node_pool_id="node-pool-1",
+            desired_size=1,
+        )
+        node = NodeInfo(
+            "cpu-1",
+            pool_name="cpu-batch",
+            node_pool_id="node-pool-1",
+        )
+        service = _service(DiscoverySnapshot(pools=[pool], nodes=[node]))
+        prepared = prepare_pool_delete(service, "cpu-batch", drain=False)
+        replacement = NodeInfo(
+            "cpu-2",
+            pool_name="cpu-batch",
+            node_pool_id="node-pool-1",
+        )
+        service.discover.return_value = DiscoverySnapshot(
+            pools=[pool],
+            nodes=[replacement],
+        )
+
+        with self.assertRaisesRegex(WorkflowError, "membership changed"):
+            execute_pool_delete(
+                service,
+                prepared,
+                drain=False,
+                lock=False,
+            )
+
+        service.oci_backend.return_value.delete_managed_node_pool.assert_not_called()
+
+    def test_execute_pool_delete_rechecks_no_drain_workloads(self):
+        pool = WorkerPoolInfo(
+            name="cpu-batch",
+            kind="node-pool",
+            node_pool_id="node-pool-1",
+            desired_size=1,
+        )
+        node = NodeInfo(
+            "cpu-1",
+            pool_name="cpu-batch",
+            node_pool_id="node-pool-1",
+        )
+        service = _service(DiscoverySnapshot(pools=[pool], nodes=[node]))
+        prepared = prepare_pool_delete(service, "cpu-batch", drain=False)
+        busy_node = NodeInfo(
+            "cpu-1",
+            pool_name="cpu-batch",
+            node_pool_id="node-pool-1",
+            running_workload_pods=1,
+        )
+        service.discover.return_value = DiscoverySnapshot(
+            pools=[pool],
+            nodes=[busy_node],
+        )
+
+        with self.assertRaisesRegex(WorkflowError, "now running"):
+            execute_pool_delete(
+                service,
+                prepared,
+                drain=False,
+                lock=False,
+            )
+
+        service.oci_backend.return_value.delete_managed_node_pool.assert_not_called()
+
+    def test_wait_for_pool_deleted_handles_discovery_convergence(self):
+        pool = WorkerPoolInfo(
+            name="cpu-batch",
+            kind="node-pool",
+            node_pool_id="node-pool-1",
+            desired_size=1,
+        )
+        service = _service(DiscoverySnapshot(pools=[pool]))
+        service.discover.side_effect = [
+            DiscoverySnapshot(pools=[pool]),
+            DiscoverySnapshot(),
+        ]
+        progress = Mock()
+
+        with patch("oke_hpc_mgmt.workflows.lifecycle.time.sleep") as sleep:
+            wait_for_pool_deleted(
+                service,
+                pool,
+                None,
+                timeout_seconds=10,
+                poll_interval_seconds=1,
+                progress=progress,
+            )
+
+        sleep.assert_called_once_with(1)
+        self.assertEqual(2, progress.call_count)
+
     def test_prepare_pool_create_selects_conventional_template_and_builds_plan(self):
         conventional = WorkerPoolInfo(
             name="oke-rdma",
@@ -286,6 +658,42 @@ class LifecycleWorkflowTests(unittest.TestCase):
             execute_pool_create(service, prepared, lock=False)
 
         service.oci_backend.return_value.create_cluster_network_pool.assert_not_called()
+
+    def test_rdma_create_wait_failure_reports_created_resource_ids(self):
+        source = WorkerPoolInfo(
+            name="oke-rdma",
+            kind="cluster-network",
+            cluster_network_id="cluster-network-1",
+            instance_pool_id="instance-pool-1",
+        )
+        service = _service(DiscoverySnapshot(pools=[source]))
+        created = ClusterNetworkCreateResult(
+            cluster_network_id="cluster-network-new",
+            instance_configuration_id="instance-configuration-new",
+            instance_pool_id="instance-pool-new",
+            work_request_id="work-request-new",
+        )
+        service.oci_backend.return_value.create_cluster_network_pool.return_value = (
+            created
+        )
+        prepared = prepare_pool_create(service, "oke-rdma-2", 1)
+
+        with (
+            patch(
+                "oke_hpc_mgmt.workflows.lifecycle.wait_for_pool_creation",
+                side_effect=WorkflowError("Insufficient capacity"),
+            ),
+            self.assertRaisesRegex(
+                WorkflowError,
+                "cluster-network-new.*instance-configuration-new",
+            ),
+        ):
+            execute_pool_create(
+                service,
+                prepared,
+                wait=True,
+                lock=False,
+            )
 
     def test_wait_for_pool_creation_tolerates_discovery_delay_and_checks_readiness(self):
         source = WorkerPoolInfo(

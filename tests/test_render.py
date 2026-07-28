@@ -88,6 +88,8 @@ class RenderTests(unittest.TestCase):
             placement_type="compute-cluster",
             compute_cluster_id="compute-cluster-1",
             host_group_ids={"host-group-1"},
+            instance_configuration_id="instance-configuration-1",
+            created_by_mgmt_oke=True,
             rdma_enabled=True,
             rdma_vf_required=True,
             slinky_managed=True,
@@ -98,6 +100,11 @@ class RenderTests(unittest.TestCase):
         self.assertEqual("compute-cluster", row["placement"])
         self.assertEqual("compute-cluster-1", row["compute_cluster_id"])
         self.assertEqual({"host-group-1"}, row["host_group_ids"])
+        self.assertEqual(
+            "instance-configuration-1",
+            row["instance_configuration_id"],
+        )
+        self.assertTrue(row["created_by_mgmt_oke"])
         self.assertTrue(row["rdma_vf_required"])
         self.assertTrue(row["slinky"])
 

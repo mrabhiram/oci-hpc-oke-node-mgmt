@@ -50,6 +50,19 @@ class ValidationTests(unittest.TestCase):
                 )
             )
 
+    def test_pool_create_rejects_reserved_ownership_tags(self):
+        for key in ("mgmt-oke-created", "pool", "role", "state_id"):
+            with (
+                self.subTest(key=key),
+                self.assertRaisesRegex(ValueError, "ownership tags"),
+            ):
+                validate_pool_create_spec(
+                    PoolCreateSpec(
+                        pool_type="rdma",
+                        freeform_tags=((key, "override"),),
+                    )
+                )
+
     def test_storage_selection_requires_explicit_composition_mode(self):
         with self.assertRaisesRegex(ValueError, "storage-mode"):
             validate_pool_create_spec(

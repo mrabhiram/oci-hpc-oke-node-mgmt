@@ -16,7 +16,6 @@ from oke_hpc_mgmt.models import (
     WorkerPoolInfo,
 )
 
-
 OUTPUT_SCHEMA_VERSION = "v1"
 
 
@@ -241,6 +240,8 @@ def pool_rows(pools: list[WorkerPoolInfo]) -> list[dict[str, Any]]:
             "node_pool_id": pool.node_pool_id,
             "cluster_network_id": pool.cluster_network_id,
             "instance_pool_id": pool.instance_pool_id,
+            "instance_configuration_id": pool.instance_configuration_id,
+            "created_by_mgmt_oke": pool.created_by_mgmt_oke,
             "compute_cluster_id": pool.compute_cluster_id,
             "host_group_ids": pool.host_group_ids,
         }

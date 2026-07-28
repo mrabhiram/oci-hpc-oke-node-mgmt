@@ -73,7 +73,7 @@ Verify the package entrypoints:
 Example version output:
 
 ```text
-mgmt-oke, version 0.6.0
+mgmt-oke, version 0.7.0
 ```
 
 ## Upgrade An Existing Installation
@@ -212,6 +212,7 @@ The current mutating commands are:
 
 ```bash
 mgmt-oke pools create <name> --type <cpu|gpu|rdma> --count <n> [--from-pool <pool>] [--dry-run] [--wait]
+mgmt-oke pools delete <pool> [--dry-run] [--wait]
 mgmt-oke pools resize <pool> (--size <n> | --delta <n>) [--dry-run] [--wait]
 mgmt-oke pools add <pool> --count <n> [--dry-run] [--wait]
 mgmt-oke pools remove <pool> --count <n> [--dry-run] [--wait]
@@ -230,6 +231,9 @@ Safety behavior:
 - Mutations acquire a Kubernetes Lease by default to prevent concurrent tool operations.
 - Pool creation inherits cluster bootstrap from a matching source and validates
   custom image, shape, placement, and network compatibility before submission.
+- Whole-pool deletion drains by default and protects `oke-system`.
+- Waited deletion removes only derived Instance Configurations carrying the
+  tool's ownership tag; stack-owned configurations are preserved.
 - The tool refuses to resize or remove nodes from Cluster Autoscaler-owned pools
   by default.
 - Node termination cordons and drains through the Kubernetes Eviction API by

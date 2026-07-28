@@ -33,6 +33,13 @@ class _ComputeManagement:
         self.calls.append(("get_cluster_network", cluster_network_id))
         return SimpleNamespace(data=self.cluster_network)
 
+    def list_cluster_networks(self, compartment_id):
+        self.calls.append(("list_cluster_networks", compartment_id))
+        cluster_networks = (
+            [] if self.cluster_network is None else [self.cluster_network]
+        )
+        return SimpleNamespace(data=cluster_networks)
+
     def update_cluster_network(self, cluster_network_id, details):
         self.calls.append(("update_cluster_network", cluster_network_id, details))
         return SimpleNamespace(headers={"opc-work-request-id": "wr-cluster-network"})
@@ -58,9 +65,36 @@ class _ComputeManagement:
             headers={},
         )
 
+    def delete_instance_configuration(self, instance_configuration_id):
+        self.calls.append(
+            ("delete_instance_configuration", instance_configuration_id)
+        )
+        return SimpleNamespace(headers={})
+
     def update_instance_pool(self, instance_pool_id, details):
         self.calls.append(("update_instance_pool", instance_pool_id, details))
         return SimpleNamespace(headers={"opc-work-request-id": "wr-instance-pool"})
+
+    def get_instance_pool(self, instance_pool_id):
+        self.calls.append(("get_instance_pool", instance_pool_id))
+        instance_pool = next(
+            pool
+            for pool in self.instance_pools
+            if pool.id == instance_pool_id
+        )
+        return SimpleNamespace(data=instance_pool)
+
+    def terminate_cluster_network(self, cluster_network_id):
+        self.calls.append(("terminate_cluster_network", cluster_network_id))
+        return SimpleNamespace(
+            headers={"opc-work-request-id": "wr-cluster-network-delete"}
+        )
+
+    def terminate_instance_pool(self, instance_pool_id):
+        self.calls.append(("terminate_instance_pool", instance_pool_id))
+        return SimpleNamespace(
+            headers={"opc-work-request-id": "wr-instance-pool-delete"}
+        )
 
     def detach_instance_pool_instance(self, instance_pool_id, details):
         self.calls.append(("detach_instance_pool_instance", instance_pool_id, details))
@@ -104,6 +138,12 @@ class _ContainerEngine:
         return SimpleNamespace(
             data=None,
             headers={"opc-work-request-id": "wr-node-pool-create"},
+        )
+
+    def delete_node_pool(self, node_pool_id):
+        self.calls.append(("delete_node_pool", node_pool_id))
+        return SimpleNamespace(
+            headers={"opc-work-request-id": "wr-node-pool-delete"}
         )
 
     def list_addons(self, cluster_id):
@@ -419,6 +459,48 @@ class OciBackendMutationTests(unittest.TestCase):
                 1,
                 PoolCreateSpec(pool_type="cpu", shape="VM.GPU.A10.1"),
             )
+
+    def test_whole_pool_delete_routes_to_owning_oci_api(self):
+        backend = _backend()
+
+        managed = backend.delete_managed_node_pool("node-pool-1")
+        cluster_network = backend.terminate_cluster_network("cluster-network-1")
+        instance_pool = backend.terminate_instance_pool("instance-pool-1")
+
+        self.assertEqual("wr-node-pool-delete", managed)
+        self.assertEqual("wr-cluster-network-delete", cluster_network)
+        self.assertEqual("wr-instance-pool-delete", instance_pool)
+
+    def test_instance_configuration_cleanup_requires_mgmt_ownership_tag(self):
+        owned = _instance_configuration()
+        owned.freeform_tags["mgmt-oke-created"] = "true"
+        backend = _backend(instance_configuration=owned)
+
+        backend.delete_mgmt_created_instance_configuration(
+            "instance-configuration-source"
+        )
+
+        self.assertEqual(
+            (
+                "delete_instance_configuration",
+                "instance-configuration-source",
+            ),
+            backend._compute_mgmt.calls[-1],
+        )
+
+        unowned = _instance_configuration()
+        backend = _backend(instance_configuration=unowned)
+        with self.assertRaisesRegex(OciDiscoveryError, "not tagged"):
+            backend.delete_mgmt_created_instance_configuration(
+                "instance-configuration-source"
+            )
+        self.assertNotIn(
+            (
+                "delete_instance_configuration",
+                "instance-configuration-source",
+            ),
+            backend._compute_mgmt.calls,
+        )
 
     def test_resize_managed_node_pool_sends_only_size(self):
         backend = _backend()
@@ -1061,6 +1143,38 @@ class OciBackendDiscoveryTests(unittest.TestCase):
         self.assertEqual("rollout failed", discovered[1].error)
         self.assertFalse(discovered[1].active)
 
+    def test_cluster_network_discovery_records_owned_instance_configuration(self):
+        cluster_network = SimpleNamespace(
+            id="cluster-network-1",
+            display_name="rdma-batch",
+            lifecycle_state="RUNNING",
+            freeform_tags={"mgmt-oke-created": "true"},
+            instance_pools=[SimpleNamespace(id="instance-pool-1")],
+        )
+        instance_pool = SimpleNamespace(
+            id="instance-pool-1",
+            display_name="rdma-batch",
+            lifecycle_state="RUNNING",
+            size=1,
+            instance_configuration_id="instance-configuration-1",
+            freeform_tags={"mgmt-oke-created": "true"},
+            placement_configurations=[],
+        )
+        backend = _backend()
+        backend._compute_mgmt = _ComputeManagement(
+            cluster_network=cluster_network,
+            instance_pools=[instance_pool],
+            instances={"instance-pool-1": []},
+        )
+
+        discovered = backend.list_cluster_network_pools("compartment-1")[0]
+
+        self.assertEqual(
+            "instance-configuration-1",
+            discovered.instance_configuration_id,
+        )
+        self.assertTrue(discovered.created_by_mgmt_oke)
+
     def test_instance_pool_discovery_hides_managed_backing_pools(self):
         pools = [
             SimpleNamespace(
@@ -1087,6 +1201,8 @@ class OciBackendDiscoveryTests(unittest.TestCase):
                 display_name="standalone",
                 lifecycle_state="RUNNING",
                 size=1,
+                instance_configuration_id="instance-configuration-standalone",
+                freeform_tags={"mgmt-oke-created": "true"},
                 placement_configurations=[],
             ),
         ]
@@ -1119,6 +1235,11 @@ class OciBackendDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(["standalone"], [pool.name for pool in discovered])
         self.assertEqual("instance-pool", discovered[0].placement_type)
+        self.assertEqual(
+            "instance-configuration-standalone",
+            discovered[0].instance_configuration_id,
+        )
+        self.assertTrue(discovered[0].created_by_mgmt_oke)
 
     def test_instance_pool_in_unmanaged_compute_cluster_remains_visible(self):
         pool = SimpleNamespace(
