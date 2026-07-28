@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, patch
 
@@ -104,10 +106,11 @@ class _ApiError(Exception):
 
 
 class _KubernetesModelsClient(_Client):
-    def __init__(self, core, policy=None, coordination=None):
+    def __init__(self, core, policy=None, coordination=None, custom=None):
         super().__init__(core)
         self.policy = policy or Mock()
         self.coordination = coordination or Mock()
+        self.custom = custom or Mock()
 
     def PolicyV1Api(self):
         return self.policy
@@ -115,9 +118,13 @@ class _KubernetesModelsClient(_Client):
     def CoordinationV1Api(self):
         return self.coordination
 
+    def CustomObjectsApi(self):
+        return self.custom
+
     @staticmethod
     def V1ObjectMeta(**kwargs):
-        return SimpleNamespace(resource_version=None, **kwargs)
+        kwargs.setdefault("resource_version", None)
+        return SimpleNamespace(**kwargs)
 
     @staticmethod
     def V1DeleteOptions(**kwargs):
@@ -133,6 +140,14 @@ class _KubernetesModelsClient(_Client):
 
     @staticmethod
     def V1Lease(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    @staticmethod
+    def V1ConfigMap(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    @staticmethod
+    def V1Preconditions(**kwargs):
         return SimpleNamespace(**kwargs)
 
 
@@ -196,6 +211,203 @@ class KubernetesBackendTests(unittest.TestCase):
         self.assertEqual("oke-rdma", node.pool_name)
         self.assertEqual("ocid1.instance.oc1.lhr.node1", node.instance_ocid)
         self.assertEqual("boot-session-1", node.boot_id)
+
+    def test_list_nodes_reports_kubelet_version(self):
+        node_object = _node()
+        node_object.status.node_info.kubelet_version = "v1.35.3"
+        backend = KubernetesBackend()
+        backend._loaded = True
+        backend._client = _Client(_CoreApi([node_object], []))
+
+        self.assertEqual("v1.35.3", backend.list_nodes()[0].kubelet_version)
+
+    def test_upgrade_pod_check_is_read_only_and_ignores_scheduler_infrastructure(self):
+        pods = [
+            _pod("training", owner_kind="Job"),
+            _pod("daemon", owner_kind="DaemonSet"),
+            _pod(
+                "controller",
+                labels={
+                    "app.kubernetes.io/name": "kueue",
+                    "app.kubernetes.io/component": "controller",
+                },
+            ),
+        ]
+        core = _CoreApi([], pods)
+        core.create_namespaced_pod_eviction = Mock()
+        backend = KubernetesBackend()
+        backend._loaded = True
+        backend._client = _KubernetesModelsClient(core)
+
+        blockers = backend.list_upgrade_blocking_pods({"node-1"})
+
+        self.assertEqual(["training"], [pod.name for pod in blockers])
+        core.create_namespaced_pod_eviction.assert_not_called()
+
+    def test_slurmctld_exec_requires_one_running_named_container(self):
+        slurmctld = SimpleNamespace(
+            metadata=SimpleNamespace(
+                name="slurm-controller-0",
+                namespace="slurm",
+            ),
+            spec=SimpleNamespace(
+                containers=[SimpleNamespace(name="slurmctld")]
+            ),
+            status=SimpleNamespace(phase="Running"),
+        )
+        core = _CoreApi([], [slurmctld])
+        core.connect_get_namespaced_pod_exec = Mock()
+        backend = KubernetesBackend()
+        backend._loaded = True
+        backend._client = _Client(core)
+
+        with patch(
+            "kubernetes.stream.stream",
+            return_value="NodeName=worker-1 State=DRAIN",
+        ) as stream:
+            result = backend.exec_slurmctld(
+                ("scontrol", "show", "node", "worker-1", "--oneliner")
+            )
+
+        self.assertEqual("NodeName=worker-1 State=DRAIN", result)
+        self.assertEqual(
+            ["scontrol", "show", "node", "worker-1", "--oneliner"],
+            stream.call_args.kwargs["command"],
+        )
+        self.assertEqual("slurmctld", stream.call_args.kwargs["container"])
+        core.pods.append(
+            SimpleNamespace(
+                metadata=SimpleNamespace(
+                    name="slurm-controller-1",
+                    namespace="slurm",
+                ),
+                spec=SimpleNamespace(
+                    containers=[SimpleNamespace(name="slurmctld")]
+                ),
+                status=SimpleNamespace(phase="Running"),
+            )
+        )
+
+        with self.assertRaisesRegex(
+            KubernetesDiscoveryError,
+            "exactly one running slurmctld container, found 2",
+        ):
+            backend.exec_slurmctld(("squeue",))
+
+    def test_kueue_discovery_distinguishes_absent_crds_from_rbac_failure(self):
+        missing = Mock()
+        missing.list_cluster_custom_object.side_effect = _ApiError(
+            404,
+            "missing",
+        )
+        backend = KubernetesBackend()
+        backend._loaded = True
+        backend._client = _KubernetesModelsClient(
+            _CoreApi([], []),
+            custom=missing,
+        )
+        self.assertEqual([], backend.get_kueue_summary().cluster_queues)
+
+        forbidden = Mock()
+        forbidden.list_cluster_custom_object.side_effect = _ApiError(
+            403,
+            "forbidden",
+        )
+        backend._client = _KubernetesModelsClient(
+            _CoreApi([], []),
+            custom=forbidden,
+        )
+        with self.assertRaisesRegex(
+            KubernetesDiscoveryError,
+            "Unable to verify Kueue",
+        ):
+            backend.get_kueue_summary()
+
+    def test_upgrade_checkpoint_uses_resource_version_for_replace_and_delete(self):
+        from oke_hpc_mgmt.upgrades import UpgradeCheckpoint
+
+        checkpoint = UpgradeCheckpoint.create(
+            cluster_id="cluster",
+            source_version="v1.34.1",
+            target_version="v1.35.2",
+            control_plane_steps=("v1.35.2",),
+            pool_order=("cpu",),
+            strategies={"cpu": "boot-volume-replace"},
+        )
+        core = _CoreApi([], [])
+        stored = SimpleNamespace(
+            metadata=SimpleNamespace(resource_version="7"),
+            data={"checkpoint.json": checkpoint.to_json()},
+        )
+        core.read_namespaced_config_map = Mock(return_value=stored)
+        core.replace_namespaced_config_map = Mock(
+            return_value=SimpleNamespace(
+                metadata=SimpleNamespace(resource_version="8")
+            )
+        )
+        core.delete_namespaced_config_map = Mock()
+        backend = KubernetesBackend()
+        backend._loaded = True
+        backend._client = _KubernetesModelsClient(core)
+
+        restored, resource_version = backend.read_upgrade_checkpoint()
+        written = backend.write_upgrade_checkpoint(restored, resource_version)
+        backend.delete_upgrade_checkpoint(written)
+
+        self.assertEqual(checkpoint, restored)
+        self.assertEqual("8", written)
+        body = core.replace_namespaced_config_map.call_args.args[2]
+        self.assertEqual("7", body.metadata.resource_version)
+        delete_body = core.delete_namespaced_config_map.call_args.kwargs["body"]
+        self.assertEqual("8", delete_body.preconditions.resource_version)
+
+    def test_upgrade_checkpoint_reports_optimistic_concurrency_conflict(self):
+        from oke_hpc_mgmt.upgrades import UpgradeCheckpoint
+
+        checkpoint = UpgradeCheckpoint.create(
+            cluster_id="cluster",
+            source_version="v1.34.1",
+            target_version="v1.35.2",
+            control_plane_steps=("v1.35.2",),
+            pool_order=(),
+            strategies={},
+        )
+        core = _CoreApi([], [])
+        core.replace_namespaced_config_map = Mock(
+            side_effect=_ApiError(409, "conflict")
+        )
+        backend = KubernetesBackend()
+        backend._loaded = True
+        backend._client = _KubernetesModelsClient(core)
+
+        with self.assertRaisesRegex(
+            KubernetesDiscoveryError,
+            "changed concurrently",
+        ):
+            backend.write_upgrade_checkpoint(checkpoint, "7")
+
+    def test_cluster_connection_data_returns_active_host_and_base64_ca(self):
+        class Configuration:
+            @staticmethod
+            def get_default_copy():
+                return SimpleNamespace(
+                    host="https://10.0.0.10:6443/",
+                    ssl_ca_cert=str(ca_path),
+                )
+
+        with TemporaryDirectory() as directory:
+            ca_path = Path(directory) / "ca.crt"
+            ca_path.write_bytes(b"certificate")
+            client = _Client(_CoreApi([], []))
+            client.Configuration = Configuration
+            backend = KubernetesBackend()
+            backend._loaded = True
+            backend._client = client
+
+            endpoint, certificate = backend.cluster_connection_data()
+
+        self.assertEqual("10.0.0.10:6443", endpoint)
+        self.assertEqual("Y2VydGlmaWNhdGU=", certificate)
 
     def test_list_nodes_tolerates_pod_list_failure(self):
         core = _CoreApi([_node()], [])

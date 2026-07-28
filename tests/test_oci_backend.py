@@ -8,7 +8,12 @@ from oke_hpc_mgmt.backends.oci import (
     _clone_pool_freeform_tags,
     _retarget_oke_node_labels,
 )
-from oke_hpc_mgmt.models import PoolBootVolumeReplaceSpec, PoolCreateSpec
+from oke_hpc_mgmt.models import (
+    AddonInfo,
+    PoolBootVolumeReplaceSpec,
+    PoolCreateSpec,
+    WorkerPoolInfo,
+)
 
 
 class _Model:
@@ -32,7 +37,10 @@ class _ComputeManagement:
 
     def get_cluster_network(self, cluster_network_id):
         self.calls.append(("get_cluster_network", cluster_network_id))
-        return SimpleNamespace(data=self.cluster_network)
+        return SimpleNamespace(
+            data=self.cluster_network,
+            headers={"etag": "cluster-network-etag"},
+        )
 
     def list_cluster_networks(self, compartment_id):
         self.calls.append(("list_cluster_networks", compartment_id))
@@ -41,8 +49,9 @@ class _ComputeManagement:
         )
         return SimpleNamespace(data=cluster_networks)
 
-    def update_cluster_network(self, cluster_network_id, details):
-        self.calls.append(("update_cluster_network", cluster_network_id, details))
+    def update_cluster_network(self, cluster_network_id, details, **kwargs):
+        call = ("update_cluster_network", cluster_network_id, details)
+        self.calls.append(call + (kwargs,) if kwargs else call)
         return SimpleNamespace(headers={"opc-work-request-id": "wr-cluster-network"})
 
     def create_cluster_network(self, details, **kwargs):
@@ -72,9 +81,17 @@ class _ComputeManagement:
         )
         return SimpleNamespace(headers={})
 
-    def update_instance_pool(self, instance_pool_id, details):
-        self.calls.append(("update_instance_pool", instance_pool_id, details))
+    def update_instance_pool(self, instance_pool_id, details, **kwargs):
+        call = ("update_instance_pool", instance_pool_id, details)
+        self.calls.append(call + (kwargs,) if kwargs else call)
         return SimpleNamespace(headers={"opc-work-request-id": "wr-instance-pool"})
+
+    def create_instance_pool(self, details, **kwargs):
+        self.calls.append(("create_instance_pool", details, kwargs))
+        return SimpleNamespace(
+            data=SimpleNamespace(id="instance-pool-blue"),
+            headers={"opc-work-request-id": "wr-instance-pool-blue"},
+        )
 
     def get_instance_pool(self, instance_pool_id):
         self.calls.append(("get_instance_pool", instance_pool_id))
@@ -83,7 +100,10 @@ class _ComputeManagement:
             for pool in self.instance_pools
             if pool.id == instance_pool_id
         )
-        return SimpleNamespace(data=instance_pool)
+        return SimpleNamespace(
+            data=instance_pool,
+            headers={"etag": "instance-pool-etag"},
+        )
 
     def terminate_cluster_network(self, cluster_network_id):
         self.calls.append(("terminate_cluster_network", cluster_network_id))
@@ -115,11 +135,29 @@ class _ContainerEngine:
         self.node_pools = node_pools or []
         self.addons = addons or []
         self.cluster = cluster
+        self.addon_options = []
         self.calls = []
 
     def get_cluster(self, cluster_id):
         self.calls.append(("get_cluster", cluster_id))
-        return SimpleNamespace(data=self.cluster)
+        return SimpleNamespace(
+            data=self.cluster,
+            headers={"etag": "cluster-etag"},
+        )
+
+    def get_cluster_options(self, cluster_id, **kwargs):
+        self.calls.append(("get_cluster_options", cluster_id, kwargs))
+        return SimpleNamespace(
+            data=SimpleNamespace(
+                kubernetes_versions=["v1.35.3", "v1.36.2"]
+            )
+        )
+
+    def update_cluster(self, cluster_id, details, **kwargs):
+        self.calls.append(("update_cluster", cluster_id, details, kwargs))
+        return SimpleNamespace(
+            headers={"opc-work-request-id": "wr-cluster-upgrade"}
+        )
 
     def list_node_pools(self, **kwargs):
         self.calls.append(("list_node_pools", kwargs))
@@ -169,6 +207,12 @@ class _ContainerEngine:
         self.calls.append(("list_addons", cluster_id))
         return SimpleNamespace(data=self.addons)
 
+    def list_addon_options(self, kubernetes_version, **kwargs):
+        self.calls.append(
+            ("list_addon_options", kubernetes_version, kwargs)
+        )
+        return SimpleNamespace(data=self.addon_options)
+
 
 class _WorkRequests:
     def __init__(self, status="SUCCEEDED", percent=100.0, errors=None, summaries=None):
@@ -203,14 +247,55 @@ class _Compute:
         self.shapes = shapes or {}
         self.boot_volume_ids = boot_volume_ids or {}
         self.image_operating_systems = image_operating_systems or {}
+        self.calls = []
+        self.gpu_memory_clusters = []
+        self.gpu_memory_cluster = None
 
     def get_instance(self, instance_id):
+        self.calls.append(("get_instance", instance_id))
         return SimpleNamespace(
             data=SimpleNamespace(
                 shape=self.shapes.get(instance_id),
                 availability_domain="AD-1",
                 compartment_id="compartment-1",
-            )
+            ),
+            headers={"etag": "instance-etag"},
+        )
+
+    def update_instance(self, instance_id, details, **kwargs):
+        self.calls.append(("update_instance", instance_id, details, kwargs))
+        return SimpleNamespace(data=SimpleNamespace(id=instance_id), headers={})
+
+    def terminate_instance(self, instance_id, **kwargs):
+        self.calls.append(("terminate_instance", instance_id, kwargs))
+        return SimpleNamespace(headers={})
+
+    def list_compute_gpu_memory_clusters(self, compartment_id):
+        return SimpleNamespace(data=self.gpu_memory_clusters)
+
+    def get_compute_gpu_memory_cluster(self, cluster_id):
+        self.calls.append(("get_compute_gpu_memory_cluster", cluster_id))
+        return SimpleNamespace(
+            data=self.gpu_memory_cluster,
+            headers={"etag": "gmc-etag"},
+        )
+
+    def list_compute_gpu_memory_cluster_instances(self, cluster_id):
+        return SimpleNamespace(data=[])
+
+    def update_compute_gpu_memory_cluster(self, cluster_id, details, **kwargs):
+        self.calls.append(
+            ("update_compute_gpu_memory_cluster", cluster_id, details, kwargs)
+        )
+        return SimpleNamespace(headers={"opc-work-request-id": "wr-gmc"})
+
+    def create_compute_gpu_memory_cluster(self, details, **kwargs):
+        self.calls.append(
+            ("create_compute_gpu_memory_cluster", details, kwargs)
+        )
+        return SimpleNamespace(
+            data=SimpleNamespace(id="gmc-blue"),
+            headers={"opc-work-request-id": "wr-gmc-blue"},
         )
 
     def list_boot_volume_attachments(
@@ -341,6 +426,7 @@ def _backend(cluster_network=None, instance_configuration=None, node_pools=None)
             models=SimpleNamespace(
                 UpdateNodePoolNodeConfigDetails=_Model,
                 UpdateNodePoolDetails=_Model,
+                UpdateClusterDetails=_Model,
                 CreateNodePoolDetails=_Model,
                 CreateNodePoolNodeConfigDetails=_Model,
                 NodePoolPlacementConfigDetails=_Model,
@@ -365,6 +451,11 @@ def _backend(cluster_network=None, instance_configuration=None, node_pools=None)
                 CreateInstanceConfigurationDetails=_Model,
                 UpdateInstancePoolDetails=_Model,
                 DetachInstancePoolInstanceDetails=_Model,
+                UpdateInstanceDetails=_Model,
+                UpdateInstanceSourceViaImageDetails=_Model,
+                UpdateComputeGpuMemoryClusterDetails=_Model,
+                CreateInstancePoolDetails=_Model,
+                CreateComputeGpuMemoryClusterDetails=_Model,
             )
         )
     )
@@ -452,6 +543,304 @@ def _managed_node_pool(shape="VM.Standard.E5.Flex"):
 
 
 class OciBackendMutationTests(unittest.TestCase):
+    def test_control_plane_upgrade_uses_cluster_etag(self):
+        cluster = SimpleNamespace(
+            id="cluster-1",
+            compartment_id="compartment-1",
+            kubernetes_version="v1.35.2",
+            available_kubernetes_upgrades=["v1.35.3"],
+            lifecycle_state="ACTIVE",
+            type="ENHANCED_CLUSTER",
+            endpoints=SimpleNamespace(
+                private_endpoint="10.0.0.1:6443",
+                public_endpoint=None,
+                kubernetes=None,
+            ),
+        )
+        backend = _backend()
+        backend._container_engine.cluster = cluster
+
+        info = backend.get_cluster_info("cluster-1")
+        work_request = backend.upgrade_control_plane(
+            "cluster-1",
+            "v1.35.3",
+            info.etag,
+        )
+
+        self.assertEqual("cluster-etag", info.etag)
+        self.assertIn("v1.36.2", info.available_kubernetes_versions)
+        self.assertEqual("wr-cluster-upgrade", work_request)
+        call = backend._container_engine.calls[-1]
+        self.assertEqual("update_cluster", call[0])
+        self.assertEqual("cluster-etag", call[3]["if_match"])
+        self.assertEqual("v1.35.3", call[2].kubernetes_version)
+
+    def test_managed_upgrade_builds_expected_cycling_modes_and_etag(self):
+        source = _managed_node_pool("VM.GPU.A10.1")
+        backend = _backend(node_pools=[source])
+
+        bvr, etag, bvr_preview = backend.preview_managed_pool_upgrade(
+            source.id,
+            "v1.35.3",
+            strategy="boot-volume-replace",
+        )
+        replacement, _, replacement_preview = (
+            backend.preview_managed_pool_upgrade(
+                source.id,
+                "v1.35.3",
+                strategy="instance-replace",
+            )
+        )
+        launch_configuration, _, launch_preview = (
+            backend.preview_managed_pool_upgrade(
+                source.id,
+                "v1.35.3",
+                strategy="boot-volume-replace",
+                enable_cycling=False,
+            )
+        )
+        work_request = backend.upgrade_managed_pool(
+            source.id,
+            bvr,
+            etag,
+        )
+
+        self.assertEqual("node-pool-etag", etag)
+        self.assertEqual(["BOOT_VOLUME_REPLACE"], bvr.node_pool_cycling_details.cycle_modes)
+        self.assertEqual("1", bvr_preview["maximum_unavailable"])
+        self.assertEqual(["INSTANCE_REPLACE"], replacement.node_pool_cycling_details.cycle_modes)
+        self.assertEqual("0", replacement_preview["maximum_unavailable"])
+        self.assertEqual("1", replacement_preview["maximum_surge"])
+        self.assertIsNone(
+            getattr(
+                launch_configuration,
+                "node_pool_cycling_details",
+                None,
+            )
+        )
+        self.assertEqual(
+            "launch-configuration",
+            launch_preview["phase"],
+        )
+        self.assertEqual("wr-node-pool", work_request)
+        self.assertEqual(
+            "node-pool-etag",
+            backend._container_engine.calls[-1][3]["if_match"],
+        )
+
+    def test_self_managed_upgrade_clone_preserves_bootstrap_and_refreshes_target(self):
+        backend = _backend()
+        source = backend._compute_mgmt.instance_configuration
+        original_metadata = dict(
+            source.instance_details.launch_details.metadata
+        )
+
+        details, preview = backend.preview_instance_configuration_upgrade(
+            source.id,
+            "v1.35.3",
+            operation_id="operation-1",
+            api_server="10.0.0.2:6443",
+            cluster_ca="new-certificate",
+        )
+
+        metadata = details.instance_details.launch_details.metadata
+        self.assertEqual("v1.35.3", metadata["oke-k8version"])
+        self.assertEqual("10.0.0.2:6443", metadata["apiserver_host"])
+        self.assertEqual("new-certificate", metadata["cluster_ca_cert"])
+        self.assertIn("oke-initial-node-labels", metadata)
+        self.assertEqual(
+            original_metadata["oke-initial-node-labels"],
+            metadata["oke-initial-node-labels"],
+        )
+        self.assertTrue(preview["api_server_refreshed"])
+        self.assertEqual(
+            "operation-1",
+            details.freeform_tags["mgmt-oke-upgrade-operation"],
+        )
+
+    def test_upgrade_instance_configuration_retry_token_is_operation_stable(self):
+        backend = _backend()
+        source_id = backend._compute_mgmt.instance_configuration.id
+
+        for _attempt in range(2):
+            backend.create_upgrade_instance_configuration(
+                source_id,
+                "v1.35.3",
+                operation_id="operation-1",
+                api_server="10.0.0.2:6443",
+                cluster_ca="new-certificate",
+            )
+
+        calls = [
+            call
+            for call in backend._compute_mgmt.calls
+            if call[0] == "create_instance_configuration"
+        ]
+        self.assertEqual(
+            calls[-2][2]["opc_retry_token"],
+            calls[-1][2]["opc_retry_token"],
+        )
+
+    def test_self_managed_bvr_preserves_instance_and_old_boot_volume(self):
+        backend = _backend()
+        backend._compute.shapes["instance-1"] = "BM.GPU4.8"
+        (
+            backend._compute_mgmt.instance_configuration
+            .instance_details.launch_details.metadata["oke-k8version"]
+        ) = "v1.35.3"
+
+        backend.replace_self_managed_instance_boot_volume(
+            "instance-1",
+            "instance-configuration-source",
+        )
+
+        call = backend._compute.calls[-1]
+        self.assertEqual("update_instance", call[0])
+        self.assertEqual("instance-1", call[1])
+        self.assertTrue(
+            call[2].source_details.is_preserve_boot_volume_enabled
+        )
+        self.assertEqual("instance-etag", call[3]["if_match"])
+
+    def test_upgrade_configuration_attachment_uses_etag_for_all_self_managed_backends(self):
+        cluster_network = SimpleNamespace(
+            id="cluster-network-1",
+            display_name="oke-rdma",
+            defined_tags={},
+            freeform_tags={},
+            instance_pools=[
+                SimpleNamespace(
+                    id="instance-pool-1",
+                    display_name="oke-rdma",
+                    size=2,
+                    instance_configuration_id="config-old",
+                    defined_tags={},
+                    freeform_tags={},
+                )
+            ],
+        )
+        instance_pool = SimpleNamespace(
+            id="instance-pool-2",
+            display_name="standalone",
+            compartment_id="compartment-1",
+            size=1,
+            instance_configuration_id="config-old",
+            placement_configurations=[],
+            freeform_tags={},
+            defined_tags={},
+        )
+        backend = _backend(cluster_network=cluster_network)
+        backend._compute_mgmt.instance_pools = [instance_pool]
+        backend._compute.gpu_memory_cluster = SimpleNamespace(
+            id="gmc-1",
+            display_name="gmc",
+            compartment_id="compartment-1",
+            availability_domain="AD-1",
+            size=1,
+            instance_configuration_id="config-old",
+            gpu_memory_fabric_id="fabric-1",
+            compute_cluster_id="compute-cluster-1",
+            freeform_tags={},
+            defined_tags={},
+        )
+
+        requests = [
+            backend.attach_upgrade_instance_configuration(
+                WorkerPoolInfo(
+                    name="oke-rdma",
+                    kind="cluster-network",
+                    cluster_network_id="cluster-network-1",
+                    instance_pool_id="instance-pool-1",
+                ),
+                "config-new",
+            ),
+            backend.attach_upgrade_instance_configuration(
+                WorkerPoolInfo(
+                    name="standalone",
+                    kind="instance-pool",
+                    instance_pool_id="instance-pool-2",
+                ),
+                "config-new",
+            ),
+            backend.attach_upgrade_instance_configuration(
+                WorkerPoolInfo(
+                    name="gmc",
+                    kind="gpu-memory-cluster",
+                    gpu_memory_cluster_id="gmc-1",
+                ),
+                "config-new",
+            ),
+        ]
+
+        self.assertEqual(
+            ["wr-cluster-network", "wr-instance-pool", "wr-gmc"],
+            requests,
+        )
+        cluster_call = next(
+            call
+            for call in backend._compute_mgmt.calls
+            if call[0] == "update_cluster_network"
+        )
+        self.assertEqual("cluster-network-etag", cluster_call[3]["if_match"])
+        pool_call = next(
+            call
+            for call in backend._compute_mgmt.calls
+            if call[0] == "update_instance_pool"
+        )
+        self.assertEqual("instance-pool-etag", pool_call[3]["if_match"])
+        gmc_call = next(
+            call
+            for call in backend._compute.calls
+            if call[0] == "update_compute_gpu_memory_cluster"
+        )
+        self.assertEqual("gmc-etag", gmc_call[3]["if_match"])
+
+    def test_gmc_blue_green_requires_explicit_placement_and_clones_source(self):
+        backend = _backend()
+        backend._compute.gpu_memory_cluster = SimpleNamespace(
+            id="gmc-1",
+            display_name="gmc",
+            compartment_id="compartment-1",
+            availability_domain="AD-1",
+            size=2,
+            gpu_memory_cluster_scale_config=SimpleNamespace(),
+            freeform_tags={"team": "ai"},
+            defined_tags={},
+        )
+        pool = WorkerPoolInfo(
+            name="gmc",
+            kind="gpu-memory-cluster",
+            desired_size=2,
+            gpu_memory_cluster_id="gmc-1",
+        )
+
+        with self.assertRaisesRegex(OciDiscoveryError, "requires explicit"):
+            backend.create_gpu_memory_cluster_blue_green(
+                pool,
+                target_instance_configuration_id="config-new",
+                name="gmc-green",
+                operation_id="operation-1",
+                compute_cluster_id=None,
+                gpu_memory_fabric_id=None,
+            )
+        cluster_id, request_id = (
+            backend.create_gpu_memory_cluster_blue_green(
+                pool,
+                target_instance_configuration_id="config-new",
+                name="gmc-green",
+                operation_id="operation-1",
+                compute_cluster_id="compute-green",
+                gpu_memory_fabric_id="fabric-green",
+            )
+        )
+
+        self.assertEqual("gmc-blue", cluster_id)
+        self.assertEqual("wr-gmc-blue", request_id)
+        details = backend._compute.calls[-1][1]
+        self.assertEqual("compute-green", details.compute_cluster_id)
+        self.assertEqual("fabric-green", details.gpu_memory_fabric_id)
+        self.assertEqual("config-new", details.instance_configuration_id)
+
     def test_create_managed_gpu_pool_applies_custom_image_and_network_overrides(self):
         source = _managed_node_pool("VM.GPU.A10.1")
         backend = _backend(node_pools=[source])
@@ -538,10 +927,14 @@ class OciBackendMutationTests(unittest.TestCase):
     def test_instance_configuration_cleanup_requires_mgmt_ownership_tag(self):
         owned = _instance_configuration()
         owned.freeform_tags["mgmt-oke-created"] = "true"
+        owned.freeform_tags[
+            "mgmt-oke-upgrade-operation"
+        ] = "operation-1"
         backend = _backend(instance_configuration=owned)
 
         backend.delete_mgmt_created_instance_configuration(
-            "instance-configuration-source"
+            "instance-configuration-source",
+            operation_id="operation-1",
         )
 
         self.assertEqual(
@@ -565,6 +958,13 @@ class OciBackendMutationTests(unittest.TestCase):
             ),
             backend._compute_mgmt.calls,
         )
+
+        backend = _backend(instance_configuration=owned)
+        with self.assertRaisesRegex(OciDiscoveryError, "not owned"):
+            backend.delete_mgmt_created_instance_configuration(
+                "instance-configuration-source",
+                operation_id="operation-2",
+            )
 
     def test_resize_managed_node_pool_sends_only_size(self):
         backend = _backend()
@@ -1303,6 +1703,145 @@ class OciBackendMutationTests(unittest.TestCase):
 
 
 class OciBackendDiscoveryTests(unittest.TestCase):
+    def test_addon_compatibility_blocks_only_unsupported_pinned_version(self):
+        backend = _backend()
+        backend._container_engine.addon_options = [
+            SimpleNamespace(
+                name="NvidiaGpuOperator",
+                versions=[
+                    SimpleNamespace(
+                        version_number="v25.3",
+                        kubernetes_version_filters=SimpleNamespace(
+                            exact_kubernetes_versions=["v1.36.1"],
+                            minimal_version=None,
+                            maximum_version=None,
+                        ),
+                    )
+                ],
+            )
+        ]
+
+        compatibility = backend.get_addon_compatibility(
+            "v1.36.1",
+            [
+                AddonInfo(
+                    name="NvidiaGpuOperator",
+                    version="v24.9",
+                    update_mode="MANUAL",
+                ),
+                AddonInfo(
+                    name="NvidiaGpuOperator",
+                    version="v24.9",
+                    update_mode="AUTOMATIC",
+                ),
+            ],
+        )
+
+        self.assertFalse(compatibility[0].compatible)
+        self.assertIn("Pinned version", compatibility[0].reason or "")
+        self.assertTrue(compatibility[1].compatible)
+
+    def test_addon_compatibility_uses_selected_pinned_version_not_old_installed_build(self):
+        backend = _backend()
+        backend._container_engine.addon_options = [
+            SimpleNamespace(
+                name="NvidiaGpuOperator",
+                versions=[
+                    SimpleNamespace(
+                        version_number="v25.3",
+                        kubernetes_version_filters=SimpleNamespace(
+                            exact_kubernetes_versions=["v1.36.1"],
+                            minimal_version=None,
+                            maximum_version=None,
+                        ),
+                    )
+                ],
+            )
+        ]
+
+        compatibility = backend.get_addon_compatibility(
+            "v1.36.1",
+            [
+                AddonInfo(
+                    name="NvidiaGpuOperator",
+                    version="v24.9",
+                    selected_version="v25.3",
+                    update_mode="PINNED",
+                )
+            ],
+        )
+
+        self.assertTrue(compatibility[0].compatible)
+        self.assertEqual("v24.9", compatibility[0].installed_version)
+
+    def test_addon_compatibility_requires_a_supported_target_build(self):
+        backend = _backend()
+        backend._container_engine.addon_options = [
+            SimpleNamespace(
+                name="NvidiaGpuOperator",
+                versions=[
+                    SimpleNamespace(
+                        version_number="v25.3",
+                        kubernetes_version_filters=SimpleNamespace(
+                            exact_kubernetes_versions=["v1.35.2"],
+                            minimal_version=None,
+                            maximum_version=None,
+                        ),
+                    )
+                ],
+            )
+        ]
+
+        compatibility = backend.get_addon_compatibility(
+            "v1.36.1",
+            [
+                AddonInfo(
+                    name="NvidiaGpuOperator",
+                    version="v25.3",
+                    lifecycle_state="ACTIVE",
+                    update_mode="AUTOMATIC",
+                )
+            ],
+        )
+
+        self.assertFalse(compatibility[0].compatible)
+        self.assertIn(
+            "no supported version",
+            compatibility[0].reason or "",
+        )
+
+    def test_gpu_memory_cluster_discovery_records_ownership_and_placement(self):
+        backend = _backend()
+        summary = SimpleNamespace(
+            id="gmc-1",
+            display_name="oke-gmc",
+            lifecycle_state="ACTIVE",
+        )
+        backend._compute.gpu_memory_clusters = [summary]
+        backend._compute.gpu_memory_cluster = SimpleNamespace(
+            id="gmc-1",
+            display_name="oke-gmc",
+            lifecycle_state="ACTIVE",
+            compartment_id="compartment-1",
+            availability_domain="AD-1",
+            size=4,
+            instance_configuration_id="instance-configuration-source",
+            gpu_memory_fabric_id="fabric-1",
+            compute_cluster_id="compute-cluster-1",
+            freeform_tags={"mgmt-oke-created": "true"},
+        )
+
+        discovered = backend.list_gpu_memory_cluster_pools(
+            "compartment-1"
+        )[0]
+
+        self.assertEqual("gpu-memory-cluster", discovered.kind)
+        self.assertEqual("gmc-1", discovered.gpu_memory_cluster_id)
+        self.assertEqual("fabric-1", discovered.gpu_memory_fabric_id)
+        self.assertEqual("compute-cluster-1", discovered.compute_cluster_id)
+        self.assertTrue(discovered.rdma_enabled)
+        self.assertTrue(discovered.created_by_mgmt_oke)
+
     def test_get_cluster_type(self):
         backend = _backend()
         backend._container_engine.cluster = SimpleNamespace(
@@ -1395,7 +1934,11 @@ class OciBackendDiscoveryTests(unittest.TestCase):
         discovered = backend.list_cluster_addons("cluster-1")
 
         self.assertEqual("v0.17.3-1", discovered[0].version)
+        self.assertIsNone(discovered[0].selected_version)
+        self.assertEqual("AUTOMATIC", discovered[0].update_mode)
         self.assertTrue(discovered[0].active)
+        self.assertEqual("v25.10.0", discovered[1].selected_version)
+        self.assertEqual("PINNED", discovered[1].update_mode)
         self.assertEqual("rollout failed", discovered[1].error)
         self.assertFalse(discovered[1].active)
 

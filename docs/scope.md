@@ -71,6 +71,41 @@ Management Tool.
 - deterministic pool, node, GPU, RDMA, add-on, and scheduler health checks
 - actionable recommendations derived from health warnings and failures
 - accelerator add-on validation against discovered GPU and RDMA capacity
+- OKE control-plane version, advertised target, virtual-pool version, declared
+  worker version, actual kubelet version, add-on update mode, Kueue stop policy,
+  and GMC ownership discovery
+- typed Kubernetes target resolution, including production minor aliases,
+  preview acknowledgement, downgrade refusal, one-minor control-plane
+  sequencing, and kubelet skew validation
+- read-only `upgrades status`, complete ordered `upgrades plan`, and validated
+  upgrade `--dry-run` commands
+- one-step OKE control-plane upgrades with ETag validation, mandatory
+  convergence waiting, add-on compatibility checks, and automatic add-on and
+  virtual-pool post-verification
+- managed CPU, GPU, and Compute Cluster RDMA worker upgrades through OKE
+  `BOOT_VOLUME_REPLACE`, `INSTANCE_REPLACE`, or complete blue-green node-pool
+  cloning
+- legacy Cluster Network, standalone Instance Pool, and GPU Memory Cluster
+  worker upgrades through structurally cloned Instance Configurations,
+  sequential identity-preserving BVR, surge-first instance replacement, or
+  complete blue-green backend creation
+- self-managed bootstrap preservation for FSS, Lustre, NVMe RAID, pre/post
+  scripts, kubelet arguments, SSH configuration, networking, RDMA agents, and
+  custom metadata, with live API endpoint and cluster CA refresh
+- compatible custom worker image overrides across managed and self-managed
+  upgrade paths
+- read-only workload gates for Kubernetes pods, Kueue ClusterQueue stop policy
+  and admitted workloads, and Slinky partition, node, and job state
+- strict separation between upgrade execution and Kubernetes cordon, drain,
+  eviction, or uncordon APIs
+- separate application, IaC-drift, workload-drain, and verification-unavailable
+  acknowledgements that are not replaced by `--yes`
+- checkpointed `upgrades apply`, observed-state `upgrades resume`, explicit
+  no-rollback `upgrades abandon`, and ownership-checked `upgrades cleanup`
+- optimistic ConfigMap `resourceVersion`, OCI ETag, deterministic create retry
+  token, work-request, and mutation-Lease concurrency controls
+- target-version GPU, RDMA topology, Network Operator VF, add-on, virtual-pool,
+  and Slinky registration verification
 - modular Click command architecture and shell-completion support
 
 ## Documentation
@@ -83,6 +118,7 @@ Management Tool.
 - [`live-pool-creation-validation.md`](live-pool-creation-validation.md)
 - [`live-pool-deletion-validation.md`](live-pool-deletion-validation.md)
 - [`replacing-worker-boot-volumes.md`](replacing-worker-boot-volumes.md)
+- [`kubernetes-upgrades.md`](kubernetes-upgrades.md)
 
 ## Not Implemented Yet
 
@@ -90,3 +126,12 @@ Management Tool.
 - Cluster Autoscaler bounds updates
 - OKE add-on installation, update, or removal
 - Slurm-aware node drain and resume; destructive operations on detected Slinky workers are refused
+- automatic workload cordon, drain, eviction, uncordon, Kueue policy changes,
+  or Slurm state changes as part of an upgrade
+- automatic Terraform or OCI Resource Manager source updates after a live
+  upgrade
+- automatic deletion of source pools after a blue-green migration
+
+GPU Memory Cluster mutation paths are implemented and unit-tested with OCI SDK
+models. Live GMC mutation validation remains pending an available GMC test
+environment.

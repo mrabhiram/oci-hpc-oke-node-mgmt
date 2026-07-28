@@ -21,6 +21,9 @@ capacity naturally vary by deployment.
   cluster without changing any resources.
 - [Command Reference](./command-reference.md): Review every command, selector,
   output control, mutation option, and exit status.
+- [Kubernetes Upgrades](./kubernetes-upgrades.md): Inspect version readiness,
+  plan and execute control-plane and worker upgrades, and recover checkpointed
+  operations without mutating Kubernetes scheduling state.
 - [Architecture](./architecture.md): Understand automatic OCI target discovery,
   worker-pool ownership, API routing, readiness, and safety boundaries.
 

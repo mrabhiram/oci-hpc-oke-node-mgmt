@@ -31,9 +31,20 @@ The controller/operator node must have:
 - additional IAM permissions to create, update, or delete OKE node pools,
   Instance Configurations, Cluster Networks, and Instance Pools when lifecycle
   commands will be used
+- permission to read OKE available Kubernetes versions, virtual node pools, and
+  add-on options when upgrade status or planning will be used
+- permission to update the OKE cluster and node pools; create and update
+  Instance Configurations; update Cluster Networks, Instance Pools, instances,
+  and GPU Memory Clusters; and inspect the resulting work requests when
+  upgrade execution will be used
 - permission to invoke OKE cluster-node boot volume replacement and read
   compute instance, image, boot volume, and work-request state when BVR commands
   will be used
+- Kubernetes RBAC to read nodes, pods, Kueue resources, and Slinky controller
+  pods, plus read-only pod exec for Slinky upgrade verification
+- Kubernetes RBAC to create, get, update, and delete the
+  `kube-system/mgmt-oke-kubernetes-upgrade` ConfigMap and operate the existing
+  `kube-system/mgmt-oke-mutation` Lease when upgrades will be executed
 - an enhanced OKE cluster for boot volume replacement
 - Network access to the Kubernetes API and OCI regional APIs
 
@@ -77,7 +88,7 @@ Verify the package entrypoints:
 Example version output:
 
 ```text
-mgmt-oke, version 0.8.0
+mgmt-oke, version 0.9.0
 ```
 
 ## Upgrade An Existing Installation
@@ -184,6 +195,10 @@ mgmt-oke status
 mgmt-oke health run
 mgmt-oke addons validate --target all
 mgmt-oke reconcile
+mgmt-oke upgrades status
+mgmt-oke upgrades status --to v1.36
+mgmt-oke upgrades plan --to v1.36
+mgmt-oke upgrades apply --to v1.36 --dry-run
 ```
 
 Example `status` result after the validation sequence:
@@ -226,6 +241,12 @@ mgmt-oke nodes drain <node...> [--dry-run]
 mgmt-oke nodes uncordon <node...> [--dry-run]
 mgmt-oke nodes terminate <node...> [--keep-size] [--dry-run] [--wait]
 mgmt-oke nodes boot-volume-replace <node...> [--dry-run] [--wait]
+mgmt-oke clusters upgrade --to <version> [--dry-run]
+mgmt-oke pools upgrade <pool> --to <version> --strategy <strategy> [--dry-run]
+mgmt-oke upgrades apply --to <version> [--dry-run]
+mgmt-oke upgrades resume [--ack-workloads-drained]
+mgmt-oke upgrades abandon [--yes]
+mgmt-oke upgrades cleanup [--yes]
 ```
 
 Safety behavior:
@@ -264,9 +285,23 @@ Safety behavior:
   until a Slurm-aware drain workflow is available. Scale-up remains supported.
 - When the NVIDIA Network Operator add-on is active, RDMA convergence also
   requires allocatable `nvidia.com/rdma-vf` resources.
+- Upgrade status, planning, and `--dry-run` are read-only. Upgrade execution
+  always waits for OCI work requests and observed Kubernetes convergence.
+- The upgrade subsystem never cordons, drains, evicts, or uncordons a worker.
+  Operators prepare workloads externally, then attest that preparation
+  separately from `--yes`.
+- `--emergency-ack-unverified-drain` is accepted only for API, RBAC, or exec
+  verification failures. Positively detected pods, Kueue workloads, or Slurm
+  jobs remain blocking.
+- Full-cluster upgrades store one non-secret, resource-version-protected
+  checkpoint ConfigMap and can resume from observed OCI and Kubernetes state.
+- Upgrade commands query OKE add-on compatibility but never install, update, or
+  remove add-ons.
 
 See [`replacing-worker-boot-volumes.md`](replacing-worker-boot-volumes.md) for
 BVR IAM, image, data-loss, and operational requirements.
+See [`kubernetes-upgrades.md`](kubernetes-upgrades.md) for upgrade IAM, strategy,
+workload-gate, execution, and recovery requirements.
 
 Example managed or self-managed pool resize:
 

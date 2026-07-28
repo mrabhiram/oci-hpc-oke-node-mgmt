@@ -234,6 +234,44 @@ For a managed-pool image update, the dry-run includes separate `current`,
 `effective`, and `updates` fields. Metadata values and SSH key content are not
 printed.
 
+## Kubernetes Upgrade Strategy
+
+The Kubernetes upgrade subsystem can select `boot-volume-replace`, but it is a
+different workflow from the maintenance commands on this page:
+
+```bash
+mgmt-oke pools upgrade <pool-name> \
+  --to v1.36.1 \
+  --strategy boot-volume-replace \
+  --dry-run
+```
+
+For a managed OKE pool, including Compute Cluster RDMA, upgrade BVR sends the
+target Kubernetes version and compatible image through `UpdateNodePool` with
+`BOOT_VOLUME_REPLACE`. It waits for every kubelet and accelerator resource to
+converge at the target.
+
+For a legacy Cluster Network, standalone Instance Pool, or GMC, upgrade BVR:
+
+1. clones the complete existing Instance Configuration
+2. refreshes the current API endpoint and cluster CA
+3. proves the target Kubernetes version in bootstrap metadata and multipart
+   cloud-init
+4. attaches the target configuration to the backend using its ETag
+5. updates each externally prepared instance sequentially with preserved boot
+   volume enabled
+6. verifies the same instance OCID, target kubelet, Ready state, GPU, RDMA
+   topology, and applicable VFs
+
+The upgrade path never calls Kubernetes scheduling or eviction APIs.
+Externally cordon and prepare workloads, then provide the independent workload
+attestation. The existing `nodes boot-volume-replace` and
+`pools boot-volume-replace` maintenance commands retain their documented
+eviction preflight and drain behavior.
+
+See [Kubernetes Upgrades](./kubernetes-upgrades.md) for version sequencing,
+acknowledgements, orchestration, and recovery.
+
 ## Infrastructure As Code
 
 An individual BVR preserves the existing node configuration and does not change

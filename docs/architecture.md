@@ -1,11 +1,13 @@
 # Architecture
 
-This document describes two core behaviors of the OKE HPC Node Management
+This document describes the core behaviors of the OKE HPC Node Management
 Tool:
 
 - automatic discovery of the OKE cluster, region, and compartment
 - ownership-aware management of standard, Compute Cluster-backed, and legacy
   Cluster Network worker pools
+- version-aware, checkpointed control-plane and worker upgrades across managed
+  and self-managed backends
 
 The CLI uses Kubernetes and OCI as complementary sources. Kubernetes provides
 the live node and workload view. OCI provides the authoritative worker-pool
@@ -18,11 +20,13 @@ APIs.
 | --- | --- |
 | `src/oke_hpc_mgmt/backends/kubeconfig.py` | Loads and validates kubeconfig, selects a context, and extracts the OKE cluster OCID and region from OCI CLI exec arguments. |
 | `src/oke_hpc_mgmt/discovery.py` | Resolves and caches the OCI target, joins Kubernetes and OCI inventory, classifies pool ownership, and applies add-on readiness expectations. |
-| `src/oke_hpc_mgmt/backends/oci.py` | Calls OKE `GetCluster`, discovers managed and self-managed pools, filters internal backing pools, implements ownership-specific OCI mutations, and reads OKE and Compute work requests. |
-| `src/oke_hpc_mgmt/backends/kubernetes.py` | Discovers nodes and pods, manages cordon state, performs PDB-aware eviction, and serializes mutations with a Lease. |
-| `src/oke_hpc_mgmt/models.py` | Defines node, pool, add-on, placement, operation-plan, drain, health, and discovery models. |
-| `src/oke_hpc_mgmt/commands/` | Defines the modular Click command tree, options, output controls, confirmation, status, health, recommendations, and add-on validation. |
-| `src/oke_hpc_mgmt/workflows/` | Implements reusable ownership-aware pool, node termination, and Kubernetes maintenance workflows. |
+| `src/oke_hpc_mgmt/backends/oci.py` | Calls OKE `GetCluster`, discovers managed and self-managed pools, filters internal backing pools, implements ownership-specific OCI and upgrade mutations, enforces ETags, and reads work requests. |
+| `src/oke_hpc_mgmt/backends/kubernetes.py` | Discovers nodes, pods, Kueue, and Slinky state; manages ordinary lifecycle cordon/eviction; stores upgrade checkpoints; and serializes mutations with a Lease. |
+| `src/oke_hpc_mgmt/models.py` | Defines node, pool, cluster, virtual-pool, add-on, placement, operation-plan, drain, health, and discovery models. |
+| `src/oke_hpc_mgmt/upgrades.py` | Defines typed Kubernetes versions, target and skew validation, workload-gate evidence, strategy selection, checkpoint phases, and checkpoint serialization. |
+| `src/oke_hpc_mgmt/commands/` | Defines the modular Click command tree, including upgrade status, planning, execution, recovery, output, and acknowledgements. |
+| `src/oke_hpc_mgmt/workflows/upgrades.py` | Builds and executes control-plane and worker upgrade plans, verifies workload gates, writes checkpoints, resumes from observed state, and routes every backend strategy. |
+| `src/oke_hpc_mgmt/workflows/` | Implements reusable ownership-aware pool, node termination, Kubernetes maintenance, boot-volume, and upgrade workflows. |
 | `src/oke_hpc_mgmt/health.py` | Evaluates deterministic node, pool, GPU, RDMA, add-on, and scheduler health. |
 | `src/oke_hpc_mgmt/selection.py` | Parses node identifiers and exact field selectors. |
 | `src/oke_hpc_mgmt/cli.py` | Provides warning suppression, entrypoint naming, exception handling, and stable process exit status. |
@@ -408,6 +412,145 @@ internal IP, changed boot volume OCID, changed Kubernetes boot ID when
 available, Ready and schedulable state, complete pool counts, GPU allocation,
 RDMA topology, and applicable Network Operator VFs. The managed-pool waiter
 also verifies the requested node-pool properties from OKE.
+
+## Kubernetes Upgrade Architecture
+
+Upgrade discovery extends the regular snapshot with:
+
+- OKE control-plane version, lifecycle state, cluster type, ETag, and
+  advertised Kubernetes targets
+- virtual node-pool versions and lifecycle state
+- declared node-pool Kubernetes versions and actual kubelet versions
+- installed and selected OKE add-on versions plus automatic or pinned update
+  mode
+- Kueue ClusterQueue stop policy and admitted workload count
+- Slinky ownership and read-only `slurmctld` verification targets
+- Cluster Network, Instance Pool, Compute Cluster, and GPU Memory Cluster
+  ownership and Instance Configuration references
+
+A major/minor target is resolved against the OKE-advertised list to the latest
+production patch. Typed version validation rejects unsupported exact patches,
+preview `.0` targets without acknowledgement, downgrades, control-plane minor
+jumps, and invalid worker skew.
+
+### Planning And Ordering
+
+`upgrades status`, `upgrades plan`, and `--dry-run` do not acquire a persistent
+checkpoint or mutate OCI or Kubernetes. Planning still performs all available
+discovery, add-on option queries, image validation, workload evidence
+collection, and self-managed bootstrap transformation.
+
+The full plan places all control-plane steps first. Worker order is stable:
+CPU canary, system, regular GPU, managed Compute Cluster RDMA, legacy Cluster
+Network RDMA, GPU Memory Cluster, then custom pools. An explicit order must name
+every pool exactly once.
+
+### Workload Verification Boundary
+
+The upgrade workflow deliberately has no dependency on the lifecycle
+workflow's cordon, uncordon, or eviction methods. Its Kubernetes backend calls
+are limited to discovery, checkpoint, Lease, and read-only Slinky exec.
+
+Pool evidence requires:
+
+- Ready Kubernetes nodes
+- `spec.unschedulable=true` from an external cordon
+- no ordinary workload pod after excluding DaemonSets, static mirror pods, and
+  recognized scheduler infrastructure
+- matching Kueue ClusterQueues in `Hold` or `HoldAndDrain` with zero admitted
+  workloads
+- Slinky partitions and nodes in safe states, with no active job referencing
+  the target nodes
+
+Positive evidence remains blocking. The emergency acknowledgement is evaluated
+only when API, RBAC, or exec failure makes verification unavailable.
+
+### Control-Plane Path
+
+Immediately before `UpdateCluster`, the workflow rediscovers the cluster under
+the mutation Lease, confirms every worker is Ready, revalidates version policy
+and add-on compatibility, and sends the current cluster ETag. It records the
+work request before waiting for target-version `ACTIVE` state. OKE-managed
+virtual pools and automatic add-ons must converge after the control plane.
+
+`clusters upgrade` executes exactly one patch or minor step.
+`upgrades apply` can retain an ordered list of valid one-minor steps and advance
+only after each observed control-plane state converges.
+
+### Managed Worker Path
+
+Standard CPU/GPU pools and Compute Cluster RDMA pools remain OKE-owned:
+
+- `boot-volume-replace` submits `UpdateNodePool` with
+  `cycleModes=["BOOT_VOLUME_REPLACE"]`
+- `instance-replace` submits `UpdateNodePool` with
+  `cycleModes=["INSTANCE_REPLACE"]`
+- `blue-green` clones the full source node pool and uses a deterministic retry
+  token for idempotent creation
+
+The source node-pool ETag is required for cycling updates. Image overrides are
+validated against shape, availability domains, and Linux distribution.
+Compute Cluster placement and host-group details are preserved, while the
+OKE-internal backing Instance Pool remains hidden and untouched.
+
+### Self-Managed Worker Path
+
+Legacy Cluster Networks, standalone Instance Pools, and GMCs first clone their
+current Instance Configuration. The transformation uses structured SDK models
+and multipart MIME parsing rather than text substitution. It preserves launch,
+network, storage, agent, tag, SSH, FSS, Lustre, NVMe RAID, kubelet, and custom
+metadata while updating the target image when requested, the live API endpoint,
+the current cluster CA, and the Kubernetes bootstrap version.
+
+The resulting configuration must prove both refreshed connection data and the
+target version before it can be created. It is attached to the backend with the
+current Cluster Network, Instance Pool, or GMC ETag before any worker cycles.
+
+- self-managed BVR updates one instance at a time with `ALLOW_DOWNTIME`,
+  preserves the previous boot volume and instance identity, and waits for the
+  same instance to return at the target version
+- self-managed instance replacement grows by one, verifies a new target worker,
+  then terminates one externally drained old worker and restores desired size
+- self-managed blue-green clones the complete parallel backend; GMC placement
+  must be explicitly usable when the source fabric or Compute Cluster cannot be
+  shared
+
+Create operations use an operation-derived retry token, allowing resume to
+reissue an ambiguous create safely.
+
+### Checkpoint State Machine
+
+Full orchestration writes one non-secret ConfigMap:
+
+```text
+kube-system/mgmt-oke-kubernetes-upgrade
+```
+
+It records operation ID, source and target versions, control-plane steps, pool
+order, strategies, image and cycling overrides, phase, active work request,
+created and retained resources, target and superseded Instance
+Configurations, acknowledgements, and the last error.
+
+Transitions are:
+
+```text
+planned -> control-plane -> worker-configs -> pool-gate
+        -> pool-upgrade -> verify -> completed
+```
+
+`failed` retains observed state for `upgrades resume`. `abandoned` records that
+orchestration stopped but does not imply rollback. Blue-green pauses within the
+pool sequence as `action-required`, returns process status `3`, and retains the
+source backend until external migration and drain are complete.
+
+Every ConfigMap replacement supplies its latest `resourceVersion`. OCI updates
+supply current ETags. Both concurrency controls are revalidated while holding
+`kube-system/mgmt-oke-mutation`.
+
+Cleanup is allowed only from `completed`. It deletes only superseded Instance
+Configurations carrying this operation's ownership tags and then removes the
+checkpoint. Stack-owned configurations, old blue-green backends, and retained
+boot volumes are not generalized cleanup targets.
 
 ## Node And Resource Readiness
 

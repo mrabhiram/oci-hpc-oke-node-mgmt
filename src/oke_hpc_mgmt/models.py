@@ -42,6 +42,12 @@ CLUSTER_NETWORK_PLACEMENT_CONSTRAINTS = (
 )
 NODE_POOL_CNI_TYPES = ("OCI_VCN_IP_NATIVE", "FLANNEL_OVERLAY")
 NODE_CYCLING_MODES = ("INSTANCE_REPLACE", "BOOT_VOLUME_REPLACE")
+UPGRADE_STRATEGIES = (
+    "auto",
+    "boot-volume-replace",
+    "instance-replace",
+    "blue-green",
+)
 
 
 @dataclass(frozen=True)
@@ -49,6 +55,9 @@ class AddonInfo:
     name: str
     lifecycle_state: str | None = None
     version: str | None = None
+    selected_version: str | None = None
+    update_mode: str | None = None
+    configurations: tuple[tuple[str, str], ...] = ()
     error: str | None = None
 
     @property
@@ -77,6 +86,7 @@ class NodeInfo:
     system_pods: int = 0
     slinky_workload_pods: int = 0
     boot_id: str | None = None
+    kubelet_version: str | None = None
 
     @property
     def rdma_labels(self) -> dict[str, str]:
@@ -169,11 +179,51 @@ class WorkerPoolInfo:
     kueue_flavor: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
     instance_configuration_id: str | None = None
+    kubernetes_version: str | None = None
+    gpu_memory_cluster_id: str | None = None
+    gpu_memory_fabric_id: str | None = None
     created_by_mgmt_oke: bool = False
 
     @property
     def backing_id(self) -> str | None:
-        return self.cluster_network_id or self.node_pool_id or self.instance_pool_id
+        return (
+            self.gpu_memory_cluster_id
+            or self.cluster_network_id
+            or self.node_pool_id
+            or self.instance_pool_id
+        )
+
+
+@dataclass(frozen=True)
+class ClusterInfo:
+    cluster_id: str
+    compartment_id: str
+    kubernetes_version: str
+    lifecycle_state: str | None = None
+    cluster_type: str | None = None
+    endpoint: str | None = None
+    ca_certificate: str | None = None
+    available_kubernetes_versions: tuple[str, ...] = ()
+    etag: str | None = None
+
+
+@dataclass(frozen=True)
+class AddonCompatibility:
+    name: str
+    installed_version: str | None
+    update_mode: str | None
+    supported_versions: tuple[str, ...]
+    compatible: bool
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class VirtualNodePoolInfo:
+    name: str
+    virtual_node_pool_id: str
+    kubernetes_version: str | None
+    size: int | None
+    lifecycle_state: str | None = None
 
 
 @dataclass
@@ -191,11 +241,14 @@ class KueueSummary:
     resource_flavors: list[dict[str, Any]] = field(default_factory=list)
     cluster_queues: list[dict[str, Any]] = field(default_factory=list)
     local_queues: list[dict[str, Any]] = field(default_factory=list)
+    workloads: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
 class DiscoverySnapshot:
+    cluster: ClusterInfo | None = None
     pools: list[WorkerPoolInfo] = field(default_factory=list)
+    virtual_pools: list[VirtualNodePoolInfo] = field(default_factory=list)
     nodes: list[NodeInfo] = field(default_factory=list)
     addons: list[AddonInfo] = field(default_factory=list)
     autoscaler_entries: list[AutoscalerEntry] = field(default_factory=list)

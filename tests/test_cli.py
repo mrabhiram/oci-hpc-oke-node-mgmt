@@ -6,6 +6,7 @@ import os
 import sys
 import unittest
 from contextlib import redirect_stderr
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from click.testing import CliRunner
@@ -14,6 +15,7 @@ from oke_hpc_mgmt.cli import _configure_oci_cli_auth, _program_name, main
 from oke_hpc_mgmt.commands import cli
 from oke_hpc_mgmt.models import (
     AddonInfo,
+    ClusterInfo,
     DiscoverySnapshot,
     NodeInfo,
     OperationPlan,
@@ -30,6 +32,12 @@ from oke_hpc_mgmt.workflows.lifecycle import (
     PreparedPoolResize,
 )
 from oke_hpc_mgmt.workflows.node_maintenance import PreparedNodeMaintenance
+from oke_hpc_mgmt.workflows.upgrades import (
+    PoolUpgradeSpec,
+    PreparedPoolUpgrade,
+    UpgradeExecutionResult,
+)
+from oke_hpc_mgmt.upgrades import UpgradeGateEvidence
 
 
 class CliTests(unittest.TestCase):
@@ -51,8 +59,335 @@ class CliTests(unittest.TestCase):
             "health",
             "recommendations",
             "reconcile",
+            "upgrades",
         ):
             self.assertIn(command, result.output)
+
+    def test_upgrade_help_is_wired_to_cluster_pool_and_orchestration_groups(self):
+        for arguments, commands in (
+            (["clusters", "--help"], ("upgrade",)),
+            (["pools", "--help"], ("upgrade",)),
+            (
+                ["upgrades", "--help"],
+                ("status", "plan", "apply", "resume", "abandon", "cleanup"),
+            ),
+        ):
+            result = self.runner.invoke(cli, arguments)
+            self.assertEqual(0, result.exit_code, result.output)
+            for command in commands:
+                self.assertIn(command, result.output)
+
+    def test_pool_upgrade_dry_run_never_executes(self):
+        pool = WorkerPoolInfo(
+            name="oke-gpu",
+            kind="node-pool",
+            node_pool_id="node-pool-1",
+            kubernetes_version="v1.35.2",
+        )
+        prepared = PreparedPoolUpgrade(
+            snapshot=DiscoverySnapshot(pools=[pool]),
+            pool=pool,
+            target_version="v1.36.1",
+            spec=PoolUpgradeSpec(),
+            strategy="boot-volume-replace",
+            evidence=UpgradeGateEvidence(
+                pool=pool.name,
+                nodes=("gpu-1",),
+                ready=True,
+                externally_cordoned=False,
+            ),
+            plan=OperationPlan(
+                operation="worker-pool-upgrade",
+                target=pool.name,
+            ),
+        )
+        with (
+            patch(
+                "oke_hpc_mgmt.commands.upgrades.prepare_pool_upgrade",
+                return_value=prepared,
+            ),
+            patch(
+                "oke_hpc_mgmt.commands.upgrades.execute_pool_upgrade"
+            ) as execute,
+        ):
+            result = self.runner.invoke(
+                cli,
+                [
+                    "pools",
+                    "upgrade",
+                    "oke-gpu",
+                    "--to",
+                    "v1.36.1",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(
+            "worker-pool-upgrade",
+            json.loads(result.output)[0]["operation"],
+        )
+        execute.assert_not_called()
+
+    def test_pool_upgrade_action_required_has_stable_exit_code(self):
+        pool = WorkerPoolInfo(
+            name="oke-gpu",
+            kind="node-pool",
+            node_pool_id="node-pool-1",
+        )
+        prepared = PreparedPoolUpgrade(
+            snapshot=DiscoverySnapshot(pools=[pool]),
+            pool=pool,
+            target_version="v1.36.1",
+            spec=PoolUpgradeSpec(),
+            strategy="blue-green",
+            evidence=UpgradeGateEvidence(
+                pool=pool.name,
+                nodes=("gpu-1",),
+                ready=True,
+                externally_cordoned=True,
+            ),
+            plan=OperationPlan(
+                operation="worker-pool-upgrade",
+                target=pool.name,
+            ),
+        )
+        with (
+            patch(
+                "oke_hpc_mgmt.commands.upgrades.prepare_pool_upgrade",
+                return_value=prepared,
+            ),
+            patch(
+                "oke_hpc_mgmt.commands.upgrades.execute_pool_upgrade",
+                return_value=UpgradeExecutionResult(
+                    operation="worker-pool-upgrade",
+                    target=pool.name,
+                    status="action-required",
+                ),
+            ),
+            patch("sys.stdout", new=io.StringIO()),
+            redirect_stderr(io.StringIO()),
+        ):
+            exit_status = main(
+                [
+                    "pools",
+                    "upgrade",
+                    "oke-gpu",
+                    "--to",
+                    "v1.36.1",
+                    "--ack-application-compatibility",
+                    "--ack-iac-drift",
+                    "--ack-workloads-drained",
+                    "--yes",
+                ],
+            )
+
+        self.assertEqual(3, exit_status)
+
+    def test_upgrade_status_reports_control_plane_and_addons_without_target(self):
+        snapshot = DiscoverySnapshot(
+            cluster=ClusterInfo(
+                cluster_id="cluster-1",
+                compartment_id="compartment-1",
+                kubernetes_version="v1.35.2",
+                lifecycle_state="ACTIVE",
+                available_kubernetes_versions=(
+                    "v1.35.2",
+                    "v1.36.1",
+                ),
+            ),
+            addons=[
+                AddonInfo(
+                    name="NvidiaGpuOperator",
+                    lifecycle_state="ACTIVE",
+                    version="v25.3",
+                    update_mode="AUTOMATIC",
+                )
+            ],
+        )
+        service = Mock()
+        service.discover.return_value = snapshot
+
+        with patch(
+            "oke_hpc_mgmt.commands.upgrades.CliState.service",
+            return_value=service,
+        ):
+            result = self.runner.invoke(
+                cli,
+                ["upgrades", "status", "--format", "json"],
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        rows = json.loads(result.output)
+        self.assertEqual("control-plane", rows[0]["kind"])
+        self.assertEqual("addon", rows[1]["kind"])
+        self.assertEqual("AUTOMATIC", rows[1]["strategy"])
+
+    def test_upgrade_plan_dry_run_executes_every_preflight_but_no_mutation(self):
+        plan = SimpleNamespace(
+            plans=(
+                OperationPlan(
+                    operation="control-plane-upgrade",
+                    target="v1.36.1",
+                ),
+                OperationPlan(
+                    operation="worker-pool-upgrade",
+                    target="oke-gpu",
+                ),
+            ),
+            snapshot=DiscoverySnapshot(),
+            target_version="v1.36.1",
+        )
+        with (
+            patch(
+                "oke_hpc_mgmt.commands.upgrades.prepare_cluster_upgrade_plan",
+                return_value=plan,
+            ) as prepare,
+            patch(
+                "oke_hpc_mgmt.commands.upgrades.execute_upgrade_apply"
+            ) as execute,
+        ):
+            result = self.runner.invoke(
+                cli,
+                [
+                    "upgrades",
+                    "plan",
+                    "--to",
+                    "v1.36",
+                    "--format",
+                    "json",
+                ],
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(2, len(json.loads(result.output)))
+        prepare.assert_called_once()
+        execute.assert_not_called()
+
+    def test_control_plane_upgrade_dry_run_never_executes(self):
+        prepared = SimpleNamespace(
+            plans=(
+                OperationPlan(
+                    operation="control-plane-upgrade",
+                    target="v1.36.1",
+                ),
+            ),
+            target_version="v1.36.1",
+        )
+        with (
+            patch(
+                "oke_hpc_mgmt.commands.upgrades.prepare_control_plane_upgrade",
+                return_value=prepared,
+            ),
+            patch(
+                "oke_hpc_mgmt.commands.upgrades.execute_control_plane_upgrade"
+            ) as execute,
+        ):
+            result = self.runner.invoke(
+                cli,
+                [
+                    "clusters",
+                    "upgrade",
+                    "--to",
+                    "v1.36",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        execute.assert_not_called()
+
+    def test_upgrade_apply_dry_run_never_creates_checkpoint_or_mutates(self):
+        plan = SimpleNamespace(
+            plans=(
+                OperationPlan(
+                    operation="control-plane-upgrade",
+                    target="v1.36.1",
+                ),
+            ),
+            snapshot=DiscoverySnapshot(),
+            target_version="v1.36.1",
+        )
+        with (
+            patch(
+                "oke_hpc_mgmt.commands.upgrades.prepare_cluster_upgrade_plan",
+                return_value=plan,
+            ),
+            patch(
+                "oke_hpc_mgmt.commands.upgrades.execute_upgrade_apply"
+            ) as execute,
+        ):
+            result = self.runner.invoke(
+                cli,
+                [
+                    "upgrades",
+                    "apply",
+                    "--to",
+                    "v1.36",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        execute.assert_not_called()
+
+    def test_upgrade_resume_abandon_and_cleanup_commands_are_wired(self):
+        result_row = UpgradeExecutionResult(
+            operation="cluster-upgrade",
+            target="v1.36.1",
+            status="completed",
+        )
+        cases = (
+            (
+                ["upgrades", "resume", "--format", "json"],
+                "resume_upgrade",
+            ),
+            (
+                [
+                    "upgrades",
+                    "abandon",
+                    "--yes",
+                    "--format",
+                    "json",
+                ],
+                "abandon_upgrade",
+            ),
+            (
+                [
+                    "upgrades",
+                    "cleanup",
+                    "--yes",
+                    "--format",
+                    "json",
+                ],
+                "cleanup_upgrade",
+            ),
+        )
+        for arguments, function_name in cases:
+            with self.subTest(command=arguments[1]):
+                return_value = (
+                    [result_row]
+                    if function_name == "resume_upgrade"
+                    else result_row
+                )
+                with patch(
+                    f"oke_hpc_mgmt.commands.upgrades.{function_name}",
+                    return_value=return_value,
+                ) as command:
+                    result = self.runner.invoke(cli, arguments)
+
+                self.assertEqual(0, result.exit_code, result.output)
+                self.assertEqual(
+                    "cluster-upgrade",
+                    json.loads(result.output)[0]["operation"],
+                )
+                command.assert_called_once()
 
     def test_node_lifecycle_help_exposes_remove_alias_and_maintenance(self):
         result = self.runner.invoke(cli, ["nodes", "--help"])

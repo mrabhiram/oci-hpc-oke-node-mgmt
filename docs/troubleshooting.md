@@ -291,6 +291,130 @@ domain. A BVR timeout does not prove rollback. Inspect the OKE work request,
 current compute instance boot volume, node Ready state, and pool readiness
 before retrying.
 
+## Upgrade Target Is Refused
+
+Refresh the authoritative version view:
+
+```bash
+mgmt-oke upgrades status
+mgmt-oke upgrades status --to v1.36
+```
+
+An exact target must be advertised by OKE. A major/minor target resolves to the
+latest advertised production patch. Preview `.0` targets require
+`--allow-preview`; downgrades and control-plane jumps of more than one minor are
+always refused.
+
+A pool cannot be upgraded ahead of the control plane:
+
+```text
+Error: Worker target v1.36.1 cannot be newer than control plane v1.35.2.
+```
+
+Use `upgrades apply` to preserve control-plane-first ordering, or complete
+`clusters upgrade` before retrying `pools upgrade`.
+
+## Upgrade Workload Gate Is Refused
+
+Inspect the plan evidence:
+
+```bash
+mgmt-oke upgrades plan --to v1.36 --format json
+mgmt-oke nodes list --pool <pool-name> --workloads
+```
+
+Every target node must be Ready, externally cordoned, and free of ordinary
+workload pods. Matching Kueue ClusterQueues must be `Hold` or `HoldAndDrain`
+with no admitted workloads. Slinky partitions and nodes must be safe and no
+active job can reference the target.
+
+Prepare workloads outside `mgmt-oke`, then rerun the plan. The upgrade
+subsystem does not cordon, drain, evict, uncordon, change Kueue policy, or
+change Slurm state.
+
+`--emergency-ack-unverified-drain` applies only when API, RBAC, or Slinky exec
+verification is unavailable. It cannot bypass any positively detected pod,
+Kueue workload, Slurm job, schedulable node, or Ready-state failure.
+
+## Upgrade Is Blocked By An Add-On
+
+Run:
+
+```bash
+mgmt-oke addons status
+mgmt-oke upgrades status --to v1.36 --format json
+```
+
+A pinned add-on blocks when its selected version has no build supported for the
+target Kubernetes version. Select and apply a compatible add-on version through
+OKE before retrying. Automatic add-ons are managed by OKE and verified after
+control-plane convergence. `mgmt-oke` does not modify add-ons.
+
+## Slinky Upgrade Verification Is Unavailable
+
+Slinky verification requires one discoverable `slurmctld` container and
+read-only pod exec RBAC. The tool reads partitions, nodes, and jobs with
+`scontrol`; it never changes Slurm state.
+
+Resolve multiple-controller ambiguity, pod readiness, or RBAC before retrying.
+Use the emergency acknowledgement only when the operator independently
+verified drain and the failure is strictly an inability to observe it. Active
+Slurm state remains non-bypassable.
+
+## Upgrade Checkpoint Needs Recovery
+
+Inspect checkpoint and Lease state:
+
+```bash
+kubectl -n kube-system get configmap mgmt-oke-kubernetes-upgrade -o yaml
+kubectl -n kube-system get lease mgmt-oke-mutation -o yaml
+mgmt-oke upgrades resume --ack-workloads-drained
+```
+
+Resume re-observes control-plane version, worker versions, work requests, and
+created resources before continuing. Do not manually edit the checkpoint.
+A `409` checkpoint conflict means another writer changed its
+`resourceVersion`; stop concurrent operations and retry from observed state.
+
+Use `upgrades abandon` only to stop orchestration without rollback:
+
+```bash
+mgmt-oke upgrades abandon --yes
+```
+
+Abandoning does not reverse any completed OCI change. `upgrades cleanup` is
+accepted only after a completed operation and deletes only superseded Instance
+Configurations tagged as owned by that operation:
+
+```bash
+mgmt-oke upgrades cleanup --yes
+```
+
+## Upgrade ETag Or Work Request Failed
+
+An ETag failure means the OCI resource changed after planning. Generate a new
+plan and review the difference; do not bypass optimistic concurrency.
+
+A failed or canceled work request is recorded in the checkpoint and stops
+execution. Correct the OCI service error, confirm the observed resource state,
+and run `upgrades resume`. Deterministic retry tokens prevent an ambiguous
+create from producing a second parallel resource.
+
+## Blue-Green Requires External Action
+
+Exit status `3` means the target backend reached the requested version and the
+source was intentionally retained. Migrate workloads to the reported target,
+externally drain the source, explicitly remove or finalize it through its
+reviewed lifecycle workflow, and run:
+
+```bash
+mgmt-oke upgrades resume --ack-workloads-drained
+```
+
+GMC blue-green may also require an explicit usable Compute Cluster or GPU
+Memory Fabric. The tool does not infer that an occupied source placement can be
+shared.
+
 ## GPU or RDMA Readiness Is Incomplete
 
 Run:

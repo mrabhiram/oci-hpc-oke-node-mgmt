@@ -36,6 +36,7 @@ class DiscoveryOptions:
     include_kueue: bool = True
     include_addons: bool = True
     include_pools: bool = True
+    include_cluster: bool = False
 
 
 @dataclass(frozen=True)
@@ -61,9 +62,11 @@ class DiscoveryService:
             kubernetes_discovery_enabled=not self.options.skip_kubernetes,
         )
         self.resolve_oci_target()
+        snapshot.cluster = self._discover_cluster(snapshot)
         nodes = self._discover_kubernetes(snapshot)
         pools = self._discover_oci(snapshot)
         addons = self._discover_addons(snapshot)
+        snapshot.virtual_pools = self._discover_virtual_pools(snapshot)
 
         if pools:
             self._assign_nodes_to_pools(nodes, pools)
@@ -217,10 +220,32 @@ class DiscoveryService:
         if self.options.skip_kubernetes:
             return []
         try:
-            return self._k8s().list_nodes(include_pod_counts=self.options.include_pod_counts)
+            return self._k8s().list_nodes(
+                include_pod_counts=self.options.include_pod_counts
+            )
         except Exception as exc:
             snapshot.warnings.append(f"Kubernetes discovery skipped: {exc}")
             return []
+
+    def _discover_cluster(self, snapshot: DiscoverySnapshot):
+        if (
+            self.options.skip_oci
+            or self.options.auth == "none"
+            or not self.options.include_cluster
+            or not self.options.cluster_id
+        ):
+            return None
+        backend = self._oci()
+        if not hasattr(backend, "get_cluster_info"):
+            return None
+        try:
+            return backend.get_cluster_info(
+                self.options.cluster_id,
+                self.options.compartment_id,
+            )
+        except Exception as exc:
+            snapshot.warnings.append(f"OKE cluster discovery skipped: {exc}")
+            return None
 
     def _discover_oci(self, snapshot: DiscoverySnapshot) -> list[WorkerPoolInfo]:
         if (
@@ -259,6 +284,27 @@ class DiscoveryService:
         }
 
         try:
+            gpu_memory_pools = backend.list_gpu_memory_cluster_pools(
+                self.options.compartment_id
+            )
+            pools.extend(gpu_memory_pools)
+        except Exception as exc:
+            snapshot.warnings.append(
+                f"GPU Memory Cluster discovery skipped: {exc}"
+            )
+            gpu_memory_pools = []
+        gpu_memory_instance_ids = {
+            instance_id
+            for pool in gpu_memory_pools
+            for instance_id in pool.oci_instance_ids
+        }
+        gpu_memory_compute_cluster_ids = {
+            pool.compute_cluster_id
+            for pool in gpu_memory_pools
+            if pool.compute_cluster_id
+        }
+
+        try:
             cluster_network_pools = backend.list_cluster_network_pools(self.options.compartment_id)
             pools.extend(cluster_network_pools)
             cluster_network_instance_pool_ids = {
@@ -273,8 +319,13 @@ class DiscoveryService:
                 backend.list_instance_pools(
                     self.options.compartment_id,
                     skip_ids=cluster_network_instance_pool_ids,
-                    skip_compute_cluster_ids=managed_compute_cluster_ids,
-                    skip_instance_ids=managed_instance_ids,
+                    skip_compute_cluster_ids=(
+                        managed_compute_cluster_ids
+                        | gpu_memory_compute_cluster_ids
+                    ),
+                    skip_instance_ids=(
+                        managed_instance_ids | gpu_memory_instance_ids
+                    ),
                 )
             )
         except Exception as exc:
@@ -299,6 +350,26 @@ class DiscoveryService:
             return self._oci().list_cluster_addons(self.options.cluster_id)
         except Exception as exc:
             snapshot.warnings.append(f"OKE add-on discovery skipped: {exc}")
+            return []
+
+    def _discover_virtual_pools(self, snapshot: DiscoverySnapshot):
+        if (
+            self.options.skip_oci
+            or self.options.auth == "none"
+            or not self.options.include_pools
+            or not self.options.cluster_id
+            or not self.options.compartment_id
+        ):
+            return []
+        try:
+            return self._oci().list_virtual_node_pools(
+                self.options.compartment_id,
+                self.options.cluster_id,
+            )
+        except Exception as exc:
+            snapshot.warnings.append(
+                f"Virtual node pool discovery skipped: {exc}"
+            )
             return []
 
     def _discover_autoscaler(self, snapshot: DiscoverySnapshot):

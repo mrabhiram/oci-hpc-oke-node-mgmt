@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 import re
 import socket
@@ -9,9 +10,15 @@ from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from oke_hpc_mgmt.models import AutoscalerEntry, DrainPod, KueueSummary, NodeInfo
+from oke_hpc_mgmt.upgrades import (
+    CHECKPOINT_NAME,
+    CHECKPOINT_NAMESPACE,
+    UpgradeCheckpoint,
+)
 
 
 INSTANCE_OCID_RE = re.compile(r"(ocid1\.instance[.\w-]+)")
@@ -248,9 +255,218 @@ class KubernetesBackend:
                         "boot_id",
                         None,
                     ),
+                    kubelet_version=getattr(
+                        getattr(node.status, "node_info", None),
+                        "kubelet_version",
+                        None,
+                    ),
                 )
             )
         return nodes
+
+    def cluster_connection_data(self) -> tuple[str, str]:
+        """Return the active API endpoint and base64-encoded cluster CA."""
+
+        client = self.client
+        configuration = client.Configuration.get_default_copy()
+        host = str(getattr(configuration, "host", "") or "").strip()
+        ca_path = str(
+            getattr(configuration, "ssl_ca_cert", "") or ""
+        ).strip()
+        if not host:
+            raise KubernetesDiscoveryError(
+                "The active Kubernetes client configuration has no API endpoint."
+            )
+        if not ca_path:
+            raise KubernetesDiscoveryError(
+                "The active Kubernetes client configuration has no cluster CA file."
+            )
+        try:
+            certificate = Path(ca_path).read_bytes()
+        except OSError as exc:
+            raise KubernetesDiscoveryError(
+                f"Unable to read the active Kubernetes cluster CA: {exc}"
+            ) from exc
+        if not certificate:
+            raise KubernetesDiscoveryError(
+                "The active Kubernetes cluster CA file is empty."
+            )
+        endpoint = re.sub(r"^https?://", "", host).rstrip("/")
+        return endpoint, base64.b64encode(certificate).decode("ascii")
+
+    def list_upgrade_blocking_pods(self, node_names: set[str]) -> list[DrainPod]:
+        """List active non-infrastructure pods without using eviction APIs."""
+
+        client = self.client
+        core = client.CoreV1Api()
+        try:
+            pods = core.list_pod_for_all_namespaces().items
+        except Exception as exc:
+            raise KubernetesDiscoveryError(
+                f"Unable to verify worker pods: {_api_error_text(exc)}"
+            ) from exc
+        blockers: list[DrainPod] = []
+        for pod in pods:
+            if getattr(pod.spec, "node_name", None) not in node_names:
+                continue
+            if getattr(pod.status, "phase", None) in {"Succeeded", "Failed"}:
+                continue
+            if _is_daemonset_pod(pod) or _is_mirror_pod(pod):
+                continue
+            labels = dict(getattr(pod.metadata, "labels", None) or {})
+            if _is_recognized_scheduler_infrastructure(labels):
+                continue
+            blockers.append(
+                DrainPod(
+                    namespace=pod.metadata.namespace,
+                    name=pod.metadata.name,
+                    phase=getattr(pod.status, "phase", None),
+                    controller=_pod_controller(pod),
+                    has_empty_dir=_has_empty_dir(pod),
+                )
+            )
+        return sorted(blockers, key=lambda item: (item.namespace, item.name))
+
+    def read_upgrade_checkpoint(
+        self,
+        name: str = CHECKPOINT_NAME,
+        namespace: str = CHECKPOINT_NAMESPACE,
+    ) -> tuple[UpgradeCheckpoint, str] | None:
+        core = self.client.CoreV1Api()
+        try:
+            config_map = core.read_namespaced_config_map(name, namespace)
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                return None
+            raise KubernetesDiscoveryError(
+                f"Unable to read upgrade checkpoint {namespace}/{name}: "
+                f"{_api_error_text(exc)}"
+            ) from exc
+        payload = (getattr(config_map, "data", None) or {}).get("checkpoint.json")
+        if not payload:
+            raise KubernetesDiscoveryError(
+                f"Upgrade checkpoint {namespace}/{name} has no checkpoint.json data."
+            )
+        resource_version = getattr(config_map.metadata, "resource_version", None)
+        if not resource_version:
+            raise KubernetesDiscoveryError(
+                f"Upgrade checkpoint {namespace}/{name} has no resourceVersion."
+            )
+        return UpgradeCheckpoint.from_json(payload), str(resource_version)
+
+    def write_upgrade_checkpoint(
+        self,
+        checkpoint: UpgradeCheckpoint,
+        resource_version: str | None = None,
+        name: str = CHECKPOINT_NAME,
+        namespace: str = CHECKPOINT_NAMESPACE,
+    ) -> str:
+        client = self.client
+        core = client.CoreV1Api()
+        metadata = client.V1ObjectMeta(
+            name=name,
+            namespace=namespace,
+            labels={
+                "app.kubernetes.io/managed-by": "mgmt-oke",
+                "mgmt-oke.oracle.com/purpose": "kubernetes-upgrade",
+            },
+            resource_version=resource_version,
+        )
+        body = client.V1ConfigMap(
+            metadata=metadata,
+            immutable=False,
+            data={"checkpoint.json": checkpoint.to_json()},
+        )
+        try:
+            if resource_version:
+                response = core.replace_namespaced_config_map(name, namespace, body)
+            else:
+                response = core.create_namespaced_config_map(namespace, body)
+        except Exception as exc:
+            conflict = " checkpoint changed concurrently" if getattr(exc, "status", None) == 409 else ""
+            raise KubernetesDiscoveryError(
+                f"Unable to write upgrade checkpoint {namespace}/{name}:{conflict} "
+                f"{_api_error_text(exc)}"
+            ) from exc
+        result_version = getattr(response.metadata, "resource_version", None)
+        if not result_version:
+            raise KubernetesDiscoveryError(
+                f"Upgrade checkpoint {namespace}/{name} write returned no resourceVersion."
+            )
+        return str(result_version)
+
+    def delete_upgrade_checkpoint(
+        self,
+        resource_version: str,
+        name: str = CHECKPOINT_NAME,
+        namespace: str = CHECKPOINT_NAMESPACE,
+    ) -> None:
+        client = self.client
+        core = client.CoreV1Api()
+        body = client.V1DeleteOptions(
+            preconditions=client.V1Preconditions(resource_version=resource_version)
+        )
+        try:
+            core.delete_namespaced_config_map(name, namespace, body=body)
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                return
+            raise KubernetesDiscoveryError(
+                f"Unable to delete upgrade checkpoint {namespace}/{name}: "
+                f"{_api_error_text(exc)}"
+            ) from exc
+
+    def exec_slurmctld(self, command: tuple[str, ...]) -> str:
+        """Execute a read-only Slurm command in the unique slurmctld container."""
+
+        client = self.client
+        core = client.CoreV1Api()
+        try:
+            pods = core.list_pod_for_all_namespaces().items
+        except Exception as exc:
+            raise KubernetesDiscoveryError(
+                f"Unable to discover slurmctld: {_api_error_text(exc)}"
+            ) from exc
+        running = [
+            pod
+            for pod in pods
+            if getattr(pod.status, "phase", None) == "Running"
+        ]
+        matches: list[tuple[Any, str]] = []
+        for pod in running:
+            names = [
+                item.name
+                for item in (getattr(pod.spec, "containers", None) or [])
+                if item.name == "slurmctld"
+            ]
+            if len(names) == 1:
+                matches.append((pod, names[0]))
+        if len(matches) != 1:
+            raise KubernetesDiscoveryError(
+                "Expected exactly one running slurmctld container, found "
+                f"{len(matches)}."
+            )
+        pod, container = matches[0]
+        try:
+            from kubernetes.stream import stream
+
+            return str(
+                stream(
+                    core.connect_get_namespaced_pod_exec,
+                    pod.metadata.name,
+                    pod.metadata.namespace,
+                    command=list(command),
+                    container=container,
+                    stderr=True,
+                    stdin=False,
+                    stdout=True,
+                    tty=False,
+                )
+            )
+        except Exception as exc:
+            raise KubernetesDiscoveryError(
+                f"Unable to execute read-only slurmctld check: {_api_error_text(exc)}"
+            ) from exc
 
     def set_node_schedulable(self, node_name: str, schedulable: bool) -> None:
         core = self.client.CoreV1Api()
@@ -509,16 +725,35 @@ class KubernetesBackend:
             plural: str,
             versions: tuple[str, ...] = ("v1beta1", "v1beta2"),
         ) -> list[dict[str, Any]]:
+            failures: list[Exception] = []
             for version in versions:
                 try:
                     response = custom.list_cluster_custom_object("kueue.x-k8s.io", version, plural)
                     return response.get("items", [])
-                except Exception:
+                except Exception as exc:
+                    if getattr(exc, "status", None) == 404:
+                        continue
+                    failures.append(exc)
                     continue
+            if failures:
+                raise KubernetesDiscoveryError(
+                    f"Unable to verify Kueue {plural}: "
+                    f"{_api_error_text(failures[-1])}"
+                )
             return []
 
         summary.topologies = list_first_available("topologies")
         summary.resource_flavors = list_first_available("resourceflavors")
         summary.cluster_queues = list_first_available("clusterqueues")
         summary.local_queues = list_first_available("localqueues")
+        summary.workloads = list_first_available("workloads")
         return summary
+
+
+def _is_recognized_scheduler_infrastructure(labels: dict[str, str]) -> bool:
+    name = labels.get("app.kubernetes.io/name", "").casefold()
+    component = labels.get("app.kubernetes.io/component", "").casefold()
+    return bool(
+        name in {"cluster-autoscaler", "kueue", "slurmctld"}
+        and component in {"", "controller", "manager", "scheduler"}
+    )

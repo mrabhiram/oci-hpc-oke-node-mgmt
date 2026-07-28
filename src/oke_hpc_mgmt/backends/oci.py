@@ -8,11 +8,14 @@ from typing import Any, TypeVar
 
 from oke_hpc_mgmt.bootstrap import compose_worker_user_data
 from oke_hpc_mgmt.models import (
+    AddonCompatibility,
     AddonInfo,
+    ClusterInfo,
     ClusterNetworkCreateResult,
     ManagedNodePoolCreateResult,
     PoolBootVolumeReplaceSpec,
     PoolCreateSpec,
+    VirtualNodePoolInfo,
     WorkerPoolInfo,
     WorkRequestInfo,
 )
@@ -189,9 +192,93 @@ class OciBackend:
                     gpu_resource=_gpu_resource_for_shape(shape),
                     rdma_enabled=bool(compute_cluster_id),
                     labels=_initial_node_labels(node_pool),
+                    kubernetes_version=getattr(
+                        node_pool,
+                        "kubernetes_version",
+                        None,
+                    ),
                 )
             )
         return pools
+
+    def list_virtual_node_pools(
+        self,
+        compartment_id: str,
+        cluster_id: str,
+    ) -> list[VirtualNodePoolInfo]:
+        response = self.oci.pagination.list_call_get_all_results(
+            self.container_engine.list_virtual_node_pools,
+            compartment_id,
+            cluster_id=cluster_id,
+        )
+        return [
+            VirtualNodePoolInfo(
+                name=getattr(pool, "display_name", None) or pool.id,
+                virtual_node_pool_id=pool.id,
+                kubernetes_version=getattr(
+                    pool,
+                    "kubernetes_version",
+                    None,
+                ),
+                size=getattr(pool, "size", None),
+                lifecycle_state=getattr(pool, "lifecycle_state", None),
+            )
+            for pool in response.data
+        ]
+
+    def get_cluster_info(
+        self,
+        cluster_id: str,
+        compartment_id: str | None = None,
+    ) -> ClusterInfo:
+        response = self._call(
+            "OKE cluster lookup",
+            self.container_engine.get_cluster,
+            cluster_id,
+        )
+        cluster = response.data
+        resolved_compartment = getattr(cluster, "compartment_id", None)
+        version = getattr(cluster, "kubernetes_version", None)
+        if not isinstance(resolved_compartment, str) or not resolved_compartment:
+            raise OciDiscoveryError(
+                f"OKE cluster {cluster_id} did not return a compartment OCID."
+            )
+        if not isinstance(version, str) or not version:
+            raise OciDiscoveryError(
+                f"OKE cluster {cluster_id} did not return a Kubernetes version."
+            )
+        versions = set(
+            getattr(cluster, "available_kubernetes_upgrades", None) or ()
+        )
+        versions.add(version)
+        try:
+            options = self._call(
+                "OKE cluster version options lookup",
+                self.container_engine.get_cluster_options,
+                cluster_id,
+                compartment_id=compartment_id or resolved_compartment,
+                should_list_all_patch_versions=True,
+            ).data
+            versions.update(getattr(options, "kubernetes_versions", None) or ())
+        except OciDiscoveryError:
+            if not versions:
+                raise
+        endpoints = getattr(cluster, "endpoints", None)
+        endpoint = (
+            getattr(endpoints, "private_endpoint", None)
+            or getattr(endpoints, "public_endpoint", None)
+            or getattr(endpoints, "kubernetes", None)
+        )
+        return ClusterInfo(
+            cluster_id=cluster_id,
+            compartment_id=resolved_compartment,
+            kubernetes_version=version,
+            lifecycle_state=getattr(cluster, "lifecycle_state", None),
+            cluster_type=getattr(cluster, "type", None),
+            endpoint=endpoint,
+            available_kubernetes_versions=tuple(sorted(versions)),
+            etag=(getattr(response, "headers", None) or {}).get("etag"),
+        )
 
     def get_cluster_compartment_id(self, cluster_id: str) -> str:
         response = self._call(
@@ -224,18 +311,162 @@ class OciBackend:
             self.container_engine.list_addons,
             cluster_id,
         )
-        return [
-            AddonInfo(
-                name=getattr(addon, "name", "unknown"),
-                lifecycle_state=getattr(addon, "lifecycle_state", None),
-                version=(
-                    getattr(addon, "current_installed_version", None)
-                    or getattr(addon, "version", None)
-                ),
-                error=_addon_error(addon),
+        addons: list[AddonInfo] = []
+        for addon in response.data:
+            selected_version = getattr(addon, "version", None)
+            addons.append(
+                AddonInfo(
+                    name=getattr(addon, "name", "unknown"),
+                    lifecycle_state=getattr(addon, "lifecycle_state", None),
+                    version=(
+                        getattr(addon, "current_installed_version", None)
+                        or selected_version
+                    ),
+                    selected_version=selected_version,
+                    update_mode=(
+                        "AUTOMATIC"
+                        if selected_version is None
+                        else "PINNED"
+                    ),
+                    configurations=tuple(
+                        sorted(
+                            (
+                                str(getattr(item, "key", "")),
+                                str(getattr(item, "value", "")),
+                            )
+                            for item in (
+                                getattr(addon, "configurations", None) or ()
+                            )
+                            if getattr(item, "key", None)
+                        )
+                    ),
+                    error=_addon_error(addon),
+                )
             )
-            for addon in response.data
-        ]
+        return addons
+
+    def get_addon_compatibility(
+        self,
+        target_version: str,
+        installed: list[AddonInfo],
+    ) -> list[AddonCompatibility]:
+        response = self._call(
+            "OKE add-on options lookup",
+            self.oci.pagination.list_call_get_all_results,
+            self.container_engine.list_addon_options,
+            target_version,
+            should_show_all_versions=True,
+        )
+        options_by_name = {
+            str(getattr(option, "name", "")): option
+            for option in response.data
+            if getattr(option, "name", None)
+        }
+        results: list[AddonCompatibility] = []
+        for addon in installed:
+            option = options_by_name.get(addon.name)
+            supported = tuple(
+                sorted(
+                    {
+                        str(getattr(version, "version_number", ""))
+                        for version in (
+                            getattr(option, "versions", None) or ()
+                        )
+                        if (
+                            getattr(version, "version_number", None)
+                            and (
+                                not getattr(version, "status", None)
+                                or str(
+                                    getattr(version, "status", "")
+                                ).upper()
+                                == "ACTIVE"
+                            )
+                            and _addon_version_supports_kubernetes(
+                                version,
+                                target_version,
+                            )
+                        )
+                    }
+                )
+            )
+            automatic = (addon.update_mode or "").upper() in {
+                "AUTOMATIC",
+                "AUTO",
+            }
+            selected_version = addon.selected_version or (
+                addon.version if not automatic else None
+            )
+            lifecycle_ready = (
+                not addon.lifecycle_state
+                or addon.lifecycle_state.upper() == "ACTIVE"
+            )
+            compatible = (
+                bool(option)
+                and bool(supported)
+                and lifecycle_ready
+                and (
+                    automatic
+                    or selected_version is None
+                    or selected_version in supported
+                )
+            )
+            reason = None
+            if option is None:
+                reason = f"Add-on is not offered for Kubernetes {target_version}."
+            elif not supported:
+                reason = (
+                    f"Add-on has no supported version for Kubernetes "
+                    f"{target_version}."
+                )
+            elif not lifecycle_ready:
+                reason = (
+                    f"Add-on lifecycle state is "
+                    f"{addon.lifecycle_state or 'UNKNOWN'}."
+                )
+            elif (
+                not automatic
+                and selected_version
+                and selected_version not in supported
+            ):
+                reason = (
+                    f"Pinned version {selected_version} is not supported for "
+                    f"Kubernetes {target_version}."
+                )
+            results.append(
+                AddonCompatibility(
+                    name=addon.name,
+                    installed_version=addon.version,
+                    update_mode=addon.update_mode,
+                    supported_versions=supported,
+                    compatible=compatible,
+                    reason=reason,
+                )
+            )
+        return results
+
+    def upgrade_control_plane(
+        self,
+        cluster_id: str,
+        target_version: str,
+        etag: str,
+    ) -> str | None:
+        if not etag:
+            raise OciDiscoveryError(
+                "Control-plane upgrade requires the current OKE cluster ETag."
+            )
+        details = self.oci.container_engine.models.UpdateClusterDetails(
+            kubernetes_version=target_version,
+        )
+        response = self._call(
+            "OKE control-plane upgrade",
+            self.container_engine.update_cluster,
+            cluster_id,
+            details,
+            if_match=etag,
+        )
+        return (getattr(response, "headers", None) or {}).get(
+            "opc-work-request-id"
+        )
 
     def get_work_request_status(
         self,
@@ -350,6 +581,8 @@ class OciBackend:
         name: str,
         size: int,
         spec: PoolCreateSpec,
+        *,
+        opc_retry_token: str | None = None,
     ) -> ManagedNodePoolCreateResult:
         details = self._build_managed_node_pool_create_details(
             source_node_pool_id,
@@ -363,10 +596,15 @@ class OciBackend:
             "Managed OKE node pool creation",
             self.container_engine.create_node_pool,
             details,
-            opc_retry_token=str(uuid.uuid4()),
+            opc_retry_token=opc_retry_token or str(uuid.uuid4()),
         )
         headers = getattr(response, "headers", None) or {}
         return ManagedNodePoolCreateResult(
+            node_pool_id=getattr(
+                getattr(response, "data", None),
+                "id",
+                None,
+            ),
             work_request_id=headers.get("opc-work-request-id"),
         )
 
@@ -488,6 +726,20 @@ class OciBackend:
                 node_pool_pod_network_option_details=pod_network,
             )
         )
+        source_compute_cluster_id = getattr(
+            source_config,
+            "compute_cluster_id",
+            None,
+        )
+        if source_compute_cluster_id:
+            supported_fields = getattr(node_config, "swagger_types", {})
+            if "compute_cluster_id" not in supported_fields:
+                raise OciDiscoveryError(
+                    "The installed OCI Python SDK cannot clone managed Compute "
+                    "Cluster placement. Upgrade the OCI SDK to the version "
+                    "declared by this project."
+                )
+            node_config.compute_cluster_id = source_compute_cluster_id
 
         metadata = dict(getattr(source, "node_metadata", None) or {})
         source_user_data = metadata.get("user_data")
@@ -748,6 +1000,9 @@ class OciBackend:
         name: str,
         size: int,
         spec: PoolCreateSpec | None = None,
+        *,
+        instance_configuration_retry_token: str | None = None,
+        cluster_network_retry_token: str | None = None,
     ) -> ClusterNetworkCreateResult:
         spec = spec or PoolCreateSpec(pool_type="rdma")
         try:
@@ -775,7 +1030,10 @@ class OciBackend:
             "Instance Configuration creation",
             self.compute_mgmt.create_instance_configuration,
             instance_configuration_details,
-            opc_retry_token=str(uuid.uuid4()),
+            opc_retry_token=(
+                instance_configuration_retry_token
+                or str(uuid.uuid4())
+            ),
         )
         instance_configuration_id = getattr(
             instance_configuration_response.data,
@@ -786,7 +1044,29 @@ class OciBackend:
             raise OciDiscoveryError(
                 "Instance Configuration creation did not return the new resource OCID."
             )
+        return self._create_cluster_network_with_configuration(
+            source,
+            source_pool,
+            placement,
+            normalized_name,
+            size,
+            str(instance_configuration_id),
+            spec,
+            opc_retry_token=cluster_network_retry_token,
+        )
 
+    def _create_cluster_network_with_configuration(
+        self,
+        source: Any,
+        source_pool: Any,
+        placement: Any,
+        name: str,
+        size: int,
+        instance_configuration_id: str,
+        spec: PoolCreateSpec,
+        *,
+        opc_retry_token: str | None = None,
+    ) -> ClusterNetworkCreateResult:
         primary_vnic_subnets = (
             None
             if spec.primary_subnet_id
@@ -812,21 +1092,21 @@ class OciBackend:
         )
         instance_pool_details = (
             self.oci.core.models.CreateClusterNetworkInstancePoolDetails(
-                display_name=normalized_name,
+                display_name=name,
                 freeform_tags=_clone_pool_freeform_tags(
                     getattr(source_pool, "freeform_tags", None),
-                    normalized_name,
+                    name,
                 ),
                 instance_configuration_id=instance_configuration_id,
                 size=size,
             )
         )
         create_details = self.oci.core.models.CreateClusterNetworkDetails(
-            compartment_id=compartment_id,
-            display_name=normalized_name,
+            compartment_id=getattr(source, "compartment_id", None),
+            display_name=name,
             freeform_tags=_clone_pool_freeform_tags(
                 getattr(source, "freeform_tags", None),
-                normalized_name,
+                name,
             ),
             instance_pools=[instance_pool_details],
             placement_configuration=placement_details,
@@ -838,7 +1118,7 @@ class OciBackend:
                 "Cluster Network pool creation",
                 self.compute_mgmt.create_cluster_network,
                 create_details,
-                opc_retry_token=str(uuid.uuid4()),
+                opc_retry_token=opc_retry_token or str(uuid.uuid4()),
             )
         except OciDiscoveryError as exc:
             raise OciDiscoveryError(
@@ -856,7 +1136,7 @@ class OciBackend:
         created_pools = list(getattr(created, "instance_pools", None) or [])
         headers = getattr(response, "headers", None) or {}
         return ClusterNetworkCreateResult(
-            cluster_network_id=cluster_network_id,
+            cluster_network_id=str(cluster_network_id),
             instance_configuration_id=instance_configuration_id,
             instance_pool_id=(
                 getattr(created_pools[0], "id", None) if created_pools else None
@@ -1299,6 +1579,7 @@ class OciBackend:
     def delete_mgmt_created_instance_configuration(
         self,
         instance_configuration_id: str,
+        operation_id: str | None = None,
     ) -> None:
         instance_configuration = self._call(
             "Instance Configuration ownership lookup",
@@ -1311,6 +1592,18 @@ class OciBackend:
             raise OciDiscoveryError(
                 "Refusing to delete an Instance Configuration that is not "
                 f"tagged mgmt-oke-created=true: {instance_configuration_id}"
+            )
+        tags = dict(
+            getattr(instance_configuration, "freeform_tags", None) or {}
+        )
+        if (
+            operation_id is not None
+            and tags.get("mgmt-oke-upgrade-operation") != operation_id
+        ):
+            raise OciDiscoveryError(
+                "Refusing to delete an Instance Configuration that is not "
+                f"owned by upgrade operation {operation_id}: "
+                f"{instance_configuration_id}"
             )
         self._call(
             "Instance Configuration deletion",
@@ -1721,6 +2014,879 @@ class OciBackend:
                 f"{operating_systems[1]}."
             )
 
+    def preview_managed_pool_upgrade(
+        self,
+        node_pool_id: str,
+        target_version: str,
+        *,
+        strategy: str,
+        image_id: str | None = None,
+        maximum_unavailable: str | None = None,
+        maximum_surge: str | None = None,
+        enable_cycling: bool = True,
+    ) -> tuple[Any, str, dict[str, Any]]:
+        response = self._call(
+            "Managed OKE node pool lookup",
+            self.container_engine.get_node_pool,
+            node_pool_id,
+        )
+        pool = response.data
+        etag = (getattr(response, "headers", None) or {}).get("etag")
+        if not etag:
+            raise OciDiscoveryError(
+                f"Managed node pool {node_pool_id} did not return an ETag."
+            )
+        current_version = getattr(pool, "kubernetes_version", None)
+        if not current_version:
+            raise OciDiscoveryError(
+                f"Managed node pool {node_pool_id} did not return a Kubernetes version."
+            )
+        if strategy not in {"boot-volume-replace", "instance-replace"}:
+            raise OciDiscoveryError(
+                f"Managed in-place upgrade does not support strategy {strategy!r}."
+            )
+        source = getattr(pool, "node_source_details", None)
+        current_image_id = getattr(source, "image_id", None)
+        effective_image_id = image_id or current_image_id
+        if not effective_image_id:
+            raise OciDiscoveryError(
+                f"Managed node pool {node_pool_id} did not return an image OCID."
+            )
+        if image_id and current_image_id:
+            self._validate_bvr_image_distribution(current_image_id, image_id)
+            node_config = getattr(pool, "node_config_details", None)
+            placements = tuple(
+                getattr(node_config, "placement_configs", None) or ()
+            )
+            shape = getattr(pool, "node_shape", None)
+            compartment_id = getattr(pool, "compartment_id", None)
+            if not shape or not compartment_id:
+                raise OciDiscoveryError(
+                    "Managed node pool does not expose shape and compartment "
+                    "details required for custom-image validation."
+                )
+            self._validate_create_compatibility(
+                compartment_id=compartment_id,
+                shape=shape,
+                image_id=image_id,
+                availability_domains=tuple(
+                    getattr(placement, "availability_domain", "")
+                    for placement in placements
+                ),
+                source_subnet_id=getattr(
+                    next(iter(placements), None),
+                    "subnet_id",
+                    None,
+                ),
+                primary_subnet_ids=tuple(
+                    getattr(placement, "subnet_id", "")
+                    for placement in placements
+                ),
+                pod_subnet_ids=(),
+                nsg_ids=(),
+                require_local_nvme=False,
+            )
+
+        mode = (
+            "BOOT_VOLUME_REPLACE"
+            if strategy == "boot-volume-replace"
+            else "INSTANCE_REPLACE"
+        )
+        values: dict[str, Any] = {
+            "kubernetes_version": target_version,
+        }
+        cycling = None
+        if enable_cycling:
+            cycling = self.oci.container_engine.models.NodePoolCyclingDetails(
+                maximum_unavailable=(
+                    maximum_unavailable
+                    if maximum_unavailable is not None
+                    else ("1" if strategy == "boot-volume-replace" else "0")
+                ),
+                maximum_surge=(
+                    maximum_surge
+                    if maximum_surge is not None
+                    else (None if strategy == "boot-volume-replace" else "1")
+                ),
+                is_node_cycling_enabled=True,
+                cycle_modes=[mode],
+            )
+            values["node_pool_cycling_details"] = cycling
+        if image_id:
+            values["node_source_details"] = (
+                self.oci.container_engine.models.NodeSourceViaImageDetails(
+                    source_type="IMAGE",
+                    image_id=effective_image_id,
+                    boot_volume_size_in_gbs=getattr(
+                        source,
+                        "boot_volume_size_in_gbs",
+                        None,
+                    ),
+                )
+            )
+        details = self.oci.container_engine.models.UpdateNodePoolDetails(**values)
+        return details, etag, {
+            "current_version": current_version,
+            "target_version": target_version,
+            "current_image_id": current_image_id,
+            "target_image_id": effective_image_id,
+            "strategy": strategy,
+            "phase": "cycle" if enable_cycling else "launch-configuration",
+            "cycle_mode": mode if enable_cycling else None,
+            "maximum_unavailable": (
+                cycling.maximum_unavailable if cycling else None
+            ),
+            "maximum_surge": cycling.maximum_surge if cycling else None,
+        }
+
+    def upgrade_managed_pool(
+        self,
+        node_pool_id: str,
+        details: Any,
+        etag: str,
+    ) -> str | None:
+        response = self._call(
+            "Managed OKE worker upgrade",
+            self.container_engine.update_node_pool,
+            node_pool_id,
+            details,
+            if_match=etag,
+        )
+        return (getattr(response, "headers", None) or {}).get(
+            "opc-work-request-id"
+        )
+
+    def preview_instance_configuration_upgrade(
+        self,
+        instance_configuration_id: str,
+        target_version: str,
+        *,
+        operation_id: str,
+        api_server: str,
+        cluster_ca: str,
+        image_id: str | None = None,
+        availability_domain: str | None = None,
+    ) -> tuple[Any, dict[str, Any]]:
+        source = self._get_instance_configuration_template(
+            instance_configuration_id
+        )
+        details, summary = self._build_upgrade_instance_configuration_details(
+            source,
+            target_version,
+            operation_id=operation_id,
+            api_server=api_server,
+            cluster_ca=cluster_ca,
+            image_id=image_id,
+            availability_domain=availability_domain,
+        )
+        return details, summary
+
+    def create_upgrade_instance_configuration(
+        self,
+        instance_configuration_id: str,
+        target_version: str,
+        *,
+        operation_id: str,
+        api_server: str,
+        cluster_ca: str,
+        image_id: str | None = None,
+        availability_domain: str | None = None,
+    ) -> str:
+        details, _summary = self.preview_instance_configuration_upgrade(
+            instance_configuration_id,
+            target_version,
+            operation_id=operation_id,
+            api_server=api_server,
+            cluster_ca=cluster_ca,
+            image_id=image_id,
+            availability_domain=availability_domain,
+        )
+        response = self._call(
+            "Upgrade Instance Configuration creation",
+            self.compute_mgmt.create_instance_configuration,
+            details,
+            opc_retry_token=_operation_retry_token(
+                operation_id,
+                "instance-configuration",
+                instance_configuration_id,
+                target_version,
+            ),
+        )
+        configuration_id = getattr(response.data, "id", None)
+        if not configuration_id:
+            raise OciDiscoveryError(
+                "Upgrade Instance Configuration creation returned no OCID."
+            )
+        return str(configuration_id)
+
+    def _build_upgrade_instance_configuration_details(
+        self,
+        source: Any,
+        target_version: str,
+        *,
+        operation_id: str,
+        api_server: str,
+        cluster_ca: str,
+        image_id: str | None,
+        availability_domain: str | None,
+    ) -> tuple[Any, dict[str, Any]]:
+        instance_details = deepcopy(getattr(source, "instance_details", None))
+        launch = getattr(instance_details, "launch_details", None)
+        if launch is None:
+            raise OciDiscoveryError(
+                "Source Instance Configuration does not expose launch details."
+            )
+        metadata = dict(getattr(launch, "metadata", None) or {})
+        required = ("user_data", "oke-initial-node-labels")
+        missing = [name for name in required if not metadata.get(name)]
+        if missing:
+            raise OciDiscoveryError(
+                "Source Instance Configuration is missing OKE bootstrap "
+                f"metadata: {', '.join(missing)}."
+            )
+        if not api_server or not cluster_ca:
+            raise OciDiscoveryError(
+                "Current Kubernetes API endpoint and cluster CA are required "
+                "to refresh self-managed worker bootstrap."
+            )
+        metadata["apiserver_host"] = api_server
+        metadata["cluster_ca_cert"] = cluster_ca
+        metadata["oke-k8version"] = target_version
+        metadata["user_data"] = compose_worker_user_data(
+            metadata["user_data"],
+            PoolCreateSpec(
+                pool_type="rdma",
+                kubernetes_version=target_version,
+            ),
+        )
+        launch.metadata = metadata
+        source_details = getattr(launch, "source_details", None)
+        if source_details is None:
+            raise OciDiscoveryError(
+                "Source Instance Configuration has no image source details."
+            )
+        current_image_id = getattr(source_details, "image_id", None)
+        if not current_image_id:
+            raise OciDiscoveryError(
+                "Source Instance Configuration does not expose an image OCID."
+            )
+        if image_id:
+            self._validate_bvr_image_distribution(current_image_id, image_id)
+            source_details.image_id = image_id
+            shape = getattr(launch, "shape", None)
+            compartment_id = getattr(source, "compartment_id", None)
+            selected_ad = (
+                availability_domain
+                or getattr(launch, "availability_domain", None)
+            )
+            primary_vnic = getattr(launch, "create_vnic_details", None)
+            if not shape or not compartment_id or not selected_ad:
+                raise OciDiscoveryError(
+                    "Custom-image upgrade validation requires the inherited "
+                    "shape, compartment, and availability domain."
+                )
+            self._validate_create_compatibility(
+                compartment_id=compartment_id,
+                shape=shape,
+                image_id=image_id,
+                availability_domains=(selected_ad,),
+                source_subnet_id=getattr(
+                    primary_vnic,
+                    "subnet_id",
+                    None,
+                ),
+                primary_subnet_ids=(
+                    getattr(primary_vnic, "subnet_id", "") or "",
+                ),
+                pod_subnet_ids=tuple(
+                    _split_metadata_values(metadata.get("pod-subnets"))
+                ),
+                nsg_ids=tuple(
+                    dict.fromkeys(
+                        [
+                            *(
+                                getattr(primary_vnic, "nsg_ids", None)
+                                or []
+                            ),
+                            *_split_metadata_values(
+                                metadata.get("pod-nsgids")
+                            ),
+                        ]
+                    )
+                ),
+                require_local_nvme=False,
+            )
+        effective_image = image_id or current_image_id
+        tags = dict(getattr(source, "freeform_tags", None) or {})
+        tags.update(
+            {
+                "mgmt-oke-created": "true",
+                "mgmt-oke-upgrade-operation": operation_id,
+                "mgmt-oke-upgrade-source-config": str(
+                    getattr(source, "id", "")
+                ),
+            }
+        )
+        launch_tags = dict(getattr(launch, "freeform_tags", None) or {})
+        launch_tags.update(tags)
+        launch.freeform_tags = launch_tags
+        display_name = (
+            f"{getattr(source, 'display_name', 'oke-worker')}-"
+            f"{target_version.lstrip('v').replace('.', '-')}"
+        )
+        details = self.oci.core.models.CreateInstanceConfigurationDetails(
+            compartment_id=getattr(source, "compartment_id", None),
+            display_name=display_name,
+            freeform_tags=tags,
+            defined_tags=deepcopy(getattr(source, "defined_tags", None)),
+            source="NONE",
+            instance_details=instance_details,
+        )
+        if metadata.get("oke-k8version") != target_version:
+            raise OciDiscoveryError(
+                "Target Kubernetes version could not be proven in cloned bootstrap."
+            )
+        return details, {
+            "source_instance_configuration_id": getattr(source, "id", None),
+            "target_version": target_version,
+            "image_id": effective_image,
+            "api_server_refreshed": True,
+            "cluster_ca_refreshed": True,
+            "metadata_keys_preserved": sorted(metadata),
+        }
+
+    def attach_upgrade_instance_configuration(
+        self,
+        pool: WorkerPoolInfo,
+        instance_configuration_id: str,
+    ) -> str | None:
+        if pool.kind == "cluster-network" and pool.cluster_network_id:
+            response = self._call(
+                "Cluster Network lookup",
+                self.compute_mgmt.get_cluster_network,
+                pool.cluster_network_id,
+            )
+            cluster_network = response.data
+            etag = (getattr(response, "headers", None) or {}).get("etag")
+            if not etag:
+                raise OciDiscoveryError("Cluster Network lookup returned no ETag.")
+            updates = []
+            matched = False
+            for item in list(
+                getattr(cluster_network, "instance_pools", None) or ()
+            ):
+                item_id = getattr(item, "id", None)
+                is_target = item_id == pool.instance_pool_id
+                matched = matched or is_target
+                updates.append(
+                    self.oci.core.models.UpdateClusterNetworkInstancePoolDetails(
+                        id=item_id,
+                        display_name=getattr(item, "display_name", None),
+                        size=getattr(item, "size", None),
+                        instance_configuration_id=(
+                            instance_configuration_id
+                            if is_target
+                            else getattr(item, "instance_configuration_id", None)
+                        ),
+                        defined_tags=getattr(item, "defined_tags", None),
+                        freeform_tags=getattr(item, "freeform_tags", None),
+                    )
+                )
+            if not matched:
+                raise OciDiscoveryError(
+                    f"Instance pool {pool.instance_pool_id} is not part of "
+                    f"Cluster Network {pool.cluster_network_id}."
+                )
+            details = self.oci.core.models.UpdateClusterNetworkDetails(
+                display_name=getattr(cluster_network, "display_name", None),
+                defined_tags=getattr(cluster_network, "defined_tags", None),
+                freeform_tags=getattr(cluster_network, "freeform_tags", None),
+                instance_pools=updates,
+            )
+            updated = self._call(
+                "Cluster Network upgrade configuration attachment",
+                self.compute_mgmt.update_cluster_network,
+                pool.cluster_network_id,
+                details,
+                if_match=etag,
+            )
+        elif pool.kind == "instance-pool" and pool.instance_pool_id:
+            response = self._call(
+                "Instance Pool lookup",
+                self.compute_mgmt.get_instance_pool,
+                pool.instance_pool_id,
+            )
+            etag = (getattr(response, "headers", None) or {}).get("etag")
+            if not etag:
+                raise OciDiscoveryError("Instance Pool lookup returned no ETag.")
+            details = self.oci.core.models.UpdateInstancePoolDetails(
+                instance_configuration_id=instance_configuration_id,
+            )
+            updated = self._call(
+                "Instance Pool upgrade configuration attachment",
+                self.compute_mgmt.update_instance_pool,
+                pool.instance_pool_id,
+                details,
+                if_match=etag,
+            )
+        elif (
+            pool.kind == "gpu-memory-cluster"
+            and pool.gpu_memory_cluster_id
+        ):
+            response = self._call(
+                "GPU Memory Cluster lookup",
+                self.compute.get_compute_gpu_memory_cluster,
+                pool.gpu_memory_cluster_id,
+            )
+            etag = (getattr(response, "headers", None) or {}).get("etag")
+            if not etag:
+                raise OciDiscoveryError(
+                    "GPU Memory Cluster lookup returned no ETag."
+                )
+            details = self.oci.core.models.UpdateComputeGpuMemoryClusterDetails(
+                instance_configuration_id=instance_configuration_id,
+            )
+            updated = self._call(
+                "GPU Memory Cluster upgrade configuration attachment",
+                self.compute.update_compute_gpu_memory_cluster,
+                pool.gpu_memory_cluster_id,
+                details,
+                if_match=etag,
+            )
+        else:
+            raise OciDiscoveryError(
+                f"Pool {pool.name} does not expose a supported self-managed backend."
+            )
+        return (getattr(updated, "headers", None) or {}).get(
+            "opc-work-request-id"
+        )
+
+    def replace_self_managed_instance_boot_volume(
+        self,
+        instance_id: str,
+        target_instance_configuration_id: str,
+    ) -> None:
+        configuration = self._get_instance_configuration_template(
+            target_instance_configuration_id
+        )
+        launch = getattr(
+            getattr(configuration, "instance_details", None),
+            "launch_details",
+            None,
+        )
+        source = getattr(launch, "source_details", None)
+        image_id = getattr(source, "image_id", None)
+        metadata = dict(getattr(launch, "metadata", None) or {})
+        if not image_id or not metadata.get("oke-k8version"):
+            raise OciDiscoveryError(
+                "Target Instance Configuration does not prove its image and "
+                "Kubernetes bootstrap version."
+            )
+        instance_response = self._call(
+            "Compute instance lookup",
+            self.compute.get_instance,
+            instance_id,
+        )
+        etag = (getattr(instance_response, "headers", None) or {}).get("etag")
+        if not etag:
+            raise OciDiscoveryError(
+                f"Compute instance {instance_id} lookup returned no ETag."
+            )
+        update_source = self.oci.core.models.UpdateInstanceSourceViaImageDetails(
+            source_type="IMAGE",
+            image_id=image_id,
+            boot_volume_size_in_gbs=getattr(
+                source,
+                "boot_volume_size_in_gbs",
+                None,
+            ),
+            kms_key_id=getattr(source, "kms_key_id", None),
+            is_preserve_boot_volume_enabled=True,
+        )
+        details = self.oci.core.models.UpdateInstanceDetails(
+            metadata=metadata,
+            source_details=update_source,
+            update_operation_constraint="ALLOW_DOWNTIME",
+        )
+        self._call(
+            "Self-managed worker boot volume replacement",
+            self.compute.update_instance,
+            instance_id,
+            details,
+            if_match=etag,
+        )
+
+    def create_managed_blue_green_pool(
+        self,
+        pool: WorkerPoolInfo,
+        *,
+        cluster_id: str,
+        compartment_id: str,
+        target_version: str,
+        name: str,
+        image_id: str | None,
+        operation_id: str,
+    ) -> ManagedNodePoolCreateResult:
+        if not pool.node_pool_id or not pool.desired_size:
+            raise OciDiscoveryError(
+                f"Managed pool {pool.name} has no source OCID or positive size."
+            )
+        pool_type = "gpu" if pool.gpu_resource else "cpu"
+        return self.create_managed_node_pool(
+            pool.node_pool_id,
+            cluster_id,
+            compartment_id,
+            name,
+            pool.desired_size,
+            PoolCreateSpec(
+                pool_type=pool_type,
+                kubernetes_version=target_version,
+                image_id=image_id,
+                freeform_tags=(
+                    ("mgmt-oke-upgrade-operation", operation_id),
+                    ("mgmt-oke-blue-green-source", pool.name),
+                ),
+            ),
+            opc_retry_token=_operation_retry_token(
+                operation_id,
+                "managed-blue-green",
+                pool.node_pool_id,
+                name,
+            ),
+        )
+
+    def create_cluster_network_blue_green_pool(
+        self,
+        pool: WorkerPoolInfo,
+        *,
+        target_version: str,
+        name: str,
+        image_id: str | None,
+        operation_id: str,
+        target_instance_configuration_id: str | None = None,
+    ) -> ClusterNetworkCreateResult:
+        if (
+            not pool.cluster_network_id
+            or not pool.instance_pool_id
+            or not pool.desired_size
+        ):
+            raise OciDiscoveryError(
+                f"Cluster Network pool {pool.name} is missing its source configuration."
+            )
+        spec = PoolCreateSpec(
+            pool_type="rdma",
+            kubernetes_version=target_version,
+            image_id=image_id,
+            freeform_tags=(
+                ("mgmt-oke-upgrade-operation", operation_id),
+                ("mgmt-oke-blue-green-source", pool.name),
+            ),
+        )
+        if not target_instance_configuration_id:
+            return self.create_cluster_network_pool(
+                pool.cluster_network_id,
+                pool.instance_pool_id,
+                name,
+                pool.desired_size,
+                spec,
+                instance_configuration_retry_token=(
+                    _operation_retry_token(
+                        operation_id,
+                        "instance-configuration",
+                        pool.instance_configuration_id or pool.instance_pool_id,
+                        target_version,
+                    )
+                ),
+                cluster_network_retry_token=_operation_retry_token(
+                    operation_id,
+                    "cluster-network-blue-green",
+                    pool.cluster_network_id,
+                    name,
+                ),
+            )
+        source, source_pool, placement = self._get_cluster_network_pool_source(
+            pool.cluster_network_id,
+            pool.instance_pool_id,
+        )
+        return self._create_cluster_network_with_configuration(
+            source,
+            source_pool,
+            placement,
+            normalize_pool_name(name),
+            pool.desired_size,
+            target_instance_configuration_id,
+            spec,
+            opc_retry_token=_operation_retry_token(
+                operation_id,
+                "cluster-network-blue-green",
+                pool.cluster_network_id,
+                name,
+            ),
+        )
+
+    def create_instance_pool_blue_green(
+        self,
+        pool: WorkerPoolInfo,
+        *,
+        target_instance_configuration_id: str,
+        name: str,
+        operation_id: str,
+    ) -> tuple[str, str | None]:
+        if not pool.instance_pool_id or not pool.desired_size:
+            raise OciDiscoveryError(
+                f"Instance Pool {pool.name} is missing its source configuration."
+            )
+        response = self._call(
+            "Source Instance Pool lookup",
+            self.compute_mgmt.get_instance_pool,
+            pool.instance_pool_id,
+        )
+        source = response.data
+        tags = dict(getattr(source, "freeform_tags", None) or {})
+        tags.update(
+            {
+                "mgmt-oke-created": "true",
+                "mgmt-oke-upgrade-operation": operation_id,
+                "mgmt-oke-blue-green-source": pool.name,
+            }
+        )
+        details = self.oci.core.models.CreateInstancePoolDetails(
+            compartment_id=getattr(source, "compartment_id", None),
+            display_name=name,
+            instance_configuration_id=target_instance_configuration_id,
+            placement_configurations=deepcopy(
+                getattr(source, "placement_configurations", None)
+            ),
+            size=pool.desired_size,
+            load_balancers=deepcopy(getattr(source, "load_balancers", None)),
+            instance_display_name_formatter=getattr(
+                source,
+                "instance_display_name_formatter",
+                None,
+            ),
+            instance_hostname_formatter=getattr(
+                source,
+                "instance_hostname_formatter",
+                None,
+            ),
+            lifecycle_management=deepcopy(
+                getattr(source, "lifecycle_management", None)
+            ),
+            freeform_tags=tags,
+            defined_tags=deepcopy(getattr(source, "defined_tags", None)),
+        )
+        created = self._call(
+            "Blue-green Instance Pool creation",
+            self.compute_mgmt.create_instance_pool,
+            details,
+            opc_retry_token=_operation_retry_token(
+                operation_id,
+                "instance-pool-blue-green",
+                pool.instance_pool_id,
+                name,
+            ),
+        )
+        pool_id = getattr(created.data, "id", None)
+        if not pool_id:
+            raise OciDiscoveryError(
+                "Blue-green Instance Pool creation returned no OCID."
+            )
+        return str(pool_id), (
+            getattr(created, "headers", None) or {}
+        ).get("opc-work-request-id")
+
+    def create_gpu_memory_cluster_blue_green(
+        self,
+        pool: WorkerPoolInfo,
+        *,
+        target_instance_configuration_id: str,
+        name: str,
+        operation_id: str,
+        compute_cluster_id: str | None,
+        gpu_memory_fabric_id: str | None,
+    ) -> tuple[str, str | None]:
+        if not pool.gpu_memory_cluster_id or not pool.desired_size:
+            raise OciDiscoveryError(
+                f"GPU Memory Cluster {pool.name} is missing its source configuration."
+            )
+        if not compute_cluster_id or not gpu_memory_fabric_id:
+            raise OciDiscoveryError(
+                "GPU Memory Cluster blue-green requires explicit "
+                "--blue-green-compute-cluster-id and "
+                "--blue-green-gpu-memory-fabric-id targets."
+            )
+        source = self._call(
+            "Source GPU Memory Cluster lookup",
+            self.compute.get_compute_gpu_memory_cluster,
+            pool.gpu_memory_cluster_id,
+        ).data
+        tags = dict(getattr(source, "freeform_tags", None) or {})
+        tags.update(
+            {
+                "mgmt-oke-created": "true",
+                "mgmt-oke-upgrade-operation": operation_id,
+                "mgmt-oke-blue-green-source": pool.name,
+            }
+        )
+        details = self.oci.core.models.CreateComputeGpuMemoryClusterDetails(
+            availability_domain=getattr(source, "availability_domain", None),
+            compartment_id=getattr(source, "compartment_id", None),
+            gpu_memory_fabric_id=gpu_memory_fabric_id,
+            compute_cluster_id=compute_cluster_id,
+            instance_configuration_id=target_instance_configuration_id,
+            size=pool.desired_size,
+            display_name=name,
+            gpu_memory_cluster_scale_config=deepcopy(
+                getattr(source, "gpu_memory_cluster_scale_config", None)
+            ),
+            freeform_tags=tags,
+            defined_tags=deepcopy(getattr(source, "defined_tags", None)),
+        )
+        created = self._call(
+            "Blue-green GPU Memory Cluster creation",
+            self.compute.create_compute_gpu_memory_cluster,
+            details,
+            opc_retry_token=_operation_retry_token(
+                operation_id,
+                "gpu-memory-cluster-blue-green",
+                pool.gpu_memory_cluster_id,
+                name,
+            ),
+        )
+        cluster_id = getattr(created.data, "id", None)
+        if not cluster_id:
+            raise OciDiscoveryError(
+                "Blue-green GPU Memory Cluster creation returned no OCID."
+            )
+        return str(cluster_id), (
+            getattr(created, "headers", None) or {}
+        ).get("opc-work-request-id")
+
+    def resize_upgrade_backend(
+        self,
+        pool: WorkerPoolInfo,
+        size: int,
+    ) -> str | None:
+        if size < 0:
+            raise OciDiscoveryError("Upgrade backend size cannot be negative.")
+        if pool.kind == "cluster-network" and pool.cluster_network_id:
+            response = self._call(
+                "Cluster Network lookup",
+                self.compute_mgmt.get_cluster_network,
+                pool.cluster_network_id,
+            )
+            cluster_network = response.data
+            etag = (getattr(response, "headers", None) or {}).get("etag")
+            if not etag:
+                raise OciDiscoveryError("Cluster Network lookup returned no ETag.")
+            updates = []
+            matched = False
+            for item in list(
+                getattr(cluster_network, "instance_pools", None) or ()
+            ):
+                item_id = getattr(item, "id", None)
+                is_target = item_id == pool.instance_pool_id
+                matched = matched or is_target
+                updates.append(
+                    self.oci.core.models.UpdateClusterNetworkInstancePoolDetails(
+                        id=item_id,
+                        display_name=getattr(item, "display_name", None),
+                        size=size if is_target else getattr(item, "size", None),
+                        instance_configuration_id=getattr(
+                            item,
+                            "instance_configuration_id",
+                            None,
+                        ),
+                        defined_tags=getattr(item, "defined_tags", None),
+                        freeform_tags=getattr(item, "freeform_tags", None),
+                    )
+                )
+            if not matched:
+                raise OciDiscoveryError(
+                    f"Cluster Network {pool.name} does not contain its expected "
+                    f"Instance Pool {pool.instance_pool_id}."
+                )
+            details = self.oci.core.models.UpdateClusterNetworkDetails(
+                display_name=getattr(cluster_network, "display_name", None),
+                defined_tags=getattr(cluster_network, "defined_tags", None),
+                freeform_tags=getattr(cluster_network, "freeform_tags", None),
+                instance_pools=updates,
+            )
+            updated = self._call(
+                "Cluster Network upgrade resize",
+                self.compute_mgmt.update_cluster_network,
+                pool.cluster_network_id,
+                details,
+                if_match=etag,
+            )
+        elif pool.kind == "instance-pool" and pool.instance_pool_id:
+            response = self._call(
+                "Instance Pool lookup",
+                self.compute_mgmt.get_instance_pool,
+                pool.instance_pool_id,
+            )
+            etag = (getattr(response, "headers", None) or {}).get("etag")
+            if not etag:
+                raise OciDiscoveryError("Instance Pool lookup returned no ETag.")
+            details = self.oci.core.models.UpdateInstancePoolDetails(size=size)
+            updated = self._call(
+                "Instance Pool upgrade resize",
+                self.compute_mgmt.update_instance_pool,
+                pool.instance_pool_id,
+                details,
+                if_match=etag,
+            )
+        elif (
+            pool.kind == "gpu-memory-cluster"
+            and pool.gpu_memory_cluster_id
+        ):
+            response = self._call(
+                "GPU Memory Cluster lookup",
+                self.compute.get_compute_gpu_memory_cluster,
+                pool.gpu_memory_cluster_id,
+            )
+            etag = (getattr(response, "headers", None) or {}).get("etag")
+            if not etag:
+                raise OciDiscoveryError(
+                    "GPU Memory Cluster lookup returned no ETag."
+                )
+            details = self.oci.core.models.UpdateComputeGpuMemoryClusterDetails(
+                size=size
+            )
+            updated = self._call(
+                "GPU Memory Cluster upgrade resize",
+                self.compute.update_compute_gpu_memory_cluster,
+                pool.gpu_memory_cluster_id,
+                details,
+                if_match=etag,
+            )
+        else:
+            raise OciDiscoveryError(
+                f"Pool {pool.name} does not expose a resizable upgrade backend."
+            )
+        return (getattr(updated, "headers", None) or {}).get(
+            "opc-work-request-id"
+        )
+
+    def terminate_upgrade_instance(self, instance_id: str) -> None:
+        response = self._call(
+            "Compute instance lookup",
+            self.compute.get_instance,
+            instance_id,
+        )
+        etag = (getattr(response, "headers", None) or {}).get("etag")
+        if not etag:
+            raise OciDiscoveryError(
+                f"Compute instance {instance_id} lookup returned no ETag."
+            )
+        self._call(
+            "Upgrade instance termination",
+            self.compute.terminate_instance,
+            instance_id,
+            preserve_boot_volume=False,
+            if_match=etag,
+        )
+
     def detach_instance_pool_node(
         self,
         instance_pool_id: str,
@@ -1771,6 +2937,101 @@ class OciBackend:
             if instance_pool_id:
                 self._enrich_from_instance_pool(pool, compartment_id, instance_pool_id)
             pools.append(pool)
+        return pools
+
+    def list_gpu_memory_cluster_pools(
+        self,
+        compartment_id: str,
+    ) -> list[WorkerPoolInfo]:
+        response = self.oci.pagination.list_call_get_all_results(
+            self.compute.list_compute_gpu_memory_clusters,
+            compartment_id,
+        )
+        pools: list[WorkerPoolInfo] = []
+        for summary in response.data:
+            state = str(getattr(summary, "lifecycle_state", "") or "").upper()
+            if state in {"DELETED", "DELETING", "TERMINATED", "TERMINATING"}:
+                continue
+            cluster_id = getattr(summary, "id", None)
+            if not cluster_id:
+                continue
+            cluster_response = self._call(
+                "GPU Memory Cluster lookup",
+                self.compute.get_compute_gpu_memory_cluster,
+                cluster_id,
+            )
+            cluster = cluster_response.data
+            instances_response = self._call(
+                "GPU Memory Cluster instance listing",
+                self.oci.pagination.list_call_get_all_results,
+                self.compute.list_compute_gpu_memory_cluster_instances,
+                cluster_id,
+            )
+            instances = list(instances_response.data)
+            active = [
+                instance
+                for instance in instances
+                if _lifecycle_state(instance).upper()
+                in {"ACTIVE", "RUNNING", "STARTING", "PROVISIONING"}
+            ]
+            shape = None
+            if active and (instance_id := _object_id(active[0])):
+                try:
+                    shape = getattr(
+                        self.compute.get_instance(instance_id).data,
+                        "shape",
+                        None,
+                    )
+                except Exception:
+                    pass
+            instance_configuration_id = getattr(
+                cluster,
+                "instance_configuration_id",
+                None,
+            )
+            pools.append(
+                WorkerPoolInfo(
+                    name=getattr(cluster, "display_name", None) or cluster_id,
+                    kind="gpu-memory-cluster",
+                    shape=shape,
+                    compartment_id=compartment_id,
+                    availability_domain=getattr(
+                        cluster,
+                        "availability_domain",
+                        None,
+                    ),
+                    desired_size=getattr(cluster, "size", None),
+                    active_oci_instances=len(active),
+                    placement_type="gpu-memory-cluster",
+                    compute_cluster_id=getattr(
+                        cluster,
+                        "compute_cluster_id",
+                        None,
+                    ),
+                    oci_instance_ids={
+                        item_id
+                        for item in instances
+                        if (item_id := _object_id(item))
+                    },
+                    gpu_resource=_gpu_resource_for_shape(shape),
+                    rdma_enabled=True,
+                    instance_configuration_id=instance_configuration_id,
+                    kubernetes_version=(
+                        self._instance_configuration_kubernetes_version(
+                            instance_configuration_id
+                        )
+                    ),
+                    gpu_memory_cluster_id=cluster_id,
+                    gpu_memory_fabric_id=getattr(
+                        cluster,
+                        "gpu_memory_fabric_id",
+                        None,
+                    ),
+                    created_by_mgmt_oke=_is_mgmt_oke_created(
+                        getattr(cluster, "freeform_tags", None)
+                    ),
+                )
+            )
         return pools
 
     def list_instance_pools(
@@ -1860,6 +3121,32 @@ class OciBackend:
                 pass
         pool.gpu_resource = _gpu_resource_for_shape(pool.shape)
         pool.rdma_enabled = pool.rdma_enabled or bool(pool.shape and pool.shape.startswith("BM.GPU"))
+        pool.kubernetes_version = (
+            self._instance_configuration_kubernetes_version(
+                pool.instance_configuration_id
+            )
+        )
+
+    def _instance_configuration_kubernetes_version(
+        self,
+        instance_configuration_id: str | None,
+    ) -> str | None:
+        if not instance_configuration_id:
+            return None
+        try:
+            configuration = self.compute_mgmt.get_instance_configuration(
+                instance_configuration_id
+            ).data
+        except Exception:
+            return None
+        launch = getattr(
+            getattr(configuration, "instance_details", None),
+            "launch_details",
+            None,
+        )
+        metadata = dict(getattr(launch, "metadata", None) or {})
+        value = metadata.get("oke-k8version")
+        return str(value) if value else None
 
 
 def _build_managed_placement_configs(
@@ -2361,10 +3648,55 @@ def _addon_error(addon: Any) -> str | None:
     return str(error)
 
 
+def _addon_version_supports_kubernetes(
+    addon_version: Any,
+    target_version: str,
+) -> bool:
+    filters = getattr(addon_version, "kubernetes_version_filters", None)
+    if filters is None:
+        return True
+    exact = tuple(
+        str(value)
+        for value in (
+            getattr(filters, "exact_kubernetes_versions", None) or ()
+        )
+    )
+    if exact:
+        return target_version in exact
+    try:
+        from oke_hpc_mgmt.upgrades import KubernetesVersion
+
+        target = KubernetesVersion.parse(target_version)
+        minimum_value = getattr(filters, "minimal_version", None)
+        maximum_value = getattr(filters, "maximum_version", None)
+        minimum = (
+            KubernetesVersion.parse(str(minimum_value))
+            if minimum_value
+            else None
+        )
+        maximum = (
+            KubernetesVersion.parse(str(maximum_value))
+            if maximum_value
+            else None
+        )
+    except ValueError:
+        return False
+    if minimum and target < minimum:
+        return False
+    if maximum and target > maximum:
+        return False
+    return True
+
+
 def _work_request_error(error: Any) -> str:
     code = getattr(error, "code", None)
     message = getattr(error, "message", None) or str(error)
     return f"{code}: {message}" if code else str(message)
+
+
+def _operation_retry_token(operation_id: str, *parts: str) -> str:
+    value = ":".join(("mgmt-oke", operation_id, *parts))
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, value))
 
 
 def _object_id(item: Any) -> str | None:

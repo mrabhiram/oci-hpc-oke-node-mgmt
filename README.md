@@ -24,6 +24,17 @@ management for OCI HPC OKE clusters:
   network, boot, Kubernetes, label, tag, and lifecycle settings `[Implemented]`
 - compose the official OCI HPC OKE worker bootstrap for existing FSS and Lustre
   mounts and local NVMe RAID `[Implemented]`
+- discover control-plane, virtual-pool, declared worker, and actual kubelet
+  versions together with OKE-advertised upgrade targets `[Implemented]`
+- resolve a minor target to the latest supported production patch and validate
+  one-minor-at-a-time sequencing, skew, preview, downgrade, add-on, Kueue, and
+  Slinky constraints `[Implemented]`
+- plan and execute checkpointed Kubernetes upgrades across managed CPU/GPU,
+  Compute Cluster RDMA, legacy Cluster Network, standalone Instance Pool, and
+  GPU Memory Cluster worker backends `[Implemented]`
+- support boot-volume-replace, instance-replace, and blue-green worker upgrade
+  strategies without cordoning, draining, evicting, or uncordoning workloads
+  from the upgrade subsystem `[Implemented]`
 - resize standard and Compute Cluster-backed OKE node pools and self-managed cluster-network pools `[Implemented]`
 - drain and delete complete managed OKE, Cluster Network, or standalone Instance
   Pool worker pools `[Implemented]`
@@ -44,11 +55,13 @@ management for OCI HPC OKE clusters:
 - validate OKE accelerator add-ons against discovered GPU and RDMA capacity `[Implemented]`
 
 Inventory, status, health, recommendation, topology, autoscaler, add-on status,
-and reconciliation commands are read-only. Pool creation, deletion, capacity,
-boot volume replacement, and node termination commands mutate OCI resources.
-Node maintenance commands mutate Kubernetes. Every mutation supports
-`--dry-run`, uses a Kubernetes Lease by default, and requires either `--yes` or
-an interactive typed confirmation.
+upgrade status and planning, and reconciliation commands are read-only. Pool
+creation, deletion, capacity, boot volume replacement, node termination, and
+upgrade execution commands mutate OCI resources. Node maintenance commands
+mutate Kubernetes. Upgrade commands never cordon, drain, evict, or uncordon
+workers; operators prepare workloads externally and provide a separate safety
+attestation. Every mutation supports `--dry-run`, uses a Kubernetes Lease by
+default, and requires either `--yes` or an interactive confirmation.
 
 ## Install
 
@@ -132,6 +145,7 @@ Command groups:
 | `pools add <pool> --count <n>` | Add `n` workers to desired pool capacity. |
 | `pools remove <pool> --count <n>` | Remove `n` workers from desired pool capacity; OCI selects the workers. |
 | `pools boot-volume-replace <pool> <property-update>` | Replace every managed worker boot volume while applying a supported image, boot, Kubernetes, metadata, or SSH-key update. |
+| `pools upgrade <pool> --to <version> --strategy <strategy>` | Upgrade one externally prepared worker pool and wait for complete convergence. |
 | `nodes list` | List and filter Kubernetes nodes. |
 | `nodes get <identifier...>` | Get nodes by Kubernetes name, Slurm name, internal IP, provider ID, or instance OCID. |
 | `nodes terminate <identifier...>` | Drain and terminate selected managed or self-managed workers. |
@@ -148,6 +162,11 @@ Command groups:
 | `health run` | Run deterministic health checks by category or pool. |
 | `recommendations list` | Show actionable warnings and failures. |
 | `reconcile` | Show a full discovery snapshot. |
+| `upgrades status [--to <version>]` | Show current and target versions, add-on compatibility, scheduler state, and supported strategies. |
+| `upgrades plan --to <version>` | Build the complete ordered control-plane and worker plan without mutation. |
+| `upgrades apply --to <version>` | Run checkpointed full-cluster orchestration after all safety acknowledgements. |
+| `upgrades resume\|abandon\|cleanup` | Resume observed state, abandon checkpoint state without rollback, or delete operation-owned superseded configurations after success. |
+| `clusters upgrade --to <version>` | Execute one valid OKE control-plane patch or minor upgrade step. |
 | `clusters list\|create\|delete\|add node` | Slurm-style compatibility aliases for worker-pool lifecycle commands. These aliases do not create or delete the OKE control plane. |
 
 Pool creation options:
@@ -546,6 +565,54 @@ For Slinky-managed pools, node removal, replacement, and pool scale-down are
 refused because they require a Slurm-aware drain. Pool scale-up remains
 available. `--allow-workloads` does not bypass this protection.
 
+### Kubernetes upgrades
+
+Inspect the complete version and compatibility state:
+
+```bash
+mgmt-oke upgrades status --to v1.36
+mgmt-oke upgrades plan --to v1.36
+mgmt-oke upgrades apply --to v1.36 --dry-run
+```
+
+A major/minor target resolves to the latest production patch advertised by
+OKE. Preview `.0` targets require `--allow-preview`. Downgrades, unsupported
+minor jumps, worker versions newer than the control plane, incompatible pinned
+add-ons, and invalid kubelet skew are refused.
+
+The default full-cluster order is control plane, CPU canary, system, regular
+GPU, managed Compute Cluster RDMA, legacy Cluster Network RDMA, GPU Memory
+Cluster, then custom pools. `auto` selects managed boot-volume replacement and
+self-managed instance replacement. Explicit
+`boot-volume-replace`, `instance-replace`, and `blue-green` strategies are also
+available.
+
+Upgrade commands never cordon, drain, evict, or uncordon workers. The operator
+must prepare Kubernetes, Kueue, and Slinky workloads externally. Execution
+requires application-compatibility and IaC-drift acknowledgements plus a
+separate workload-drained attestation for worker pools; `--yes` does not replace
+them. The emergency attestation applies only when verification is unavailable
+and never bypasses positively detected workloads.
+
+Preview one control-plane step or one pool:
+
+```bash
+mgmt-oke clusters upgrade --to v1.36 --dry-run
+mgmt-oke pools upgrade oke-gpu \
+  --to v1.36.1 \
+  --strategy boot-volume-replace \
+  --dry-run
+```
+
+Full execution stores a resumable, resource-version-protected ConfigMap in
+`kube-system`, revalidates OCI ETags under the mutation Lease, waits after
+every mutation, and supports `upgrades resume`, `upgrades abandon`, and
+ownership-checked `upgrades cleanup`.
+
+See [Kubernetes Upgrades](docs/kubernetes-upgrades.md) for the complete strategy
+matrix, workload gate, custom-image behavior, recovery model, and sanitized
+live validation output.
+
 ### Status, health, and recommendations
 
 ```bash
@@ -630,7 +697,7 @@ changes that break automation require a new schema version.
 After installing the package, run the unit-test suite from the project root:
 
 ```bash
-python -m unittest discover -s tests -v
+python -m pytest
 ```
 
 For lint and type checks, install the development tools and run:
@@ -638,8 +705,10 @@ For lint and type checks, install the development tools and run:
 ```bash
 python -m pip install ".[dev]"
 ruff check src tests
-mypy src
+mypy src tests
 ```
+
+CI runs pytest on Python 3.9, 3.10, 3.11, and 3.12, followed by Ruff and mypy.
 
 ## Documentation
 
@@ -650,6 +719,9 @@ mypy src
   prerequisites, installation, authentication, validation, and troubleshooting
 - [`docs/command-reference.md`](docs/command-reference.md): complete command,
   selector, mutation-option, output, and exit-status reference
+- [`docs/kubernetes-upgrades.md`](docs/kubernetes-upgrades.md): Kubernetes
+  target selection, planning, workload gates, strategies, orchestration, and
+  recovery
 - [`docs/live-pool-creation-validation.md`](docs/live-pool-creation-validation.md):
   sanitized output from live managed GPU and self-managed RDMA creation validation
 - [`docs/live-pool-deletion-validation.md`](docs/live-pool-deletion-validation.md):

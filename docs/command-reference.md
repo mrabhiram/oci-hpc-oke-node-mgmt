@@ -34,6 +34,7 @@ Commands:
   reconcile        Run full OCI and Kubernetes discovery.
   status           Show concise AI/HPC cluster health and capacity status.
   topology         Inspect OCI RDMA placement topology.
+  upgrades         Plan, execute, resume, and audit Kubernetes upgrades.
 ```
 
 ## Global Options
@@ -495,6 +496,122 @@ Termination drains by default. The safety options are:
 Managed OKE pools use OKE `DeleteNode`. Legacy Cluster Network and standalone
 Instance Pool workers use instance-pool detach with automatic termination.
 
+## Kubernetes Upgrades
+
+Inspect current versions and optionally resolve a target:
+
+```bash
+mgmt-oke upgrades status
+mgmt-oke upgrades status --to v1.36
+mgmt-oke upgrades status --to v1.36 --format json
+```
+
+Generate the full ordered plan:
+
+```bash
+mgmt-oke upgrades plan --to v1.36
+mgmt-oke upgrades plan --to v1.36 \
+  --strategy auto \
+  --pool-strategy oke-gpu=instance-replace \
+  --pool-image oke-gpu=<image-ocid>
+```
+
+Execute one control-plane step, one externally prepared pool, or checkpointed
+full-cluster orchestration:
+
+```bash
+mgmt-oke clusters upgrade --to v1.36.1 --dry-run
+mgmt-oke pools upgrade oke-gpu \
+  --to v1.36.1 \
+  --strategy boot-volume-replace \
+  --dry-run
+mgmt-oke upgrades apply --to v1.36 --dry-run
+```
+
+Resume or resolve checkpoint state:
+
+```bash
+mgmt-oke upgrades resume --ack-workloads-drained
+mgmt-oke upgrades abandon --yes
+mgmt-oke upgrades cleanup --yes
+```
+
+Example live-derived plan output:
+
+```text
+operation              target      owner            strategy             target_size  workload_pods
+---------------------  ----------  ---------------  -------------------  -----------  -------------
+control-plane-upgrade  v1.36.1     oke              OKE UpdateCluster    -            0
+worker-pool-upgrade    oke-cpu     node-pool        boot-volume-replace  1            9
+worker-pool-upgrade    oke-system  node-pool        boot-volume-replace  2            12
+worker-pool-upgrade    oke-gpu     node-pool        boot-volume-replace  1            0
+worker-pool-upgrade    oke-rdma    cluster-network  instance-replace     2            1
+```
+
+This sanitized example was generated against a running CPU, A10, and A100 RDMA
+cluster. `v1.36` resolved to the OKE-advertised production target `v1.36.1`.
+The plan reported active pods, schedulability, and Kueue blockers but did not
+mutate OCI or Kubernetes.
+
+Target options:
+
+| Option | Purpose |
+| --- | --- |
+| `--to <version>` | Required exact patch or major/minor target. A major/minor value resolves to the latest advertised production patch. |
+| `--allow-preview` | Permit an explicitly advertised preview `.0` target. |
+
+Strategies:
+
+| Value | Behavior |
+| --- | --- |
+| `auto` | Managed OKE uses `boot-volume-replace`; self-managed backends use `instance-replace`. |
+| `boot-volume-replace` | Preserve worker instance identity. Managed pools use OKE cycling; self-managed pools sequentially update source, metadata, and boot volume. |
+| `instance-replace` | Managed pools use OKE surge cycling; self-managed pools add verified target capacity before removing old workers. |
+| `blue-green` | Create and verify a parallel backend, retain the source, then return `action-required` for external migration. |
+
+Pool strategy options:
+
+| Option | Purpose |
+| --- | --- |
+| `--strategy <value>` | Select `auto`, `boot-volume-replace`, `instance-replace`, or `blue-green`. |
+| `--image-id <ocid>` | Override the current compatible worker image. |
+| `--maximum-unavailable <value>` | Managed cycling count or percentage. |
+| `--maximum-surge <value>` | Managed cycling count or percentage. |
+| `--blue-green-name <name>` | Name the parallel worker backend. |
+| `--blue-green-compute-cluster-id <ocid>` | Select GMC target Compute Cluster placement. |
+| `--blue-green-gpu-memory-fabric-id <ocid>` | Select GMC target fabric placement. |
+
+Orchestration overrides repeat once per pool and use `POOL=VALUE`:
+
+| Option | Purpose |
+| --- | --- |
+| `--pool-order <pool>` | Supply the complete custom order by repeating this option. |
+| `--pool-strategy <pool=strategy>` | Override one pool strategy. |
+| `--pool-image <pool=image-ocid>` | Override one pool image. |
+| `--pool-maximum-unavailable <pool=value>` | Override managed cycling disruption. |
+| `--pool-maximum-surge <pool=value>` | Override managed surge. |
+| `--pool-blue-green-name <pool=name>` | Override the parallel backend name. |
+| `--pool-blue-green-compute-cluster <pool=ocid>` | Select GMC blue-green Compute Cluster placement. |
+| `--pool-blue-green-gpu-memory-fabric <pool=ocid>` | Select GMC blue-green fabric placement. |
+
+Execution and acknowledgement options:
+
+| Option | Purpose |
+| --- | --- |
+| `--ack-application-compatibility` | Attest that applications support the target version. |
+| `--ack-iac-drift` | Acknowledge direct OCI changes that must be reconciled into IaC. |
+| `--ack-workloads-drained` | Attest that targeted workers were externally prepared. |
+| `--emergency-ack-unverified-drain` | Accept only unavailable API, RBAC, or exec verification; detected work remains blocking. |
+| `--dry-run` | Perform available discovery and validation, print the plan, and stop before checkpoint or mutation. |
+| `--yes` | Confirm OCI mutation only; never replaces safety acknowledgements. |
+| `--timeout <seconds>` | Per-operation convergence timeout. Default: `7200`. |
+| `--poll-interval <seconds>` | Convergence polling interval. Default: `30`. |
+
+All upgrade execution paths wait. They do not expose `--no-wait`, scheduling,
+eviction, or drain options. See
+[Kubernetes Upgrades](./kubernetes-upgrades.md) for backend behavior,
+checkpoint recovery, add-on validation, and workload gates.
+
 ## Accelerator And Scheduler Views
 
 ```bash
@@ -560,6 +677,7 @@ partial discovery result is reported as `WARN` rather than as a healthy cluster.
 | `0` | Command succeeded; health checks found no failure or warning. |
 | `1` | Requested resource was not found, or a health command found a warning. |
 | `2` | Usage, validation, discovery, operation, timeout, or health failure. |
+| `3` | Upgrade reached a safe external-action checkpoint, such as blue-green workload migration. |
 | `130` | Interactive cancellation or keyboard interruption. |
 
 Warnings and progress are written to standard error. Table, JSON, and CSV data

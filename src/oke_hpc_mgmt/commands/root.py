@@ -129,6 +129,11 @@ from oke_hpc_mgmt.commands.recommendations import recommendations  # noqa: E402
 from oke_hpc_mgmt.commands.reconcile import reconcile  # noqa: E402
 from oke_hpc_mgmt.commands.status import status  # noqa: E402
 from oke_hpc_mgmt.commands.topology import topology  # noqa: E402
+from oke_hpc_mgmt.commands.upgrades import (  # noqa: E402
+    upgrade_cluster,
+    upgrade_pool,
+    upgrades,
+)
 
 
 cli.add_command(status)
@@ -141,3 +146,6 @@ cli.add_command(addons)
 cli.add_command(health)
 cli.add_command(recommendations)
 cli.add_command(reconcile)
+cli.add_command(upgrades)
+clusters.add_command(upgrade_cluster)
+pools.add_command(upgrade_pool)

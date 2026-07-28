@@ -15,7 +15,12 @@ Two protections are enforced:
 - manual resize, node removal, and BVR are refused for a pool targeted by
   Cluster Autoscaler
 - Slinky-managed pools allow scale-up but refuse scale-down, specific node
-  removal, replacement, and BVR until a Slurm-aware drain workflow exists
+  removal, replacement, and maintenance BVR until a Slurm-aware drain workflow
+  exists
+
+Kubernetes upgrade commands use a separate read-only workload gate. They can
+proceed only after the operator changes Slurm state externally and the CLI
+proves the partition, node, and job conditions described below.
 
 ## Cluster Autoscaler Detection
 
@@ -128,6 +133,52 @@ mgmt-oke --auth instance_principal pools boot-volume-replace <slinky-pool> --ima
 
 `--allow-workloads` and `--yes` do not bypass Slinky ownership protection.
 
+## Upgrade Workload Gate
+
+Upgrade planning reads Kueue and Slinky state without changing either
+scheduler:
+
+```bash
+mgmt-oke upgrades status --to v1.36
+mgmt-oke upgrades plan --to v1.36 --format json
+```
+
+For every ResourceFlavor associated with the target pool, its ClusterQueue must
+use `Hold` or `HoldAndDrain`, and the queue must have no admitted workload.
+
+For a Slinky pool, the Kubernetes backend:
+
+1. requires one discoverable `slurmctld` container
+2. uses read-only pod exec to run `scontrol show partition`, `scontrol show
+   node`, and `squeue`
+3. requires affected partitions to be `DOWN` or `INACTIVE`
+4. requires every target Slurm node to be drained/down
+5. blocks running, configuring, completing, suspended, or resizing jobs that
+   reference the target nodes
+
+The operator performs all Kueue holds, workload moves, Slurm node drains, and
+partition changes outside the tool. After the Kubernetes nodes are also Ready,
+externally cordoned, and free of ordinary pods, execute with an independent
+attestation:
+
+```bash
+mgmt-oke pools upgrade <slinky-pool> \
+  --to v1.36.1 \
+  --strategy instance-replace \
+  --ack-application-compatibility \
+  --ack-iac-drift \
+  --ack-workloads-drained \
+  --yes
+```
+
+`--yes` does not replace the three acknowledgements. The emergency
+acknowledgement is limited to an API, RBAC, or exec observation failure and
+cannot bypass detected pods, admitted Kueue work, or active Slurm jobs.
+
+After worker convergence, the tool verifies each Slinky node is registered
+again with the expected name. See
+[Kubernetes Upgrades](./kubernetes-upgrades.md).
+
 ## Operational Guidance
 
 Do not remove Slinky labels, annotations, or pods to make a destructive command
@@ -138,8 +189,10 @@ worker through Slurm-aware tooling when that workflow becomes available.
 
 The full reconciliation view reports Kueue Topology, ResourceFlavor,
 ClusterQueue, and LocalQueue counts and can associate a ResourceFlavor with a
-pool. The CLI does not change Kueue quota after a resize. Update queue quota
-through the Kueue configuration workflow when capacity changes require it.
+pool. The CLI does not change Kueue quota after a resize and does not change
+ClusterQueue stop policy during an upgrade. Update queue quota and stop policy
+through the Kueue configuration workflow when capacity or maintenance state
+requires it.
 
 ## Verification
 

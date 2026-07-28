@@ -318,6 +318,64 @@ For a legacy self-managed Cluster Network, use specific-node BVR without an
 image update. See
 [Replacing Worker Boot Volumes](./replacing-worker-boot-volumes.md).
 
+## RDMA Kubernetes Upgrades
+
+Inspect both RDMA ownership and upgrade readiness:
+
+```bash
+mgmt-oke pools get oke-rdma
+mgmt-oke upgrades status --to v1.36
+mgmt-oke upgrades plan --to v1.36 --format json
+```
+
+A managed Compute Cluster RDMA pool is upgraded through OKE exactly like other
+managed node pools. `boot-volume-replace` and `instance-replace` use
+`UpdateNodePool`; blue-green clones the complete node-pool configuration while
+preserving Compute Cluster and host-group placement. The OKE-internal backing
+Instance Pool remains hidden and is never mutated directly.
+
+A legacy Cluster Network upgrade clones the existing Instance Configuration
+before cycling capacity. The clone preserves RDMA VNICs, agents, cloud-init,
+custom metadata, SSH configuration, FSS, Lustre, local NVMe RAID, and
+pre/post-bootstrap scripts. It refreshes the current OKE API endpoint, cluster
+CA, and Kubernetes bootstrap version, then attaches the new configuration with
+the Cluster Network ETag.
+
+The default legacy strategy is `instance-replace`: increase the embedded
+Instance Pool by one, wait for a target-version RDMA worker with valid GPU,
+RDMA topology, and applicable `nvidia.com/rdma-vf`, then detach and terminate
+one externally drained old instance while decrementing back to desired size.
+
+Preview an explicit legacy strategy:
+
+```bash
+mgmt-oke pools upgrade oke-rdma \
+  --to v1.36.1 \
+  --strategy instance-replace \
+  --dry-run
+```
+
+Example live-derived output:
+
+```text
+operation            owner            pool      strategy          target_version  target_size  workload_pods
+-------------------  ---------------  --------  ----------------  --------------  -----------  -------------
+worker-pool-upgrade  cluster-network  oke-rdma  instance-replace  v1.36.1         2            1
+
+api_server_refreshed=true
+cluster_ca_refreshed=true
+kueue_blocker=ClusterQueue/bm-gpu4-8-rdma-topology-aware stopPolicy=None
+```
+
+The live plan proved the transformed bootstrap without creating an Instance
+Configuration or changing capacity. Execution remains blocked until the
+ordinary pod is moved, Kueue is held and empty, both workers are externally
+cordoned, and the operator provides the workload attestation.
+
+No RDMA upgrade path calls Kubernetes cordon, drain, eviction, or uncordon.
+See [Kubernetes Upgrades](./kubernetes-upgrades.md) for strategy details and
+checkpoint recovery.
+
 ## Slinky Slurm Pools
 
 The tool detects Slinky ownership from upstream labels, annotations, and slurmd
