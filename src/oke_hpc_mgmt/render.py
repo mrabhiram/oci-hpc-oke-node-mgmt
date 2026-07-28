@@ -3,8 +3,9 @@ from __future__ import annotations
 import csv
 import json
 import sys
+from collections.abc import Iterable
 from dataclasses import asdict, is_dataclass
-from typing import Any, Iterable
+from typing import Any
 
 from oke_hpc_mgmt.models import (
     AddonInfo,
@@ -197,6 +198,7 @@ PLAN_COLUMNS = [
     "target_size",
     "decrement_size",
     "workload_pods",
+    "details",
     "steps",
     "warnings",
     "status",
@@ -373,6 +375,7 @@ def operation_plan_rows(plans: list[OperationPlan]) -> list[dict[str, Any]]:
             "target_size": plan.target_size,
             "decrement_size": plan.decrement_size,
             "workload_pods": plan.workload_pods,
+            "details": plan.details,
             "steps": plan.steps,
             "warnings": plan.warnings,
             "status": "planned",

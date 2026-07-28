@@ -33,6 +33,15 @@ GPU_RESOURCES = ("nvidia.com/gpu", "amd.com/gpu")
 RDMA_VF_RESOURCE = "nvidia.com/rdma-vf"
 SLINKY_HOSTNAME_ANNOTATION = "nodeset.slinky.slurm.net/hostname-override"
 SLINKY_HOSTNAME_PREFIX_LABEL = "oci.oraclecloud.com/slinky-hostname-prefix"
+POOL_CREATE_TYPES = ("cpu", "gpu", "rdma")
+POOL_STORAGE_MODES = ("inherit", "append", "replace")
+CLUSTER_NETWORK_PLACEMENT_CONSTRAINTS = (
+    "SINGLE_TIER",
+    "SINGLE_BLOCK",
+    "PACKED_DISTRIBUTION_MULTI_BLOCK",
+)
+NODE_POOL_CNI_TYPES = ("OCI_VCN_IP_NATIVE", "FLANNEL_OVERLAY")
+NODE_CYCLING_MODES = ("INSTANCE_REPLACE", "BOOT_VOLUME_REPLACE")
 
 
 @dataclass(frozen=True)
@@ -242,6 +251,7 @@ class OperationPlan:
     workload_pods: int = 0
     steps: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -287,6 +297,153 @@ class ClusterNetworkCreateResult:
     instance_configuration_id: str
     instance_pool_id: str | None = None
     work_request_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ManagedNodePoolCreateResult:
+    node_pool_id: str | None = None
+    work_request_id: str | None = None
+
+
+@dataclass(frozen=True)
+class FssMountSpec:
+    export_path: str
+    mount_path: str
+    mount_target_ip: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "export_path": self.export_path,
+            "mount_path": self.mount_path,
+            "mount_target_ip": self.mount_target_ip,
+        }
+
+
+@dataclass(frozen=True)
+class LustreMountSpec:
+    management_address: str
+    filesystem_name: str
+    mount_path: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "management_address": self.management_address,
+            "filesystem_name": self.filesystem_name,
+            "mount_path": self.mount_path,
+        }
+
+
+@dataclass(frozen=True)
+class NvmeRaidSpec:
+    level: int
+    device_pattern: str = "/dev/nvme*n1"
+    mount_path: str = "/mnt/nvme"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "level": self.level,
+            "device_pattern": self.device_pattern,
+            "mount_path": self.mount_path,
+        }
+
+
+@dataclass(frozen=True)
+class PoolCreateSpec:
+    pool_type: str
+    availability_domain: str | None = None
+    shape: str | None = None
+    image_id: str | None = None
+    primary_subnet_id: str | None = None
+    pod_subnet_ids: tuple[str, ...] = ()
+    node_nsg_ids: tuple[str, ...] = ()
+    pod_nsg_ids: tuple[str, ...] = ()
+    boot_volume_size_in_gbs: int | None = None
+    boot_volume_vpus_per_gb: int | None = None
+    boot_volume_kms_key_id: str | None = None
+    ocpus: float | None = None
+    memory_in_gbs: float | None = None
+    kubernetes_version: str | None = None
+    max_pods_per_node: int | None = None
+    ssh_public_key: str | None = None
+    cloud_init: bytes | None = None
+    node_labels: tuple[tuple[str, str], ...] = ()
+    node_metadata: tuple[tuple[str, str], ...] = ()
+    freeform_tags: tuple[tuple[str, str], ...] = ()
+    capacity_reservation_id: str | None = None
+    fault_domains: tuple[str, ...] = ()
+    cni_type: str | None = None
+    placement_constraint: str | None = None
+    assign_public_ip: bool | None = None
+    pv_encryption_in_transit: bool | None = None
+    legacy_imds_endpoints_disabled: bool | None = None
+    node_cycling_enabled: bool | None = None
+    node_cycling_max_surge: str | None = None
+    node_cycling_max_unavailable: str | None = None
+    node_cycling_mode: str | None = None
+    eviction_grace_duration: str | None = None
+    force_delete_after_eviction_grace: bool | None = None
+    force_action_after_eviction_grace: bool | None = None
+    pre_bootstrap_script: bytes | None = None
+    post_bootstrap_script: bytes | None = None
+    kubelet_extra_args: str | None = None
+    storage_mode: str = "inherit"
+    nvme_raid: NvmeRaidSpec | None = None
+    fss_mounts: tuple[FssMountSpec, ...] = ()
+    lustre_mounts: tuple[LustreMountSpec, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        values: dict[str, Any] = {
+            "type": self.pool_type,
+            "availability_domain": self.availability_domain,
+            "shape": self.shape,
+            "image_id": self.image_id,
+            "primary_subnet_id": self.primary_subnet_id,
+            "pod_subnet_ids": list(self.pod_subnet_ids),
+            "node_nsg_ids": list(self.node_nsg_ids),
+            "pod_nsg_ids": list(self.pod_nsg_ids),
+            "boot_volume_size_in_gbs": self.boot_volume_size_in_gbs,
+            "boot_volume_vpus_per_gb": self.boot_volume_vpus_per_gb,
+            "boot_volume_kms_key_id": self.boot_volume_kms_key_id,
+            "ocpus": self.ocpus,
+            "memory_in_gbs": self.memory_in_gbs,
+            "kubernetes_version": self.kubernetes_version,
+            "max_pods_per_node": self.max_pods_per_node,
+            "ssh_public_key_configured": bool(self.ssh_public_key),
+            "cloud_init_overridden": self.cloud_init is not None,
+            "node_labels": dict(self.node_labels),
+            "node_metadata_keys": [key for key, _value in self.node_metadata],
+            "freeform_tags": dict(self.freeform_tags),
+            "capacity_reservation_id": self.capacity_reservation_id,
+            "fault_domains": list(self.fault_domains),
+            "cni_type": self.cni_type,
+            "placement_constraint": self.placement_constraint,
+            "assign_public_ip": self.assign_public_ip,
+            "pv_encryption_in_transit": self.pv_encryption_in_transit,
+            "legacy_imds_endpoints_disabled": self.legacy_imds_endpoints_disabled,
+            "node_cycling_enabled": self.node_cycling_enabled,
+            "node_cycling_max_surge": self.node_cycling_max_surge,
+            "node_cycling_max_unavailable": self.node_cycling_max_unavailable,
+            "node_cycling_mode": self.node_cycling_mode,
+            "eviction_grace_duration": self.eviction_grace_duration,
+            "force_delete_after_eviction_grace": (
+                self.force_delete_after_eviction_grace
+            ),
+            "force_action_after_eviction_grace": (
+                self.force_action_after_eviction_grace
+            ),
+            "pre_bootstrap_script_configured": self.pre_bootstrap_script is not None,
+            "post_bootstrap_script_configured": self.post_bootstrap_script is not None,
+            "kubelet_extra_args_configured": self.kubelet_extra_args is not None,
+            "storage_mode": self.storage_mode,
+            "nvme_raid": self.nvme_raid.as_dict() if self.nvme_raid else None,
+            "fss_mounts": [mount.as_dict() for mount in self.fss_mounts],
+            "lustre_mounts": [mount.as_dict() for mount in self.lustre_mounts],
+        }
+        return {
+            key: value
+            for key, value in values.items()
+            if value is not None and value not in ([], {})
+        }
 
 
 def _valid_topology_value(value: str | None) -> bool:

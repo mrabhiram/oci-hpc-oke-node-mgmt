@@ -58,6 +58,7 @@ configuration and placement:
 
 ```bash
 mgmt-oke --auth instance_principal pools create oke-rdma-2 \
+  --type rdma \
   --count 2 \
   --from-pool oke-rdma \
   --dry-run \
@@ -68,6 +69,7 @@ Apply after reviewing the plan:
 
 ```bash
 mgmt-oke --auth instance_principal pools create oke-rdma-2 \
+  --type rdma \
   --count 2 \
   --from-pool oke-rdma \
   --wait
@@ -80,7 +82,7 @@ a new Cluster Network and embedded Instance Pool. It does not create a managed
 OKE node pool or alter the source pool.
 
 See
-[Creating Cluster Network Worker Pools](./creating-cluster-network-pools.md)
+[Creating Worker Pools](./creating-worker-pools.md)
 for source selection, safety checks, dry-run output, and infrastructure-as-code
 ownership.
 

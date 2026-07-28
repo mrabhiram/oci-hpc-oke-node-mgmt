@@ -7,6 +7,7 @@ from oke_hpc_mgmt.backends.oci import (
     _clone_pool_freeform_tags,
     _retarget_oke_node_labels,
 )
+from oke_hpc_mgmt.models import PoolCreateSpec
 
 
 class _Model:
@@ -98,6 +99,13 @@ class _ContainerEngine:
         self.calls.append(("update_node_pool", node_pool_id, details))
         return SimpleNamespace(headers={"opc-work-request-id": "wr-node-pool"})
 
+    def create_node_pool(self, details, **kwargs):
+        self.calls.append(("create_node_pool", details, kwargs))
+        return SimpleNamespace(
+            data=None,
+            headers={"opc-work-request-id": "wr-node-pool-create"},
+        )
+
     def list_addons(self, cluster_id):
         self.calls.append(("list_addons", cluster_id))
         return SimpleNamespace(data=self.addons)
@@ -133,6 +141,32 @@ class _Compute:
     def get_instance(self, instance_id):
         return SimpleNamespace(data=SimpleNamespace(shape=self.shapes.get(instance_id)))
 
+    def list_shapes(self, compartment_id, **kwargs):
+        return SimpleNamespace(
+            data=[
+                SimpleNamespace(shape="BM.GPU4.8", local_disks=8),
+                SimpleNamespace(shape="VM.Standard.E5.Flex", local_disks=0),
+                SimpleNamespace(shape="VM.GPU.A10.1", local_disks=0),
+                SimpleNamespace(shape="VM.GPU.A10.2", local_disks=0),
+            ]
+        )
+
+
+class _VirtualNetwork:
+    def get_subnet(self, subnet_id):
+        return SimpleNamespace(
+            data=SimpleNamespace(
+                id=subnet_id,
+                vcn_id="vcn-1",
+                availability_domain=None,
+            )
+        )
+
+    def get_network_security_group(self, nsg_id):
+        return SimpleNamespace(
+            data=SimpleNamespace(id=nsg_id, vcn_id="vcn-1")
+        )
+
 
 class _Pagination:
     @staticmethod
@@ -154,6 +188,9 @@ def _instance_configuration():
         instance_details=SimpleNamespace(
             launch_details=SimpleNamespace(
                 display_name=None,
+                shape="BM.GPU4.8",
+                shape_config=None,
+                availability_domain="UK-LONDON-1-AD-3",
                 freeform_tags={
                     "pool": "oke-rdma",
                     "role": "worker",
@@ -172,11 +209,20 @@ def _instance_configuration():
                     "user_data": "cloud-init",
                 },
                 create_vnic_details=SimpleNamespace(
+                    subnet_id="subnet-1",
+                    nsg_ids=["nsg-1"],
                     freeform_tags={
                         "pool": "oke-rdma",
                         "role": "worker",
                         "state_id": "terraform-state",
                     }
+                ),
+                source_details=SimpleNamespace(
+                    source_type="image",
+                    image_id="image-1",
+                    boot_volume_size_in_gbs=512,
+                    boot_volume_vpus_per_gb=10,
+                    kms_key_id=None,
                 ),
             ),
             secondary_vnics=[],
@@ -185,7 +231,7 @@ def _instance_configuration():
     )
 
 
-def _backend(cluster_network=None, instance_configuration=None):
+def _backend(cluster_network=None, instance_configuration=None, node_pools=None):
     backend = OciBackend(auth="none")
     backend._oci = SimpleNamespace(
         pagination=_Pagination(),
@@ -193,6 +239,16 @@ def _backend(cluster_network=None, instance_configuration=None):
             models=SimpleNamespace(
                 UpdateNodePoolNodeConfigDetails=_Model,
                 UpdateNodePoolDetails=_Model,
+                CreateNodePoolDetails=_Model,
+                CreateNodePoolNodeConfigDetails=_Model,
+                NodePoolPlacementConfigDetails=_Model,
+                NodeSourceViaImageDetails=_Model,
+                CreateNodeShapeConfigDetails=_Model,
+                OciVcnIpNativeNodePoolPodNetworkOptionDetails=_Model,
+                FlannelOverlayNodePoolPodNetworkOptionDetails=_Model,
+                KeyValue=_Model,
+                NodePoolCyclingDetails=_Model,
+                NodeEvictionNodePoolSettings=_Model,
             )
         ),
         core=SimpleNamespace(
@@ -212,13 +268,158 @@ def _backend(cluster_network=None, instance_configuration=None):
         cluster_network,
         instance_configuration or _instance_configuration(),
     )
-    backend._container_engine = _ContainerEngine()
+    backend._container_engine = _ContainerEngine(node_pools=node_pools)
     backend._compute = _Compute()
+    backend._virtual_network = _VirtualNetwork()
     backend._work_requests = _WorkRequests()
     return backend
 
 
+def _managed_node_pool(shape="VM.Standard.E5.Flex"):
+    return SimpleNamespace(
+        id="node-pool-source",
+        cluster_id="cluster-1",
+        compartment_id="compartment-1",
+        name="oke-gpu" if "GPU" in shape else "oke-cpu",
+        lifecycle_state="ACTIVE",
+        kubernetes_version="v1.35.2",
+        node_shape=shape,
+        node_shape_config=(
+            SimpleNamespace(ocpus=6.0, memory_in_gbs=32.0)
+            if "Flex" in shape
+            else None
+        ),
+        node_source_details=SimpleNamespace(
+            image_id="image-source",
+            boot_volume_size_in_gbs=256,
+        ),
+        node_config_details=SimpleNamespace(
+            size=1,
+            nsg_ids=["node-nsg-source"],
+            kms_key_id=None,
+            is_pv_encryption_in_transit_enabled=True,
+            freeform_tags={"pool": "source", "state_id": "terraform-state"},
+            defined_tags={},
+            placement_configs=[
+                SimpleNamespace(
+                    availability_domain="AD-1",
+                    subnet_id="worker-subnet-source",
+                    capacity_reservation_id=None,
+                    preemptible_node_config=None,
+                    fault_domains=["FD-1"],
+                )
+            ],
+            node_pool_pod_network_option_details=SimpleNamespace(
+                cni_type="OCI_VCN_IP_NATIVE",
+                max_pods_per_node=64,
+                pod_nsg_ids=["pod-nsg-source"],
+                pod_subnet_ids=["pod-subnet-source"],
+            ),
+        ),
+        node_metadata={
+            "apiserver_host": "10.0.0.1:6443",
+            "user_data": "inherited-cloud-init",
+        },
+        initial_node_labels=[
+            SimpleNamespace(
+                key="oke.oraclecloud.com/pool.name",
+                value="source",
+            ),
+            SimpleNamespace(
+                key="oke.oraclecloud.com/tf.state_id",
+                value="terraform-state",
+            ),
+        ],
+        ssh_public_key="ssh-ed25519 source",
+        freeform_tags={"pool": "source", "state_id": "terraform-state"},
+        defined_tags={},
+        node_pool_cycling_details=SimpleNamespace(
+            is_node_cycling_enabled=False,
+            maximum_surge="25%",
+            maximum_unavailable="0",
+            cycle_modes=["INSTANCE_REPLACE"],
+        ),
+        node_eviction_node_pool_settings=SimpleNamespace(
+            eviction_grace_duration="PT5M",
+            is_force_delete_after_grace_duration=True,
+            is_force_action_after_grace_duration=True,
+        ),
+    )
+
+
 class OciBackendMutationTests(unittest.TestCase):
+    def test_create_managed_gpu_pool_applies_custom_image_and_network_overrides(self):
+        source = _managed_node_pool("VM.GPU.A10.1")
+        backend = _backend(node_pools=[source])
+        spec = PoolCreateSpec(
+            pool_type="gpu",
+            availability_domain="AD-2",
+            shape="VM.GPU.A10.2",
+            image_id="image-custom",
+            primary_subnet_id="worker-subnet-new",
+            pod_subnet_ids=("pod-subnet-new",),
+            node_nsg_ids=("node-nsg-new",),
+            pod_nsg_ids=("pod-nsg-new",),
+            boot_volume_size_in_gbs=512,
+            max_pods_per_node=80,
+            node_labels=(("workload.example/type", "training"),),
+            freeform_tags=(("team", "ai"),),
+        )
+
+        preview = backend.preview_managed_node_pool_create(
+            source.id,
+            "cluster-1",
+            "compartment-1",
+            "gpu-batch",
+            2,
+            spec,
+        )
+        created = backend.create_managed_node_pool(
+            source.id,
+            "cluster-1",
+            "compartment-1",
+            "gpu-batch",
+            2,
+            spec,
+        )
+
+        self.assertEqual("image-custom", preview["image_id"])
+        self.assertEqual(["AD-2"], preview["availability_domains"])
+        self.assertEqual(["pod-subnet-new"], preview["pod_subnet_ids"])
+        self.assertEqual("wr-node-pool-create", created.work_request_id)
+        call = next(
+            item
+            for item in backend._container_engine.calls
+            if item[0] == "create_node_pool"
+        )
+        details = call[1]
+        self.assertEqual("VM.GPU.A10.2", details.node_shape)
+        self.assertEqual("image-custom", details.node_source_details.image_id)
+        self.assertEqual(512, details.node_source_details.boot_volume_size_in_gbs)
+        self.assertEqual(
+            "worker-subnet-new",
+            details.node_config_details.placement_configs[0].subnet_id,
+        )
+        labels = {label.key: label.value for label in details.initial_node_labels}
+        self.assertEqual("gpu-batch", labels["oke.oraclecloud.com/pool.name"])
+        self.assertEqual("training", labels["workload.example/type"])
+        self.assertNotIn("oke.oraclecloud.com/tf.state_id", labels)
+        self.assertEqual("ai", details.freeform_tags["team"])
+
+    def test_managed_pool_type_rejects_incompatible_shape(self):
+        source = _managed_node_pool()
+        backend = _backend(node_pools=[source])
+
+        with self.assertRaisesRegex(OciDiscoveryError, "CPU pool type"):
+            backend.preview_managed_node_pool_create(
+                source.id,
+                "cluster-1",
+                "compartment-1",
+                "cpu-bad",
+                1,
+                PoolCreateSpec(pool_type="cpu", shape="VM.GPU.A10.1"),
+            )
+
     def test_resize_managed_node_pool_sends_only_size(self):
         backend = _backend()
 
@@ -558,6 +759,7 @@ class OciBackendMutationTests(unittest.TestCase):
                 "pool": "oke-rdma-2",
                 "role": "worker",
                 "custom": "value",
+                "mgmt-oke-created": "true",
             },
             tags,
         )

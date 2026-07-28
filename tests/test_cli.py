@@ -17,6 +17,7 @@ from oke_hpc_mgmt.models import (
     DiscoverySnapshot,
     NodeInfo,
     OperationPlan,
+    PoolCreateSpec,
     WorkerPoolInfo,
 )
 from oke_hpc_mgmt.workflows.lifecycle import (
@@ -70,7 +71,7 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(0, result.exit_code)
         self.assertIn("create", result.output)
-        self.assertIn("Discover, create, and resize", result.output)
+        self.assertIn("Manage the lifecycle", result.output)
 
     def test_kube_context_environment_variable_is_not_used(self):
         service = Mock()
@@ -205,6 +206,7 @@ class CliTests(unittest.TestCase):
             source_pool=source,
             name="oke-rdma-2",
             count=2,
+            spec=PoolCreateSpec(pool_type="rdma"),
             plan=OperationPlan(
                 operation="pool-create",
                 target="oke-rdma-2",
@@ -226,6 +228,8 @@ class CliTests(unittest.TestCase):
                     "pools",
                     "create",
                     "oke-rdma-2",
+                    "--type",
+                    "rdma",
                     "--count",
                     "2",
                     "--from-pool",
@@ -241,6 +245,113 @@ class CliTests(unittest.TestCase):
         prepare.assert_called_once()
         self.assertEqual("oke-rdma", prepare.call_args.kwargs["source_identifier"])
         execute.assert_not_called()
+
+    def test_pool_create_requires_explicit_type(self):
+        result = self.runner.invoke(
+            cli,
+            [
+                "pools",
+                "create",
+                "new-pool",
+                "--count",
+                "1",
+                "--dry-run",
+            ],
+        )
+
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("--type", result.output)
+
+    def test_pool_create_builds_managed_custom_image_and_storage_spec(self):
+        source = WorkerPoolInfo(
+            name="oke-gpu",
+            kind="node-pool",
+            node_pool_id="node-pool-1",
+            gpu_resource="nvidia.com/gpu",
+        )
+        prepared = PreparedPoolCreate(
+            snapshot=DiscoverySnapshot(pools=[source]),
+            source_pool=source,
+            name="gpu-batch",
+            count=2,
+            spec=PoolCreateSpec(pool_type="gpu"),
+            plan=OperationPlan(
+                operation="pool-create",
+                target="gpu-batch",
+            ),
+        )
+        with patch(
+            "oke_hpc_mgmt.commands.pools.prepare_pool_create",
+            return_value=prepared,
+        ) as prepare:
+            result = self.runner.invoke(
+                cli,
+                [
+                    "pools",
+                    "create",
+                    "gpu-batch",
+                    "--type",
+                    "gpu",
+                    "--count",
+                    "2",
+                    "--from-pool",
+                    "oke-gpu",
+                    "--availability-domain",
+                    "AD-2",
+                    "--shape",
+                    "VM.GPU.A10.2",
+                    "--image-id",
+                    "image-custom",
+                    "--storage-mode",
+                    "replace",
+                    "--fss-mount-target-ip",
+                    "10.0.0.5",
+                    "--fss-export-path",
+                    "/training",
+                    "--dry-run",
+                ],
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        spec = prepare.call_args.kwargs["spec"]
+        self.assertEqual("gpu", spec.pool_type)
+        self.assertEqual("AD-2", spec.availability_domain)
+        self.assertEqual("VM.GPU.A10.2", spec.shape)
+        self.assertEqual("image-custom", spec.image_id)
+        self.assertEqual("/mnt/oci-fss", spec.fss_mounts[0].mount_path)
+
+    def test_pool_create_rejects_storage_without_composition_mode(self):
+        result = self.runner.invoke(
+            cli,
+            [
+                "pools",
+                "create",
+                "cpu-new",
+                "--type",
+                "cpu",
+                "--count",
+                "1",
+                "--fss-mount-target-ip",
+                "10.0.0.5",
+                "--fss-export-path",
+                "/training",
+                "--dry-run",
+            ],
+        )
+
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("storage-mode", str(result.exception))
+
+    def test_clusters_group_exposes_slurm_style_pool_lifecycle_aliases(self):
+        result = self.runner.invoke(cli, ["clusters", "--help"])
+        add_result = self.runner.invoke(cli, ["clusters", "add", "--help"])
+
+        self.assertEqual(0, result.exit_code, result.output)
+        for command in ("list", "create", "add"):
+            self.assertIn(command, result.output)
+        self.assertEqual(0, add_result.exit_code, add_result.output)
+        self.assertIn("node", add_result.output)
+        self.assertIn("OKE control plane", result.output)
 
     def test_pool_add_translates_count_to_positive_delta(self):
         pool = WorkerPoolInfo(name="oke-cpu", kind="node-pool", desired_size=1)

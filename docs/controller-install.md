@@ -28,8 +28,9 @@ The controller/operator node must have:
 - IAM policy allowing the instance principal to read the target OKE cluster,
   inspect its node pools and add-ons, inspect backing compute resources, and
   inspect work requests used by `--wait`
-- additional IAM permissions to manage node pools, Cluster Networks, or
-  Instance Pools when resize or node-removal commands will be used
+- additional IAM permissions to create, update, or delete OKE node pools,
+  Instance Configurations, Cluster Networks, and Instance Pools when lifecycle
+  commands will be used
 - Network access to the Kubernetes API and OCI regional APIs
 
 Validate the controller environment before installing:
@@ -72,7 +73,7 @@ Verify the package entrypoints:
 Example version output:
 
 ```text
-mgmt-oke, version 0.5.0
+mgmt-oke, version 0.6.0
 ```
 
 ## Upgrade An Existing Installation
@@ -210,7 +211,7 @@ these checks when the operator kubeconfig identifies one OKE cluster.
 The current mutating commands are:
 
 ```bash
-mgmt-oke pools create <name> --count <n> [--from-pool <pool>] [--dry-run] [--wait]
+mgmt-oke pools create <name> --type <cpu|gpu|rdma> --count <n> [--from-pool <pool>] [--dry-run] [--wait]
 mgmt-oke pools resize <pool> (--size <n> | --delta <n>) [--dry-run] [--wait]
 mgmt-oke pools add <pool> --count <n> [--dry-run] [--wait]
 mgmt-oke pools remove <pool> --count <n> [--dry-run] [--wait]
@@ -227,6 +228,8 @@ Safety behavior:
 - Every mutation supports a validated `--dry-run` plan.
 - Every mutation requires either `--yes` or an interactive typed confirmation.
 - Mutations acquire a Kubernetes Lease by default to prevent concurrent tool operations.
+- Pool creation inherits cluster bootstrap from a matching source and validates
+  custom image, shape, placement, and network compatibility before submission.
 - The tool refuses to resize or remove nodes from Cluster Autoscaler-owned pools
   by default.
 - Node termination cordons and drains through the Kubernetes Eviction API by
@@ -252,23 +255,31 @@ mgmt-oke pools add oke-cpu --count 1 --dry-run
 mgmt-oke pools add oke-cpu --count 1 --wait
 ```
 
-Example Cluster Network pool creation:
+Example managed CPU, managed GPU, and self-managed RDMA creation previews:
 
 ```bash
-mgmt-oke pools create oke-rdma-2 \
+mgmt-oke pools create cpu-batch \
+  --type cpu \
+  --count 2 \
+  --from-pool oke-cpu \
+  --dry-run
+mgmt-oke pools create gpu-training \
+  --type gpu \
+  --count 2 \
+  --from-pool oke-gpu \
+  --image-id <custom-image-ocid> \
+  --dry-run
+mgmt-oke pools create rdma-training \
+  --type rdma \
   --count 2 \
   --from-pool oke-rdma \
   --dry-run
-mgmt-oke pools create oke-rdma-2 \
-  --count 2 \
-  --from-pool oke-rdma \
-  --wait
 ```
 
-Creation derives a new Instance Configuration from the source, applies the new
-pool identity, and reuses the source placement. It then creates a new Cluster
-Network and embedded Instance Pool; it does not create an OKE managed node-pool
-object.
+CPU and GPU submit OKE `CreateNodePool`. RDMA derives a new Instance
+Configuration and creates a Cluster Network with an embedded Instance Pool.
+See [`creating-worker-pools.md`](creating-worker-pools.md) and
+[`worker-bootstrap-and-storage.md`](worker-bootstrap-and-storage.md).
 
 A negative delta reduces capacity but does not select the departing worker. Use
 `nodes terminate` when a particular worker must be removed.

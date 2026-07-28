@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import click
 
 from oke_hpc_mgmt.commands.common import (
@@ -14,6 +16,10 @@ from oke_hpc_mgmt.commands.common import (
     resolve_output,
     wait_options,
 )
+from oke_hpc_mgmt.commands.pool_create_options import (
+    build_pool_create_spec,
+    pool_create_options,
+)
 from oke_hpc_mgmt.render import POOL_COLUMNS, pool_rows, print_records
 from oke_hpc_mgmt.workflows.lifecycle import (
     WorkflowNotFound,
@@ -24,7 +30,7 @@ from oke_hpc_mgmt.workflows.lifecycle import (
 )
 
 
-@click.group(help="Discover, create, and resize OCI HPC OKE worker pools.")
+@click.group(help="Manage the lifecycle of OCI HPC OKE worker pools.")
 def pools() -> None:
     pass
 
@@ -64,20 +70,13 @@ def get_pool(state: CliState, pool: str, output_override: str | None) -> int:
 
 @pools.command(
     "create",
-    help="Create a Cluster Network-backed pool from an existing RDMA pool.",
+    help=(
+        "Create a managed CPU/GPU pool or self-managed RDMA Cluster Network "
+        "pool from a proven OKE source."
+    ),
 )
 @click.argument("name")
-@click.option(
-    "--count",
-    type=click.IntRange(min=1),
-    required=True,
-    help="Initial number of workers.",
-)
-@click.option(
-    "--from-pool",
-    "source_identifier",
-    help="Source Cluster Network pool. Defaults to oke-rdma or the only eligible pool.",
-)
+@pool_create_options
 @wait_options
 @mutation_options
 @output_option
@@ -94,7 +93,12 @@ def create_pool(
     lock: bool,
     yes: bool,
     output_override: str | None,
+    **create_options: Any,
 ) -> int:
+    spec = build_pool_create_spec(
+        pool_type=str(create_options.pop("pool_type")),
+        **create_options,
+    )
     service = state.service(
         include_pod_counts=False,
         include_autoscaler=False,
@@ -104,6 +108,7 @@ def create_pool(
         service,
         name,
         count,
+        spec=spec,
         source_identifier=source_identifier,
     )
     if dry_run:

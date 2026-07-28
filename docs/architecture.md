@@ -283,50 +283,52 @@ rerun a separate worker-pool creation workflow.
 Pool-level size reduction delegates instance selection to Compute Management.
 Use specific node removal when worker identity matters.
 
-### Legacy Cluster Network Creation
+### Worker Pool Creation
 
-`pools create` creates a second self-managed RDMA pool from an existing Cluster
-Network pool. The preparation phase requires complete OCI pool discovery,
-rejects duplicate names, and selects the source through `--from-pool`,
-conventional `oke-rdma` naming, or an unambiguous single candidate.
+`pools create` requires an explicit `--type` and derives a new pool from a
+matching, working stack pool:
 
-The OCI backend reads the source Cluster Network and validates:
+- `cpu`: managed non-GPU, non-RDMA OKE source
+- `gpu`: managed GPU, non-RDMA OKE source
+- `rdma`: self-managed Cluster Network source
 
-- running lifecycle state
-- source Instance Pool membership
-- compartment OCID
-- Instance Configuration OCID
-- placement configuration
-- source Instance Configuration launch details
-- required OKE API server, CA certificate, node-label, and cloud-init metadata
+Preparation requires complete OCI pool discovery, rejects duplicate names, and
+selects the source through `--from-pool`, conventional stack naming, or an
+unambiguous single candidate. A managed Compute Cluster RDMA pool is not
+eligible as a regular GPU source.
 
-The backend deep-copies the source launch details and calls
-`CreateInstanceConfiguration`. The copy preserves the image, shape, cloud-init,
-OKE join metadata, agent settings, boot-volume settings, and networking. It
-updates instance and VNIC free-form tags, updates
-`oke.oraclecloud.com/pool.name`, enforces
-`oke.oraclecloud.com/pool.mode=cluster-network`, and removes the source
-Terraform module and state labels.
+For CPU and GPU, the backend reads the source OKE node pool and builds
+`CreateNodePoolDetails`. It preserves cluster-specific bootstrap, CNI, pod
+networking, labels, tags, cycling, and eviction settings unless a dedicated
+option overrides them. The new pool name and identity labels are retargeted.
 
-It then calls `CreateClusterNetwork` with a new display name and initial size,
-one embedded Instance Pool, the derived Instance Configuration, and the source
-availability domain, subnet, and placement constraint. The source `state_id`
-free-form tag is removed from newly derived resources. Other free-form tags are
-preserved, and `pool` is set to the new name.
+For RDMA, the backend reads the source Cluster Network, embedded Instance Pool,
+and Instance Configuration. It deep-copies launch details, including the image,
+shape, cloud-init, OKE join metadata, agent settings, primary and secondary
+VNICs, block volumes, and networking. It applies selected overrides, retargets
+instance and VNIC tags, updates the Kubernetes pool identity, and removes
+source Terraform module and state labels.
 
-The source Cluster Network and Instance Configuration remain unchanged. Cluster
-configuration fields that identify already allocated network blocks are not
-copied; Compute Management allocates placement for the new Cluster Network.
+The RDMA backend calls `CreateInstanceConfiguration`, then
+`CreateClusterNetwork` with one embedded Instance Pool. Already allocated
+network-block configuration is not copied; Compute Management allocates
+placement for the new Cluster Network. The source resources remain unchanged.
 
-If Instance Configuration creation succeeds but Cluster Network creation
-fails, the error reports the derived Instance Configuration OCID. Operators
-must first verify whether the Cluster Network request succeeded before removing
-that configuration.
+Every backend validates image and shape compatibility in the selected
+availability domains, VCN consistency for subnets and NSGs, CNI compatibility,
+and local-disk availability for NVMe RAID. Dry-run reports both requested and
+effective configuration.
 
-With `--wait`, the workflow tolerates the new resource not appearing in early
-inventory polls, monitors the returned work request, and then uses the same OCI,
-Kubernetes, GPU, RDMA topology, and applicable RDMA VF convergence checks as a
-resize.
+Optional cloud-init composition uses pinned copies of the official
+`oci-hpc-oke` worker scripts. NVMe RAID is inserted before OKE bootstrap; FSS
+and Lustre mounts are inserted after it. FSS and Lustre settings mount existing
+endpoints and do not provision storage, network, IAM, or Kubernetes PV
+resources.
+
+If RDMA Instance Configuration creation succeeds but Cluster Network creation
+fails, the error reports the derived Instance Configuration OCID. With
+`--wait`, creation monitors the work request and uses the same OCI, Kubernetes,
+GPU, RDMA topology, and applicable RDMA VF convergence checks as resize.
 
 ### Legacy Node Removal Or Replacement
 

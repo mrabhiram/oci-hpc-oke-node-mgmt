@@ -121,6 +121,7 @@ def cli(
 
 from oke_hpc_mgmt.commands.addons import addons  # noqa: E402
 from oke_hpc_mgmt.commands.autoscaler import autoscaler  # noqa: E402
+from oke_hpc_mgmt.commands.clusters import clusters  # noqa: E402
 from oke_hpc_mgmt.commands.health import health  # noqa: E402
 from oke_hpc_mgmt.commands.nodes import nodes  # noqa: E402
 from oke_hpc_mgmt.commands.pools import pools  # noqa: E402
@@ -131,6 +132,7 @@ from oke_hpc_mgmt.commands.topology import topology  # noqa: E402
 
 
 cli.add_command(status)
+cli.add_command(clusters)
 cli.add_command(pools)
 cli.add_command(nodes)
 cli.add_command(topology)

@@ -25,9 +25,10 @@ Usage: mgmt-oke [OPTIONS] COMMAND [ARGS]...
 Commands:
   addons           Inspect and validate OKE accelerator add-ons.
   autoscaler       Inspect Cluster Autoscaler ownership of worker pools.
+  clusters         Slurm-style aliases for OKE worker-pool lifecycle commands.
   health           Run deterministic AI/HPC readiness checks.
   nodes            Discover, maintain, replace, or terminate workers.
-  pools            Discover, create, and resize OCI HPC OKE worker pools.
+  pools            Manage the lifecycle of OCI HPC OKE worker pools.
   recommendations  Show actionable findings derived from cluster health.
   reconcile        Run full OCI and Kubernetes discovery.
   status           Show concise AI/HPC cluster health and capacity status.
@@ -97,25 +98,30 @@ oke-gpu     node-pool        standard         VM.GPU.A10.1         1        1   
 oke-system  node-pool        standard         VM.Standard.E5.Flex  2        2           2          -               no
 ```
 
-Create a self-managed Cluster Network pool from an existing RDMA pool:
+Create a pool from a matching stack template:
 
 ```bash
 mgmt-oke pools create <new-pool-name> \
+  --type <cpu|gpu|rdma> \
   --count 2 \
-  --from-pool <source-cluster-network-pool> \
+  --from-pool <source-pool> \
   --dry-run
 mgmt-oke pools create <new-pool-name> \
+  --type <cpu|gpu|rdma> \
   --count 2 \
-  --from-pool <source-cluster-network-pool> \
+  --from-pool <source-pool> \
   --wait
 ```
 
-If `--from-pool` is omitted, the command uses `oke-rdma` when present or the
-only eligible Cluster Network pool. It validates and derives a new Instance
-Configuration with the new pool identity, then creates the Cluster Network. It
-refuses ambiguous source selection. See
-[Creating Cluster Network Worker Pools](./creating-cluster-network-pools.md)
-for the complete workflow and dry-run output.
+`cpu` and `gpu` create managed OKE node pools. `rdma` creates a self-managed
+Cluster Network and derived Instance Configuration. Custom images and
+backend-appropriate placement, shape, networking, boot, Kubernetes, lifecycle,
+metadata, cloud-init, FSS, Lustre, and NVMe settings are available. Unspecified
+values are inherited from the matching source.
+
+See [Creating Worker Pools](./creating-worker-pools.md) and
+[Worker Bootstrap and Storage](./worker-bootstrap-and-storage.md) for the full
+option matrix and examples.
 
 Set an exact desired size:
 
@@ -178,6 +184,20 @@ All pool mutations support:
 | `--poll-interval <seconds>` | Set the readiness polling interval. Default: `30`. |
 | `--lock` / `--no-lock` | Enable or bypass the Kubernetes mutation Lease. |
 | `--yes` | Skip interactive typed confirmation. |
+
+## Slurm-Style Pool Aliases
+
+The following aliases mirror the command style of the OCI HPC Slurm management
+tool while retaining OKE worker-pool semantics:
+
+```bash
+mgmt-oke clusters list
+mgmt-oke clusters create <name> --type <cpu|gpu|rdma> --count <n>
+mgmt-oke clusters add node <pool> --count <n>
+```
+
+These aliases create and add capacity to worker pools. They do not create the
+OKE control plane.
 
 ## Node Inventory
 

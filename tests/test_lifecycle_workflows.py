@@ -9,6 +9,7 @@ from oke_hpc_mgmt.models import (
     DiscoverySnapshot,
     DrainPod,
     NodeInfo,
+    PoolCreateSpec,
     PoolResourceReadiness,
     WorkerPoolInfo,
     WorkRequestInfo,
@@ -45,8 +46,15 @@ def _service(snapshot: DiscoverySnapshot) -> Mock:
     )
     service.discover.return_value = snapshot
     service.resolve_oci_target.return_value = SimpleNamespace(
-        compartment_id="compartment-1"
+        compartment_id="compartment-1",
+        cluster_id="cluster-1",
     )
+    service.oci_backend.return_value.preview_cluster_network_pool_create.return_value = {
+        "backend": "cluster-network"
+    }
+    service.oci_backend.return_value.preview_managed_node_pool_create.return_value = {
+        "backend": "oke-node-pool"
+    }
     return service
 
 
@@ -80,11 +88,16 @@ class LifecycleWorkflowTests(unittest.TestCase):
             INSTANCE_CONFIGURATION_DERIVATION_NOTICE,
             prepared.plan.warnings,
         )
-        service.resolve_oci_target.assert_called_once_with(require_compartment=True)
-        service.oci_backend.return_value.validate_cluster_network_pool_template.assert_called_once_with(
+        service.resolve_oci_target.assert_called_once_with(
+            require_compartment=True,
+            require_cluster=True,
+        )
+        service.oci_backend.return_value.preview_cluster_network_pool_create.assert_called_once_with(
             "cluster-network-1",
             "instance-pool-1",
             "oke-rdma-2",
+            2,
+            PoolCreateSpec(pool_type="rdma"),
         )
 
     def test_prepare_pool_create_supports_explicit_template(self):
@@ -104,6 +117,64 @@ class LifecycleWorkflowTests(unittest.TestCase):
         )
 
         self.assertEqual(source, prepared.source_pool)
+
+    def test_prepare_pool_create_routes_managed_cpu_and_gpu_templates(self):
+        cpu = WorkerPoolInfo(
+            name="oke-cpu",
+            kind="node-pool",
+            node_pool_id="node-pool-cpu",
+            shape="VM.Standard.E5.Flex",
+        )
+        gpu = WorkerPoolInfo(
+            name="oke-gpu",
+            kind="node-pool",
+            node_pool_id="node-pool-gpu",
+            shape="VM.GPU.A10.1",
+            gpu_resource="nvidia.com/gpu",
+        )
+        service = _service(DiscoverySnapshot(pools=[gpu, cpu]))
+
+        prepared_cpu = prepare_pool_create(
+            service,
+            "cpu-batch",
+            2,
+            spec=PoolCreateSpec(pool_type="cpu", image_id="image-cpu"),
+        )
+        prepared_gpu = prepare_pool_create(
+            service,
+            "gpu-batch",
+            1,
+            spec=PoolCreateSpec(pool_type="gpu", image_id="image-gpu"),
+        )
+
+        self.assertEqual(cpu, prepared_cpu.source_pool)
+        self.assertEqual("oke", prepared_cpu.plan.owner)
+        self.assertEqual(gpu, prepared_gpu.source_pool)
+        self.assertEqual("oke", prepared_gpu.plan.owner)
+        self.assertEqual(
+            2,
+            service.oci_backend.return_value
+            .preview_managed_node_pool_create.call_count,
+        )
+
+    def test_managed_compute_cluster_rdma_pool_is_not_a_gpu_template(self):
+        rdma = WorkerPoolInfo(
+            name="oke-rdma",
+            kind="node-pool",
+            node_pool_id="managed-rdma-1",
+            gpu_resource="nvidia.com/gpu",
+            rdma_enabled=True,
+            placement_type="compute-cluster",
+        )
+        service = _service(DiscoverySnapshot(pools=[rdma]))
+
+        with self.assertRaisesRegex(WorkflowError, "No eligible gpu pool"):
+            prepare_pool_create(
+                service,
+                "gpu-new",
+                1,
+                spec=PoolCreateSpec(pool_type="gpu"),
+            )
 
     def test_prepare_pool_create_rejects_duplicates_and_ambiguous_templates(self):
         first = WorkerPoolInfo(
@@ -150,7 +221,7 @@ class LifecycleWorkflowTests(unittest.TestCase):
         )
         service = _service(DiscoverySnapshot(pools=[source]))
 
-        with self.assertRaisesRegex(WorkflowError, "Cluster Network-backed"):
+        with self.assertRaisesRegex(WorkflowError, "eligible rdma template"):
             prepare_pool_create(
                 service,
                 "new-rdma",
@@ -184,6 +255,7 @@ class LifecycleWorkflowTests(unittest.TestCase):
             "instance-pool-1",
             "oke-rdma-2",
             2,
+            PoolCreateSpec(pool_type="rdma"),
         )
         self.assertEqual("submitted", result["status"])
         self.assertEqual("cluster-network-new", result["cluster_network_id"])

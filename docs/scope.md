@@ -34,8 +34,17 @@ Management Tool.
 - fail-closed Slinky protection for node removal, replacement, and pool scale-down
 - guarded managed OKE node pool resize through a size-only `node_config_details` update
 - guarded self-managed cluster-network and instance-pool resize
-- guarded creation of self-managed Cluster Network pools by deriving a new
-  Instance Configuration from an existing RDMA pool and reusing its placement
+- guarded creation of managed CPU/GPU node pools through OKE `CreateNodePool`
+  from matching stack templates
+- guarded creation of self-managed RDMA Cluster Network pools by deriving a new
+  Instance Configuration from an existing RDMA pool
+- custom image, shape, availability domain, subnet, NSG, boot, Flex, Kubernetes,
+  metadata, tag, capacity, fault-domain, CNI, encryption, IMDS, and lifecycle
+  overrides with effective-request dry-run output
+- official OCI HPC OKE worker cloud-init composition for local NVMe RAID and
+  existing FSS and Lustre mounts
+- Slurm-style `clusters list`, `clusters create`, and
+  `clusters add node` worker-pool aliases
 - explicit `pools add` and `pools remove` capacity commands
 - validated dry-run plans for every mutation
 - Kubernetes Lease serialization for concurrent mutations

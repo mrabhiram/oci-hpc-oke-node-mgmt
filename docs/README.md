@@ -40,9 +40,12 @@ capacity naturally vary by deployment.
 - [Resizing Worker Pools](./resizing-worker-pools.md): Add or remove capacity
   from managed OKE, Compute Cluster-backed, Cluster Network, and standalone
   Instance Pools.
-- [Creating Cluster Network Worker Pools](./creating-cluster-network-pools.md):
-  Create a self-managed RDMA pool by deriving a new launch template from an
-  existing Cluster Network pool.
+- [Creating Worker Pools](./creating-worker-pools.md): Create managed CPU/GPU
+  pools or self-managed RDMA Cluster Network pools with inherited defaults and
+  explicit overrides.
+- [Worker Bootstrap and Storage](./worker-bootstrap-and-storage.md): Compose the
+  official OCI HPC OKE cloud-init, NVMe RAID, FSS mount, and Lustre mount
+  workflows.
 - [Removing and Replacing Worker Nodes](./removing-and-replacing-worker-nodes.md):
   Drain and terminate selected workers or replace them while preserving pool size.
 - [Managing RDMA Worker Pools](./managing-rdma-worker-pools.md): Operate both the
