@@ -89,6 +89,10 @@ addon            NvidiaGpuOperator v25.10.1        v25.10.1         v1.36.1     
 
 The values above came from a fresh London validation cluster and were
 sanitized. The minor target resolved from `v1.36` to production `v1.36.1`.
+This validation was read-only and dry-run only; no Kubernetes version was
+changed. See [Live Kubernetes Upgrade Validation](./live-kubernetes-upgrade-validation.md)
+for the executed commands, sanitized output, observed blockers, and exact
+validation boundary.
 
 ## Generate A Plan
 

@@ -59,6 +59,9 @@ capacity naturally vary by deployment.
 
 ## Live lifecycle validation
 
+- [Live Kubernetes Upgrade Validation](./live-kubernetes-upgrade-validation.md):
+  Review fresh status, plan, dry-run, ordering-guard, and checkpoint output,
+  together with the explicit boundary that no live version change was made.
 - [Live Worker Pool Creation Validation](./live-pool-creation-validation.md):
   Review sanitized output from managed GPU creation, self-managed RDMA
   creation planning, and a capacity-limited RDMA submission.

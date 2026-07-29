@@ -244,6 +244,16 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn('cycleModes=["BOOT_VOLUME_REPLACE"]', guide)
         self.assertNotIn("- boot volume replacement wrapper", scope)
 
+    def test_upgrade_validation_distinguishes_dry_run_from_live_upgrade(self):
+        guide = (
+            PROJECT_ROOT / "docs" / "live-kubernetes-upgrade-validation.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("No Kubernetes version was changed", guide)
+        self.assertIn("It did not call\n`UpdateCluster`", guide)
+        self.assertIn("Live control-plane version change | Not performed", guide)
+        self.assertIn("It is not evidence of a completed Kubernetes\nupgrade", guide)
+
 
 if __name__ == "__main__":
     unittest.main()

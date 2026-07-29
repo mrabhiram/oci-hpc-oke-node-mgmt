@@ -722,6 +722,9 @@ CI runs pytest on Python 3.9, 3.10, 3.11, and 3.12, followed by Ruff and mypy.
 - [`docs/kubernetes-upgrades.md`](docs/kubernetes-upgrades.md): Kubernetes
   target selection, planning, workload gates, strategies, orchestration, and
   recovery
+- [`docs/live-kubernetes-upgrade-validation.md`](docs/live-kubernetes-upgrade-validation.md):
+  fresh sanitized status, plan, dry-run, ordering-guard, and checkpoint output,
+  explicitly distinguished from an unperformed live version change
 - [`docs/live-pool-creation-validation.md`](docs/live-pool-creation-validation.md):
   sanitized output from live managed GPU and self-managed RDMA creation validation
 - [`docs/live-pool-deletion-validation.md`](docs/live-pool-deletion-validation.md):
