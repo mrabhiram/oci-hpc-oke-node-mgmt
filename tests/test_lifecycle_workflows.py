@@ -12,6 +12,7 @@ from oke_hpc_mgmt.models import (
     AddonInfo,
     ClusterNetworkCreateResult,
     ComputeClusterInfo,
+    CustomerReportedHostStatus,
     DiscoverySnapshot,
     DrainPod,
     ManagedNodePoolCreateResult,
@@ -29,6 +30,7 @@ from oke_hpc_mgmt.workflows.lifecycle import (
     LEGACY_BOOTSTRAP_INHERITANCE_NOTICE,
     WorkflowError,
     WorkflowNotFound,
+    apply_node_removal_host_tags,
     execute_node_boot_volume_replace,
     execute_node_removal,
     execute_pool_boot_volume_replace,
@@ -1916,6 +1918,75 @@ class LifecycleWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkflowError, "--force"):
             prepare_node_removal(service, identifiers=("cpu-1",), drain=True)
 
+    def test_apply_node_removal_host_tags_updates_only_selected_plans(self):
+        pool = WorkerPoolInfo(
+            name="oke-gpu",
+            kind="node-pool",
+            node_pool_id="node-pool-1",
+            desired_size=2,
+        )
+        nodes = [
+            NodeInfo(
+                k8s_name=f"gpu-{index}",
+                instance_ocid=f"instance-{index}",
+                pool_name=pool.name,
+            )
+            for index in (1, 2)
+        ]
+        prepared = prepare_node_removal(
+            _service(DiscoverySnapshot(pools=[pool], nodes=nodes)),
+            identifiers=("gpu-1", "gpu-2"),
+            drain=False,
+        )
+
+        prepared = apply_node_removal_host_tags(
+            prepared,
+            {"gpu-1": CustomerReportedHostStatus.UNHEALTHY},
+        )
+
+        first, second = prepared.plans
+        self.assertEqual(
+            "unhealthy",
+            first.details["customer_reported_host_status"],
+        )
+        self.assertEqual(
+            (
+                "tag OCI instance as customer-reported unhealthy",
+                "verify OCI instance unhealthy tag",
+                "delete the selected worker through OKE DeleteNode",
+            ),
+            first.steps,
+        )
+        self.assertEqual(
+            "not-requested",
+            second.details["customer_reported_host_status"],
+        )
+        self.assertNotIn("unhealthy", " ".join(second.steps))
+
+    def test_apply_node_removal_host_tags_rejects_unselected_node(self):
+        pool = WorkerPoolInfo(
+            name="oke-cpu",
+            kind="node-pool",
+            node_pool_id="node-pool-1",
+            desired_size=1,
+        )
+        node = NodeInfo(
+            k8s_name="cpu-1",
+            instance_ocid="instance-1",
+            pool_name=pool.name,
+        )
+        prepared = prepare_node_removal(
+            _service(DiscoverySnapshot(pools=[pool], nodes=[node])),
+            identifiers=(node.k8s_name,),
+            drain=False,
+        )
+
+        with self.assertRaisesRegex(WorkflowError, "unselected nodes: cpu-2"):
+            apply_node_removal_host_tags(
+                prepared,
+                {"cpu-2": CustomerReportedHostStatus.UNHEALTHY},
+            )
+
     def test_execute_node_removal_routes_managed_and_legacy_workers(self):
         managed = WorkerPoolInfo(
             name="managed",
@@ -1957,7 +2028,128 @@ class LifecycleWorkflowTests(unittest.TestCase):
         backend.detach_instance_pool_node.assert_called_once_with(
             "instance-pool-1", "instance-2", decrement_size=True
         )
+        backend.tag_instance_customer_reported_unhealthy.assert_not_called()
         self.assertEqual(2, len(results))
+
+    def test_execute_node_removal_tags_all_requested_hosts_before_termination(self):
+        managed = WorkerPoolInfo(
+            name="managed",
+            kind="node-pool",
+            node_pool_id="node-pool-1",
+            desired_size=1,
+        )
+        legacy = WorkerPoolInfo(
+            name="legacy",
+            kind="instance-pool",
+            instance_pool_id="instance-pool-1",
+            desired_size=1,
+        )
+        nodes = (
+            NodeInfo(
+                k8s_name="managed-1",
+                instance_ocid="instance-1",
+                pool_name="managed",
+            ),
+            NodeInfo(
+                k8s_name="legacy-1",
+                instance_ocid="instance-2",
+                pool_name="legacy",
+            ),
+        )
+        service = _service(
+            DiscoverySnapshot(pools=[managed, legacy], nodes=list(nodes))
+        )
+        prepared = prepare_node_removal(
+            service,
+            identifiers=tuple(node.k8s_name for node in nodes),
+            drain=False,
+        )
+        prepared = apply_node_removal_host_tags(
+            prepared,
+            {
+                node.k8s_name: CustomerReportedHostStatus.UNHEALTHY
+                for node in nodes
+            },
+        )
+        events: list[str] = []
+        backend = service.oci_backend.return_value
+        backend.tag_instance_customer_reported_unhealthy.side_effect = (
+            lambda instance_id: events.append(f"tag:{instance_id}") or "tagged"
+        )
+        backend.delete_node.side_effect = (
+            lambda *args, **kwargs: events.append("terminate:managed") or None
+        )
+        backend.detach_instance_pool_node.side_effect = (
+            lambda *args, **kwargs: events.append("terminate:legacy") or None
+        )
+
+        results = execute_node_removal(
+            service,
+            prepared,
+            drain=False,
+            lock=False,
+        )
+
+        self.assertEqual(
+            [
+                "tag:instance-1",
+                "tag:instance-2",
+                "terminate:managed",
+                "terminate:legacy",
+            ],
+            events,
+        )
+        self.assertEqual(
+            ["tagged", "tagged"],
+            [result["host_tag_status"] for result in results],
+        )
+
+    def test_execute_node_removal_tag_failure_prevents_all_terminations(self):
+        pool = WorkerPoolInfo(
+            name="oke-gpu",
+            kind="node-pool",
+            node_pool_id="node-pool-1",
+            desired_size=2,
+        )
+        nodes = [
+            NodeInfo(
+                k8s_name=f"gpu-{index}",
+                instance_ocid=f"instance-{index}",
+                pool_name=pool.name,
+            )
+            for index in (1, 2)
+        ]
+        service = _service(DiscoverySnapshot(pools=[pool], nodes=nodes))
+        prepared = prepare_node_removal(
+            service,
+            identifiers=("gpu-1", "gpu-2"),
+            drain=True,
+        )
+        prepared = apply_node_removal_host_tags(
+            prepared,
+            {
+                node.k8s_name: CustomerReportedHostStatus.UNHEALTHY
+                for node in nodes
+            },
+        )
+        backend = service.oci_backend.return_value
+        backend.tag_instance_customer_reported_unhealthy.side_effect = [
+            "tagged",
+            OciDiscoveryError("tag namespace is unavailable"),
+        ]
+
+        with self.assertRaisesRegex(OciDiscoveryError, "namespace is unavailable"):
+            execute_node_removal(
+                service,
+                prepared,
+                drain=True,
+                lock=False,
+            )
+
+        backend.delete_node.assert_not_called()
+        kubernetes = service.kubernetes_backend.return_value
+        self.assertEqual(2, kubernetes.cordon_node.call_count)
+        self.assertEqual(2, kubernetes.uncordon_node.call_count)
 
     def test_legacy_node_removal_wait_detects_resource_work_request_failure(self):
         pool = WorkerPoolInfo(

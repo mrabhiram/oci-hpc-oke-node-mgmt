@@ -199,7 +199,7 @@ or:
 
 ```bash
 mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> \
-  --keep-size --wait
+  --tag none --keep-size --wait
 ```
 
 For boot volume replacement:

@@ -946,12 +946,161 @@ class CliTests(unittest.TestCase):
         ):
             result = self.runner.invoke(
                 cli,
-                ["nodes", "remove", "cpu-1", "--dry-run", "--format", "json"],
+                [
+                    "nodes",
+                    "remove",
+                    "cpu-1",
+                    "--tag",
+                    "none",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
             )
 
         self.assertEqual(0, result.exit_code, result.output)
-        self.assertEqual("node-remove", json.loads(result.output)[0]["operation"])
+        plan = json.loads(result.output)[0]
+        self.assertEqual("node-remove", plan["operation"])
+        self.assertEqual(
+            "not-requested",
+            plan["details"]["customer_reported_host_status"],
+        )
         execute.assert_not_called()
+
+    def test_node_termination_tag_option_is_visible_and_validated(self):
+        help_result = self.runner.invoke(cli, ["nodes", "terminate", "--help"])
+        invalid_result = self.runner.invoke(
+            cli,
+            ["nodes", "terminate", "cpu-1", "--tag", "broken"],
+        )
+
+        self.assertEqual(0, help_result.exit_code, help_result.output)
+        normalized_help = " ".join(help_result.output.split())
+        self.assertIn("--tag [unhealthy|none]", normalized_help)
+        self.assertIn(
+            "Omission prompts for each node, including with --yes",
+            normalized_help,
+        )
+        self.assertNotEqual(0, invalid_result.exit_code)
+        self.assertIn("Invalid value for '--tag'", invalid_result.output)
+
+    def test_explicit_unhealthy_tag_is_in_node_removal_dry_run(self):
+        node = NodeInfo("gpu-1", pool_name="oke-gpu", instance_ocid="instance-1")
+        pool = WorkerPoolInfo("oke-gpu", "node-pool", desired_size=1)
+        prepared = PreparedNodeRemoval(
+            snapshot=DiscoverySnapshot(pools=[pool], nodes=[node]),
+            nodes=(node,),
+            pools={pool.name: pool},
+            plans=(
+                OperationPlan(
+                    "node-remove",
+                    node.k8s_name,
+                    pool=pool.name,
+                    steps=("delete the selected worker through OKE DeleteNode",),
+                ),
+            ),
+            drain_pods={},
+            target_sizes={pool.name: 0},
+            decrement_size=True,
+        )
+        with (
+            patch(
+                "oke_hpc_mgmt.commands.nodes.prepare_node_removal",
+                return_value=prepared,
+            ),
+            patch("oke_hpc_mgmt.commands.nodes.execute_node_removal") as execute,
+        ):
+            result = self.runner.invoke(
+                cli,
+                [
+                    "nodes",
+                    "terminate",
+                    node.k8s_name,
+                    "--tag",
+                    "unhealthy",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        plan = json.loads(result.output)[0]
+        self.assertEqual(
+            "unhealthy",
+            plan["details"]["customer_reported_host_status"],
+        )
+        self.assertIn("tag OCI instance", " ".join(plan["steps"]))
+        execute.assert_not_called()
+
+    def test_omitted_tag_prompts_even_with_yes(self):
+        node = NodeInfo("gpu-1", pool_name="oke-gpu", instance_ocid="instance-1")
+        pool = WorkerPoolInfo("oke-gpu", "node-pool", desired_size=1)
+        prepared = PreparedNodeRemoval(
+            snapshot=DiscoverySnapshot(pools=[pool], nodes=[node]),
+            nodes=(node,),
+            pools={pool.name: pool},
+            plans=(OperationPlan("node-remove", node.k8s_name, pool=pool.name),),
+            drain_pods={},
+            target_sizes={pool.name: 0},
+            decrement_size=True,
+        )
+        with patch(
+            "oke_hpc_mgmt.commands.nodes.prepare_node_removal",
+            return_value=prepared,
+        ):
+            result = self.runner.invoke(
+                cli,
+                [
+                    "nodes",
+                    "terminate",
+                    node.k8s_name,
+                    "--yes",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+                input="y\n",
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIn(
+            "Is gpu-1 unhealthy and should it be tagged before termination?",
+            result.output,
+        )
+        self.assertIn('"customer_reported_host_status": "unhealthy"', result.output)
+
+    def test_omitted_tag_can_be_declined(self):
+        node = NodeInfo("cpu-1", pool_name="oke-cpu", instance_ocid="instance-1")
+        pool = WorkerPoolInfo("oke-cpu", "node-pool", desired_size=1)
+        prepared = PreparedNodeRemoval(
+            snapshot=DiscoverySnapshot(pools=[pool], nodes=[node]),
+            nodes=(node,),
+            pools={pool.name: pool},
+            plans=(OperationPlan("node-remove", node.k8s_name, pool=pool.name),),
+            drain_pods={},
+            target_sizes={pool.name: 0},
+            decrement_size=True,
+        )
+        with patch(
+            "oke_hpc_mgmt.commands.nodes.prepare_node_removal",
+            return_value=prepared,
+        ):
+            result = self.runner.invoke(
+                cli,
+                [
+                    "nodes",
+                    "remove",
+                    node.k8s_name,
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+                input="n\n",
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIn('"customer_reported_host_status": "not-requested"', result.output)
 
     def test_individual_node_bvr_dry_run_never_executes(self):
         node = NodeInfo(

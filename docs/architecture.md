@@ -273,10 +273,33 @@ Before either managed or self-managed termination, the default workflow:
 4. acquires the cluster mutation Lease
 5. cordons all selected nodes
 6. evicts eligible pods through the `policy/v1` Eviction API
-7. invokes the ownership-specific OCI termination operation
+7. applies and verifies every requested customer-reported unhealthy-host tag
+8. invokes the ownership-specific OCI termination operation
 
 `--no-drain` bypasses steps 2, 5, and 6 and requires `--allow-workloads` when
 ordinary workload pods remain.
+
+### Customer-Reported Unhealthy Host Tagging
+
+Node termination accepts `--tag unhealthy` or `--tag none`. When the option is
+omitted, the CLI records an independent operator decision for every selected
+node through an interactive prompt. `--yes` is intentionally separate and
+only confirms the destructive OCI operation.
+
+For each requested unhealthy tag, the OCI backend:
+
+1. gets the Compute instance and its ETag
+2. deep-copies the existing `defined_tags` map
+3. merges
+   `ComputeInstanceHostActions.CustomerReportedHostStatus=unhealthy`
+4. calls `UpdateInstance` with `if_match=<etag>`
+5. gets the instance again and verifies the exact namespace, key, and value
+
+Execution tags and verifies all requested instances before submitting any OKE
+`DeleteNode` or Compute Management `DetachInstancePoolInstance` operation. A
+missing ETag, authorization error, tag-namespace error, concurrent update, or
+failed read-back stops termination. An instance that already has the exact tag
+is accepted without another update.
 
 ### Legacy Cluster Network Resize
 

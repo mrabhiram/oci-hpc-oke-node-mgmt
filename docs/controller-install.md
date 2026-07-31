@@ -92,7 +92,7 @@ Verify the package entrypoints:
 Example version output:
 
 ```text
-mgmt-oke, version 0.9.0
+mgmt-oke, version 0.10.0
 ```
 
 ## Upgrade An Existing Installation
@@ -244,7 +244,7 @@ mgmt-oke pools boot-volume-replace <managed-pool> <property-update> [--dry-run] 
 mgmt-oke nodes cordon <node...> [--dry-run]
 mgmt-oke nodes drain <node...> [--dry-run]
 mgmt-oke nodes uncordon <node...> [--dry-run]
-mgmt-oke nodes terminate <node...> [--keep-size] [--dry-run] [--wait]
+mgmt-oke nodes terminate <node...> [--tag <unhealthy|none>] [--keep-size] [--dry-run] [--wait]
 mgmt-oke nodes boot-volume-replace <node...> [--dry-run] [--wait]
 mgmt-oke clusters upgrade --to <version> [--dry-run]
 mgmt-oke pools upgrade <pool> --to <version> --strategy <strategy> [--dry-run]
@@ -288,6 +288,10 @@ Safety behavior:
 - Specific nodes in managed pools are removed with OKE `DeleteNode`. Specific
   nodes in legacy Cluster Network or standalone Instance Pools are detached
   with automatic termination.
+- Node termination can merge and verify
+  `ComputeInstanceHostActions.CustomerReportedHostStatus=unhealthy` before the
+  destructive OCI call. If `--tag` is omitted, the CLI asks for each node;
+  `--tag none` is the explicit noninteractive opt-out.
 - Slinky-managed pools refuse node removal, replacement, and pool scale-down
   until a Slurm-aware drain workflow is available. Scale-up remains supported.
 - When the NVIDIA Network Operator add-on is active, RDMA convergence also
@@ -364,12 +368,16 @@ A negative delta reduces capacity but does not select the departing worker. Use
 Example specific node replacement while keeping pool size:
 
 ```bash
-mgmt-oke nodes terminate <node-name-or-ip> --keep-size --dry-run
-mgmt-oke nodes terminate <node-name-or-ip> --keep-size --wait
+mgmt-oke nodes terminate <node-name-or-ip> \
+  --tag unhealthy --keep-size --dry-run
+mgmt-oke nodes terminate <node-name-or-ip> \
+  --tag unhealthy --keep-size --wait
 ```
 
 Use `--yes` only for non-interactive operations where the target pool or node
-has already been selected intentionally.
+has already been selected intentionally. Node termination automation must also
+specify `--tag unhealthy` or `--tag none`; `--yes` does not answer that
+separate health question.
 
 ## Shell Completion
 

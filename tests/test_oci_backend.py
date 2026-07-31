@@ -1,4 +1,5 @@
 import unittest
+from copy import deepcopy
 from types import SimpleNamespace
 
 from oke_hpc_mgmt.backends.oci import (
@@ -255,10 +256,12 @@ class _Compute:
         shapes=None,
         boot_volume_ids=None,
         image_operating_systems=None,
+        defined_tags=None,
     ):
         self.shapes = shapes or {}
         self.boot_volume_ids = boot_volume_ids or {}
         self.image_operating_systems = image_operating_systems or {}
+        self.defined_tags = defined_tags or {}
         self.calls = []
         self.gpu_memory_clusters = []
         self.gpu_memory_cluster = None
@@ -272,12 +275,15 @@ class _Compute:
                 shape=self.shapes.get(instance_id),
                 availability_domain="AD-1",
                 compartment_id="compartment-1",
+                defined_tags=deepcopy(self.defined_tags.get(instance_id, {})),
             ),
             headers={"etag": "instance-etag"},
         )
 
     def update_instance(self, instance_id, details, **kwargs):
         self.calls.append(("update_instance", instance_id, details, kwargs))
+        if hasattr(details, "defined_tags"):
+            self.defined_tags[instance_id] = deepcopy(details.defined_tags)
         return SimpleNamespace(data=SimpleNamespace(id=instance_id), headers={})
 
     def terminate_instance(self, instance_id, **kwargs):
@@ -2198,6 +2204,87 @@ class OciBackendMutationTests(unittest.TestCase):
         self.assertEqual("instance-1", details.instance_id)
         self.assertFalse(details.is_decrement_size)
         self.assertTrue(details.is_auto_terminate)
+
+    def test_unhealthy_tag_merges_defined_tags_uses_etag_and_verifies(self):
+        backend = _backend()
+        backend._compute.defined_tags["instance-1"] = {
+            "Operations": {"CostCenter": "42"},
+            "ComputeInstanceHostActions": {"ExistingKey": "preserved"},
+        }
+
+        status = backend.tag_instance_customer_reported_unhealthy("instance-1")
+
+        self.assertEqual("tagged", status)
+        update_call = next(
+            call for call in backend._compute.calls if call[0] == "update_instance"
+        )
+        self.assertEqual("instance-1", update_call[1])
+        self.assertEqual({"if_match": "instance-etag"}, update_call[3])
+        self.assertEqual(
+            {
+                "Operations": {"CostCenter": "42"},
+                "ComputeInstanceHostActions": {
+                    "ExistingKey": "preserved",
+                    "CustomerReportedHostStatus": "unhealthy",
+                },
+            },
+            update_call[2].defined_tags,
+        )
+        get_calls = [
+            call for call in backend._compute.calls if call[0] == "get_instance"
+        ]
+        self.assertEqual(2, len(get_calls))
+
+    def test_unhealthy_tag_is_idempotent(self):
+        backend = _backend()
+        backend._compute.defined_tags["instance-1"] = {
+            "ComputeInstanceHostActions": {
+                "CustomerReportedHostStatus": "unhealthy"
+            }
+        }
+
+        status = backend.tag_instance_customer_reported_unhealthy("instance-1")
+
+        self.assertEqual("already-tagged", status)
+        self.assertFalse(
+            any(call[0] == "update_instance" for call in backend._compute.calls)
+        )
+
+    def test_unhealthy_tag_verification_failure_blocks_success(self):
+        backend = _backend()
+        original_update = backend._compute.update_instance
+
+        def update_without_persisting(instance_id, details, **kwargs):
+            current = deepcopy(backend._compute.defined_tags)
+            response = original_update(instance_id, details, **kwargs)
+            backend._compute.defined_tags = current
+            return response
+
+        backend._compute.update_instance = update_without_persisting
+
+        with self.assertRaisesRegex(
+            OciDiscoveryError,
+            "node termination was not submitted",
+        ):
+            backend.tag_instance_customer_reported_unhealthy("instance-1")
+
+    def test_unhealthy_tag_requires_instance_etag(self):
+        backend = _backend()
+        original_get = backend._compute.get_instance
+
+        def get_without_etag(instance_id):
+            response = original_get(instance_id)
+            response.headers = {}
+            return response
+
+        backend._compute.get_instance = get_without_etag
+
+        with self.assertRaisesRegex(OciDiscoveryError, "returned no ETag"):
+            backend.tag_instance_customer_reported_unhealthy("instance-1")
+
+        self.assertFalse(
+            any(call[0] == "update_instance" for call in backend._compute.calls)
+        )
 
     def test_call_wraps_sdk_exception_with_operation(self):
         def fail():

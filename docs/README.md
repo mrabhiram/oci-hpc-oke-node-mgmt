@@ -68,6 +68,9 @@ capacity naturally vary by deployment.
 - [Live Worker Pool Deletion Validation](./live-pool-deletion-validation.md):
   Review sanitized output from managed GPU deletion, RDMA deletion planning,
   ownership-aware cleanup, and system-pool protection.
+- [Live Unhealthy Host Termination Validation](./live-unhealthy-host-termination-validation.md):
+  Review sanitized managed A10 and A100 RDMA tag-and-terminate dry-run output,
+  including the explicit boundary that no host tag or termination was applied.
 
 ## Safety and troubleshooting
 

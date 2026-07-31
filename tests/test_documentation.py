@@ -8,6 +8,7 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
+from oke_hpc_mgmt import __version__
 from oke_hpc_mgmt.commands import cli
 
 
@@ -81,6 +82,14 @@ def _mgmt_argv(command: str) -> list[str] | None:
 
 
 class DocumentationTests(unittest.TestCase):
+    def test_install_guides_show_packaged_version(self):
+        expected = f"mgmt-oke, version {__version__}"
+        for filename in ("controller-install.md", "operator-quickstart.md"):
+            document = (PROJECT_ROOT / "docs" / filename).read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(expected, document)
+
     def test_docs_index_links_every_guide(self):
         index = (PROJECT_ROOT / "docs" / "README.md").read_text(encoding="utf-8")
         missing = [
@@ -268,6 +277,57 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn("It did not call\n`UpdateCluster`", guide)
         self.assertIn("Live control-plane version change | Not performed", guide)
         self.assertIn("It is not evidence of a completed Kubernetes\nupgrade", guide)
+
+    def test_unhealthy_host_docs_define_tag_and_live_validation_boundary(self):
+        removal_guide = (
+            PROJECT_ROOT / "docs" / "removing-and-replacing-worker-nodes.md"
+        ).read_text(encoding="utf-8")
+        architecture = (PROJECT_ROOT / "docs" / "architecture.md").read_text(
+            encoding="utf-8"
+        )
+        live_guide = (
+            PROJECT_ROOT
+            / "docs"
+            / "live-unhealthy-host-termination-validation.md"
+        ).read_text(encoding="utf-8")
+
+        expected_tag = (
+            "ComputeInstanceHostActions.CustomerReportedHostStatus=unhealthy"
+        )
+        self.assertIn(expected_tag, removal_guide)
+        self.assertIn(expected_tag, architecture)
+        self.assertIn("`--tag none`", removal_guide)
+        self.assertIn("`--yes`", removal_guide)
+        self.assertIn("No Compute instance was tagged or terminated", live_guide)
+        self.assertIn("Actual `UpdateInstance` tag mutation | Not performed", live_guide)
+        self.assertIn(
+            "It is not evidence of a completed unhealthy\ntag update",
+            live_guide,
+        )
+
+    def test_noninteractive_termination_examples_include_tag_decision(self):
+        failures: list[str] = []
+        for markdown_file in MARKDOWN_FILES:
+            document = markdown_file.read_text(encoding="utf-8")
+            for block_line, block in _bash_blocks(document):
+                for offset, command in enumerate(_logical_shell_lines(block)):
+                    if (
+                        "mgmt-oke" in command
+                        and "nodes terminate" in command
+                        and "--yes" in command
+                        and "--tag" not in command
+                    ):
+                        failures.append(
+                            f"{markdown_file.relative_to(PROJECT_ROOT)}:"
+                            f"{block_line + offset}: {command}"
+                        )
+
+        self.assertEqual(
+            [],
+            failures,
+            "Noninteractive termination examples without a host tag decision:\n"
+            + "\n".join(failures),
+        )
 
 
 if __name__ == "__main__":
