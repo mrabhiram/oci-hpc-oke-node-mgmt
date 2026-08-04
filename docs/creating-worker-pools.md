@@ -1,17 +1,18 @@
 # Creating Worker Pools
 
-`mgmt-oke pools create` creates one of three worker-pool types from a proven
-pool already registered with the selected OKE cluster:
+`mgmt-oke pools create` creates workers from a proven pool already registered
+with the selected OKE cluster:
 
-| `--type` | New resource | Required source |
+| Type and mode | New resource | Preferred source |
 | --- | --- | --- |
-| `cpu` | Managed OKE node pool | Managed non-GPU, non-RDMA node pool |
-| `gpu` | Managed OKE node pool | Managed GPU node pool without RDMA placement |
-| `rdma` | Self-managed OCI Cluster Network with one embedded Instance Pool | Existing Cluster Network-backed RDMA pool |
+| `--type cpu` | Managed OKE node pool | Managed non-GPU pool |
+| `--type gpu` | Managed OKE node pool | Managed non-RDMA GPU pool |
+| `--type rdma --rdma-mode compute-cluster` | Managed OKE node pool in a Compute Cluster | Existing managed Compute Cluster RDMA pool, then managed GPU pool |
+| `--type rdma` | Legacy self-managed Cluster Network with one embedded Instance Pool | Existing Cluster Network RDMA pool |
 
-The command does not create or delete the OKE control plane. It also does not
-create a managed Compute Cluster-backed RDMA pool; `--type rdma` deliberately
-uses the self-managed Cluster Network model.
+The command does not create or delete the OKE control plane. Legacy Cluster
+Network mode remains the default for `--type rdma` so existing scripts do not
+change behavior.
 
 ## Source Templates
 
@@ -25,6 +26,11 @@ Select the source explicitly with `--from-pool`. When omitted, the command uses
 the matching conventional pool name (`oke-cpu`, `oke-gpu`, or `oke-rdma`) when
 present. If there is no conventional pool, exactly one eligible source must
 exist. Ambiguous or incompatible sources are rejected.
+
+For managed Compute Cluster RDMA, an existing managed RDMA source is preferred.
+When creating the first such pool, a regular managed GPU source such as
+`oke-gpu` is eligible; specify an RDMA-capable shape and, when needed, a
+compatible image override.
 
 ## Managed CPU Pool
 
@@ -86,7 +92,84 @@ The source pool's OKE bootstrap, CNI, pod networking, GPU labels, cycling
 settings, and eviction settings are retained unless their dedicated options
 override them.
 
-## Self-Managed RDMA Pool
+## Managed Compute Cluster RDMA Pool
+
+Preview a managed RDMA pool with a dedicated Compute Cluster:
+
+```bash
+mgmt-oke pools create rdma-managed \
+  --type rdma \
+  --rdma-mode compute-cluster \
+  --count 1 \
+  --from-pool oke-gpu \
+  --availability-domain <availability-domain> \
+  --shape BM.GPU4.8 \
+  --compute-cluster-name rdma-managed-cc \
+  --dry-run \
+  --format json
+```
+
+Apply the reviewed request by replacing `--dry-run --format json` with
+`--wait`. When `--compute-cluster-id` is omitted, `mgmt-oke` creates an empty
+dedicated Compute Cluster, waits for `ACTIVE`, and then submits OKE
+`CreateNodePool` with its OCID. Use
+`--compute-cluster-compartment-id <ocid>` to create that placement resource in
+another accessible compartment.
+
+Use an existing Compute Cluster instead:
+
+```bash
+mgmt-oke pools create rdma-managed \
+  --type rdma \
+  --rdma-mode compute-cluster \
+  --count 1 \
+  --from-pool <managed-gpu-or-rdma-source> \
+  --availability-domain <availability-domain> \
+  --shape <rdma-capable-bare-metal-gpu-shape> \
+  --compute-cluster-id <compute-cluster-ocid> \
+  --wait
+```
+
+An existing Compute Host Group can constrain the managed placement:
+
+```bash
+mgmt-oke pools create rdma-managed \
+  --type rdma \
+  --rdma-mode compute-cluster \
+  --count 1 \
+  --from-pool <managed-gpu-or-rdma-source> \
+  --availability-domain <availability-domain> \
+  --shape <rdma-capable-bare-metal-gpu-shape> \
+  --compute-cluster-id <compute-cluster-ocid> \
+  --host-group-id <compute-host-group-ocid> \
+  --wait
+```
+
+The placement preflight requires:
+
+- an enhanced OKE cluster
+- exactly one placement row and availability domain
+- no fault domains or capacity reservation for Compute Cluster placement
+- an `ACTIVE` Compute Cluster in the selected availability domain
+- an `ACTIVE` Host Group, when supplied, in the same availability domain
+- a Host Group `VALID` target matching the worker shape or an OCI platform name
+- a shape/image combination that advertises RDMA ports in the selected AD
+- OKE node-pool resource-principal permissions
+  `COMPUTE_CLUSTER_LAUNCH_INSTANCE` and, when applicable,
+  `HOST_GROUP_LAUNCH_INSTANCE`
+
+The tool creates Compute Clusters but not Compute Host Groups or hosts. If the
+node-pool request fails or has an uncertain outcome after dedicated Compute
+Cluster creation, the error reports and retains both resources for inspection.
+Deleting the managed node pool does not delete its Compute Cluster or Host
+Group; remove a tool-created dedicated Compute Cluster separately after all
+instances and node pools that use it are gone.
+
+Oracle documents the OKE prerequisites and placement contract in
+[Using Compute Clusters with Managed Nodes](https://docs.oracle.com/en-us/iaas/Content/ContEng/Tasks/contengusingcomputeclusters.htm)
+and [Using Compute Host Groups with Managed Nodes](https://docs.oracle.com/en-us/iaas/Content/ContEng/Tasks/contengusinghostgroups.htm).
+
+## Legacy Self-Managed RDMA Pool
 
 To change only the name, AD, shape, and size while inheriting every other
 setting from the existing RDMA pool:
@@ -146,6 +229,7 @@ Use `mgmt-oke pools create --help` for the installed version's authoritative
 option list. Supported overrides include:
 
 - availability domain, shape, image, worker subnet, pod subnet, and NSGs
+- RDMA backend, existing or dedicated Compute Cluster, and existing Host Group
 - boot-volume size, performance, and Vault key
 - Flex OCPUs and memory
 - Kubernetes version, maximum pods, node labels, metadata, and freeform tags
@@ -166,7 +250,10 @@ Dry-run performs live, read-only validation before producing a plan:
 - complete OCI pool discovery and unique pool name
 - source type and lifecycle
 - image and shape availability in the selected availability domain
+- canonical or display-form availability-domain resolution
 - CPU versus GPU versus RDMA shape compatibility
+- Compute Cluster state, single-AD placement, no fault domains, and RDMA ports
+- Compute Host Group state, AD, and shape or platform compatibility
 - local-disk availability when NVMe RAID is requested
 - worker, pod, and NSG resources in the source VCN
 - availability-domain-scoped subnet compatibility
@@ -231,10 +318,11 @@ resource identifiers are replaced with stable examples:
 Pool creation is a direct OCI mutation. It does not update Terraform or OCI
 Resource Manager state.
 
-For managed CPU and GPU pools, declare or import the new OKE node pool before a
-later stack apply. For RDMA pools, declare or import the derived Instance
-Configuration, Cluster Network, and embedded Instance Pool. Keep the live and
-declared configurations aligned before the next apply.
+For managed CPU, GPU, and Compute Cluster RDMA pools, declare or import the new
+OKE node pool before a later stack apply. Also declare or import a dedicated
+Compute Cluster created by the tool. For legacy RDMA pools, declare or import
+the derived Instance Configuration, Cluster Network, and embedded Instance
+Pool. Keep the live and declared configurations aligned before the next apply.
 
 ## Verify
 
@@ -253,9 +341,8 @@ mgmt-oke addons validate --target rdma --pool <new-pool>
 ```
 
 See [Live Worker Pool Creation Validation](./live-pool-creation-validation.md)
-for sanitized output from a successful managed GPU creation, an inherited RDMA
-plan, and an RDMA submission that reached OCI but was rejected for unavailable
-Cluster Network capacity.
+for sanitized output from managed GPU, managed Compute Cluster RDMA, and legacy
+Cluster Network validation.
 
 ## Delete a Complete Pool
 

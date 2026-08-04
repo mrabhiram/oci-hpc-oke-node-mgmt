@@ -441,6 +441,16 @@ class CliTests(unittest.TestCase):
         self.assertIn("create", result.output)
         self.assertIn("Manage the lifecycle", result.output)
 
+        create_result = self.runner.invoke(cli, ["pools", "create", "--help"])
+        self.assertEqual(0, create_result.exit_code, create_result.output)
+        for option in (
+            "--rdma-mode",
+            "--compute-cluster-id",
+            "--compute-cluster-name",
+            "--host-group-id",
+        ):
+            self.assertIn(option, create_result.output)
+
     def test_kube_context_environment_variable_is_not_used(self):
         service = Mock()
         service.discover.return_value = DiscoverySnapshot()
@@ -687,6 +697,57 @@ class CliTests(unittest.TestCase):
         self.assertEqual("VM.GPU.A10.2", spec.shape)
         self.assertEqual("image-custom", spec.image_id)
         self.assertEqual("/mnt/oci-fss", spec.fss_mounts[0].mount_path)
+
+    def test_pool_create_builds_compute_cluster_and_host_group_spec(self):
+        source = WorkerPoolInfo(
+            name="oke-rdma",
+            kind="node-pool",
+            node_pool_id="node-pool-rdma",
+            compute_cluster_id="compute-cluster-source",
+            rdma_enabled=True,
+        )
+        prepared = PreparedPoolCreate(
+            snapshot=DiscoverySnapshot(pools=[source]),
+            source_pool=source,
+            name="rdma-batch",
+            count=2,
+            spec=PoolCreateSpec(pool_type="rdma"),
+            plan=OperationPlan(operation="pool-create", target="rdma-batch"),
+        )
+        with patch(
+            "oke_hpc_mgmt.commands.pools.prepare_pool_create",
+            return_value=prepared,
+        ) as prepare:
+            result = self.runner.invoke(
+                cli,
+                [
+                    "pools",
+                    "create",
+                    "rdma-batch",
+                    "--type",
+                    "rdma",
+                    "--rdma-mode",
+                    "compute-cluster",
+                    "--count",
+                    "2",
+                    "--from-pool",
+                    "oke-rdma",
+                    "--compute-cluster-id",
+                    "compute-cluster-target",
+                    "--host-group-id",
+                    "host-group-1",
+                    "--availability-domain",
+                    "AD-1",
+                    "--dry-run",
+                ],
+            )
+
+        self.assertEqual(0, result.exit_code, result.output)
+        spec = prepare.call_args.kwargs["spec"]
+        self.assertEqual("compute-cluster", spec.rdma_mode)
+        self.assertEqual("compute-cluster-target", spec.compute_cluster_id)
+        self.assertEqual("host-group-1", spec.host_group_id)
+        self.assertFalse(spec.creates_compute_cluster)
 
     def test_pool_create_rejects_storage_without_composition_mode(self):
         result = self.runner.invoke(

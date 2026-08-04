@@ -9,9 +9,12 @@ from oke_hpc_mgmt.backends.oci import (
     OciDiscoveryError,
 )
 from oke_hpc_mgmt.models import (
+    AddonInfo,
     ClusterNetworkCreateResult,
+    ComputeClusterInfo,
     DiscoverySnapshot,
     DrainPod,
+    ManagedNodePoolCreateResult,
     NodeInfo,
     PoolBootVolumeReplaceSpec,
     PoolCreateSpec,
@@ -43,6 +46,7 @@ from oke_hpc_mgmt.workflows.lifecycle import (
     wait_for_pool_creation,
     wait_for_pool_deleted,
     wait_for_node_boot_volume_replace,
+    wait_for_compute_cluster_active,
     wait_for_pool_boot_volume_replace,
     wait_for_pool_size,
 )
@@ -914,6 +918,332 @@ class LifecycleWorkflowTests(unittest.TestCase):
             service.oci_backend.return_value
             .preview_managed_node_pool_create.call_count,
         )
+
+    def test_prepare_pool_create_routes_managed_compute_cluster_rdma(self):
+        rdma = WorkerPoolInfo(
+            name="oke-rdma",
+            kind="node-pool",
+            node_pool_id="node-pool-rdma",
+            compute_cluster_id="compute-cluster-source",
+            placement_type="compute-cluster",
+            shape="BM.GPU4.8",
+            gpu_resource="nvidia.com/gpu",
+            rdma_enabled=True,
+        )
+        service = _service(DiscoverySnapshot(pools=[rdma]))
+        service.oci_backend.return_value.preview_managed_node_pool_create.return_value = {
+            "backend": "oke-node-pool",
+            "placement": "compute-cluster",
+            "availability_domains": ["AD-1"],
+        }
+        spec = PoolCreateSpec(
+            pool_type="rdma",
+            rdma_mode="compute-cluster",
+            compute_cluster_id="compute-cluster-target",
+            host_group_id="host-group-1",
+        )
+
+        prepared = prepare_pool_create(
+            service,
+            "rdma-batch",
+            2,
+            spec=spec,
+        )
+
+        self.assertEqual(rdma, prepared.source_pool)
+        self.assertEqual("oke", prepared.plan.owner)
+        warnings = " ".join(prepared.plan.warnings)
+        self.assertIn("COMPUTE_CLUSTER_LAUNCH_INSTANCE", warnings)
+        self.assertIn("HOST_GROUP_LAUNCH_INSTANCE", warnings)
+        service.oci_backend.return_value.preview_managed_node_pool_create.assert_called_once_with(
+            "node-pool-rdma",
+            "cluster-1",
+            "compartment-1",
+            "rdma-batch",
+            2,
+            spec,
+        )
+
+    def test_first_managed_rdma_pool_uses_regular_gpu_template(self):
+        legacy_rdma = WorkerPoolInfo(
+            name="oke-rdma",
+            kind="cluster-network",
+            cluster_network_id="cluster-network-1",
+            instance_pool_id="instance-pool-1",
+            shape="BM.GPU4.8",
+            gpu_resource="nvidia.com/gpu",
+            rdma_enabled=True,
+        )
+        gpu = WorkerPoolInfo(
+            name="oke-gpu",
+            kind="node-pool",
+            node_pool_id="node-pool-gpu",
+            shape="VM.GPU.A10.1",
+            gpu_resource="nvidia.com/gpu",
+        )
+        service = _service(
+            DiscoverySnapshot(pools=[legacy_rdma, gpu])
+        )
+        service.oci_backend.return_value.preview_managed_node_pool_create.return_value = {
+            "backend": "oke-node-pool",
+            "placement": "compute-cluster",
+            "availability_domains": ["AD-1"],
+        }
+        spec = PoolCreateSpec(
+            pool_type="rdma",
+            rdma_mode="compute-cluster",
+            shape="BM.GPU4.8",
+        )
+
+        prepared = prepare_pool_create(
+            service,
+            "rdma-managed",
+            1,
+            spec=spec,
+        )
+
+        self.assertEqual(gpu, prepared.source_pool)
+        service.oci_backend.return_value.preview_managed_node_pool_create.assert_called_once_with(
+            "node-pool-gpu",
+            "cluster-1",
+            "compartment-1",
+            "rdma-managed",
+            1,
+            spec,
+        )
+
+    def test_managed_rdma_prefers_existing_compute_cluster_template(self):
+        gpu = WorkerPoolInfo(
+            name="oke-gpu",
+            kind="node-pool",
+            node_pool_id="node-pool-gpu",
+            gpu_resource="nvidia.com/gpu",
+        )
+        managed_rdma = WorkerPoolInfo(
+            name="rdma-existing",
+            kind="node-pool",
+            node_pool_id="node-pool-rdma",
+            compute_cluster_id="compute-cluster-existing",
+            gpu_resource="nvidia.com/gpu",
+            rdma_enabled=True,
+        )
+        service = _service(
+            DiscoverySnapshot(pools=[gpu, managed_rdma])
+        )
+
+        prepared = prepare_pool_create(
+            service,
+            "rdma-managed-2",
+            1,
+            spec=PoolCreateSpec(
+                pool_type="rdma",
+                rdma_mode="compute-cluster",
+                compute_cluster_id="compute-cluster-target",
+            ),
+        )
+
+        self.assertEqual(managed_rdma, prepared.source_pool)
+
+    def test_execute_managed_rdma_create_builds_compute_cluster_first(self):
+        rdma = WorkerPoolInfo(
+            name="oke-rdma",
+            kind="node-pool",
+            node_pool_id="node-pool-rdma",
+            compute_cluster_id="compute-cluster-source",
+            placement_type="compute-cluster",
+            shape="BM.GPU4.8",
+            gpu_resource="nvidia.com/gpu",
+            rdma_enabled=True,
+        )
+        service = _service(DiscoverySnapshot(pools=[rdma]))
+        backend = service.oci_backend.return_value
+        backend.preview_managed_node_pool_create.return_value = {
+            "backend": "oke-node-pool",
+            "placement": "compute-cluster",
+            "availability_domains": ["AD-1"],
+        }
+        compute_cluster = ComputeClusterInfo(
+            compute_cluster_id="compute-cluster-new",
+            display_name="rdma-batch-cc",
+            availability_domain="AD-1",
+            compartment_id="compartment-1",
+            lifecycle_state="ACTIVE",
+        )
+        backend.create_compute_cluster.return_value = compute_cluster
+        backend.get_compute_cluster_info.return_value = compute_cluster
+        backend.create_managed_node_pool.return_value = (
+            ManagedNodePoolCreateResult(
+                node_pool_id="node-pool-new",
+                work_request_id="work-request-new",
+                compute_cluster_id="compute-cluster-new",
+            )
+        )
+        prepared = prepare_pool_create(
+            service,
+            "rdma-batch",
+            2,
+            spec=PoolCreateSpec(
+                pool_type="rdma",
+                rdma_mode="compute-cluster",
+            ),
+        )
+
+        result = execute_pool_create(service, prepared, lock=False)
+
+        backend.create_compute_cluster.assert_called_once_with(
+            compartment_id="compartment-1",
+            availability_domain="AD-1",
+            display_name="rdma-batch-cc",
+            pool_name="rdma-batch",
+            freeform_tags={},
+        )
+        runtime_spec = backend.create_managed_node_pool.call_args.args[-1]
+        self.assertEqual("compute-cluster-new", runtime_spec.compute_cluster_id)
+        self.assertFalse(runtime_spec.creates_compute_cluster)
+        self.assertEqual("compute-cluster", result["placement"])
+        self.assertTrue(result["compute_cluster_created"])
+
+    def test_managed_rdma_submission_failure_retains_created_compute_cluster(self):
+        gpu = WorkerPoolInfo(
+            name="oke-gpu",
+            kind="node-pool",
+            node_pool_id="node-pool-gpu",
+            gpu_resource="nvidia.com/gpu",
+        )
+        service = _service(DiscoverySnapshot(pools=[gpu]))
+        backend = service.oci_backend.return_value
+        backend.preview_managed_node_pool_create.return_value = {
+            "backend": "oke-node-pool",
+            "placement": "compute-cluster",
+            "availability_domains": ["AD-1"],
+        }
+        compute_cluster = ComputeClusterInfo(
+            compute_cluster_id="compute-cluster-new",
+            display_name="rdma-batch-cc",
+            availability_domain="AD-1",
+            compartment_id="compartment-1",
+            lifecycle_state="ACTIVE",
+        )
+        backend.create_compute_cluster.return_value = compute_cluster
+        backend.get_compute_cluster_info.return_value = compute_cluster
+        backend.create_managed_node_pool.side_effect = OciDiscoveryError(
+            "request timed out"
+        )
+        prepared = prepare_pool_create(
+            service,
+            "rdma-batch",
+            1,
+            spec=PoolCreateSpec(
+                pool_type="rdma",
+                rdma_mode="compute-cluster",
+                shape="BM.GPU4.8",
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            WorkflowError,
+            "compute-cluster-new is retained",
+        ):
+            execute_pool_create(service, prepared, lock=False)
+
+    def test_managed_rdma_wait_requires_vfs_when_network_operator_is_active(self):
+        gpu = WorkerPoolInfo(
+            name="oke-gpu",
+            kind="node-pool",
+            node_pool_id="node-pool-gpu",
+            gpu_resource="nvidia.com/gpu",
+        )
+        snapshot = DiscoverySnapshot(
+            pools=[gpu],
+            addons=[
+                AddonInfo(
+                    name="NvidiaNetworkOperator",
+                    lifecycle_state="ACTIVE",
+                )
+            ],
+        )
+        service = _service(snapshot)
+        backend = service.oci_backend.return_value
+        backend.preview_managed_node_pool_create.return_value = {
+            "backend": "oke-node-pool",
+            "placement": "compute-cluster",
+            "availability_domains": ["AD-1"],
+        }
+        compute_cluster = ComputeClusterInfo(
+            compute_cluster_id="compute-cluster-new",
+            display_name="rdma-batch-cc",
+            availability_domain="AD-1",
+            compartment_id="compartment-1",
+            lifecycle_state="ACTIVE",
+        )
+        backend.create_compute_cluster.return_value = compute_cluster
+        backend.get_compute_cluster_info.return_value = compute_cluster
+        created = ManagedNodePoolCreateResult(
+            node_pool_id="node-pool-new",
+            work_request_id="work-request-new",
+            compute_cluster_id="compute-cluster-new",
+        )
+        backend.create_managed_node_pool.return_value = created
+        prepared = prepare_pool_create(
+            service,
+            "rdma-batch",
+            1,
+            spec=PoolCreateSpec(
+                pool_type="rdma",
+                rdma_mode="compute-cluster",
+                shape="BM.GPU4.8",
+            ),
+        )
+
+        with patch(
+            "oke_hpc_mgmt.workflows.lifecycle.wait_for_pool_creation",
+            return_value=WorkerPoolInfo(
+                name="rdma-batch",
+                kind="node-pool",
+                desired_size=1,
+                ready_k8s_nodes=1,
+            ),
+        ) as waiter:
+            execute_pool_create(
+                service,
+                prepared,
+                wait=True,
+                lock=False,
+            )
+
+        self.assertTrue(waiter.call_args.kwargs["require_rdma_vf"])
+
+    def test_wait_for_compute_cluster_requires_active_state(self):
+        backend = Mock()
+        backend.get_compute_cluster_info.side_effect = [
+            ComputeClusterInfo(
+                compute_cluster_id="compute-cluster-1",
+                display_name="rdma-cc",
+                availability_domain="AD-1",
+                compartment_id="compartment-1",
+                lifecycle_state="PROVISIONING",
+            ),
+            ComputeClusterInfo(
+                compute_cluster_id="compute-cluster-1",
+                display_name="rdma-cc",
+                availability_domain="AD-1",
+                compartment_id="compartment-1",
+                lifecycle_state="ACTIVE",
+            ),
+        ]
+        progress = Mock()
+
+        with patch("oke_hpc_mgmt.workflows.lifecycle.time.sleep") as sleep:
+            wait_for_compute_cluster_active(
+                backend,
+                "compute-cluster-1",
+                timeout_seconds=10,
+                poll_interval_seconds=1,
+                progress=progress,
+            )
+
+        sleep.assert_called_once_with(1)
+        self.assertEqual(2, progress.call_count)
 
     def test_managed_compute_cluster_rdma_pool_is_not_a_gpu_template(self):
         rdma = WorkerPoolInfo(

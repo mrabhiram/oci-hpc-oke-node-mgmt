@@ -19,9 +19,11 @@ management for OCI HPC OKE clusters:
 - show Cluster Autoscaler pool ownership `[Implemented]`
 - show Kueue resource counts and ResourceFlavor-to-pool matches `[Implemented]`
 - discover Slinky Slurm node aliases and protect Slinky workers from unsafe removal `[Implemented]`
-- create managed CPU and GPU node pools or self-managed RDMA Cluster Network
-  pools from proven stack pool templates, with custom image, shape, placement,
-  network, boot, Kubernetes, label, tag, and lifecycle settings `[Implemented]`
+- create managed CPU/GPU node pools, managed RDMA node pools in existing or
+  dedicated Compute Clusters, and legacy self-managed RDMA Cluster Network
+  pools from proven stack templates `[Implemented]`
+- place managed workers in an existing Compute Host Group after validating its
+  lifecycle state, availability domain, and shape or platform target `[Implemented]`
 - compose the official OCI HPC OKE worker bootstrap for existing FSS and Lustre
   mounts and local NVMe RAID `[Implemented]`
 - discover control-plane, virtual-pool, declared worker, and actual kubelet
@@ -139,7 +141,7 @@ Command groups:
 | --- | --- |
 | `pools list` | List discovered worker pools. |
 | `pools get <pool>` | Get one worker pool by name or OCID. |
-| `pools create <name> --type <cpu\|gpu\|rdma> --count <n>` | Create a managed CPU/GPU pool or self-managed RDMA Cluster Network pool from an existing stack pool template. |
+| `pools create <name> --type <cpu\|gpu\|rdma> --count <n>` | Create a managed CPU/GPU pool, managed Compute Cluster RDMA pool, or legacy Cluster Network RDMA pool from a stack template. |
 | `pools delete <pool>` | Drain workers and delete the complete owning pool resource. |
 | `pools resize <pool> (--size <n> \| --delta <n>)` | Resize a managed OKE node pool, cluster network, or instance pool. |
 | `pools add <pool> --count <n>` | Add `n` workers to desired pool capacity. |
@@ -173,10 +175,15 @@ Pool creation options:
 
 | Option | Description |
 | --- | --- |
-| `--type cpu\|gpu\|rdma` | Required pool backend. CPU and GPU create managed OKE node pools; RDMA creates a self-managed Cluster Network. |
+| `--type cpu\|gpu\|rdma` | Required workload type. CPU/GPU are managed OKE pools. RDMA defaults to the legacy Cluster Network backend for compatibility. |
 | `--count <n>` | Initial worker count. The value must be at least one. |
+| `--rdma-mode cluster-network\|compute-cluster` | Select the RDMA backend. `cluster-network` is the default; `compute-cluster` creates a managed OKE node pool. |
+| `--compute-cluster-id <ocid>` | Use an existing Compute Cluster for managed RDMA. When omitted in compute-cluster mode, the tool creates a dedicated empty Compute Cluster first. |
+| `--compute-cluster-name <name>` | Name an automatically created Compute Cluster. Default: `<pool>-cc`. |
+| `--compute-cluster-compartment-id <ocid>` | Create the dedicated Compute Cluster in another accessible compartment. Default: the discovered OKE compartment. |
+| `--host-group-id <ocid>` | Place a managed pool through an existing Compute Host Group. A single ID requires one selected AD. |
 | `--from-pool <pool>` | Select the source template. If omitted, the matching conventional pool (`oke-cpu`, `oke-gpu`, or `oke-rdma`) is used when present; otherwise the only eligible pool is used. |
-| `--image-id`, `--shape`, `--availability-domain`, `--subnet-id` | Override the inherited worker image, shape, placement, or primary subnet. |
+| `--image-id`, `--shape`, `--availability-domain`, `--subnet-id` | Override the inherited worker image, shape, placement, or primary subnet. Availability domains accept canonical or display-form names. |
 | `--pod-subnet-id`, `--node-nsg-id`, `--pod-nsg-id` | Override worker and VCN-native pod networking. Repeat where supported. |
 | `--boot-volume-*`, `--ocpus`, `--memory-in-gbs` | Override boot-volume and Flex-shape settings. |
 | `--kubernetes-version`, `--max-pods-per-node`, `--node-label`, `--node-metadata` | Override worker bootstrap and Kubernetes registration settings. |
@@ -329,14 +336,15 @@ both ownership models:
 | Pool model | Inventory | Create operation | Resize operation | Specific node removal |
 | --- | --- | --- | --- | --- |
 | Standard managed OKE node pool | `kind=node-pool`, `placement=standard` | OKE `CreateNodePool` from a matching CPU/GPU source | OKE `UpdateNodePool` with only the desired size | OKE `DeleteNode` |
-| Managed OKE node pool placed in a Compute Cluster | `kind=node-pool`, `placement=compute-cluster` | Not created by this command; `--type rdma` intentionally creates the self-managed Cluster Network model | OKE `UpdateNodePool` with only the desired size | OKE `DeleteNode` |
+| Managed OKE node pool placed in a Compute Cluster | `kind=node-pool`, `placement=compute-cluster` | Create or validate a Compute Cluster, then OKE `CreateNodePool` | OKE `UpdateNodePool` with only the desired size | OKE `DeleteNode` |
+| Managed OKE node pool placed in a Compute Host Group | `kind=node-pool`, `placement=host-group` | Validate the existing Host Group, then OKE `CreateNodePool` | OKE `UpdateNodePool` | OKE `DeleteNode` |
 | Self-managed Cluster Network instance pool | `kind=cluster-network`, `placement=cluster-network` | Compute Management `CreateInstanceConfiguration` and `CreateClusterNetwork` from an existing pool template | Compute Management `UpdateClusterNetwork` | Instance-pool detach with automatic termination |
 | Standalone Instance Pool | `kind=instance-pool` | Not supported | Compute Management `UpdateInstancePool` | Instance-pool detach with automatic termination |
 
-The Compute Cluster is placement metadata for a managed OKE pool. The tool does
-not resize or detach its OKE-internal backing Instance Pool directly. Discovery
-suppresses that internal resource from standalone pool output, preventing one
-managed RDMA pool from appearing twice.
+The Compute Cluster and Compute Host Group are placement resources for a
+managed OKE pool. The tool never resizes or detaches OKE-internal backing
+Instance Pools directly. Discovery suppresses those internal resources from
+standalone pool output, preventing duplicate inventory.
 
 Specific-node BVR is routed through OKE for every managed and self-managed pool
 model. Pool-wide BVR with image or property updates is available only for
@@ -369,6 +377,27 @@ mgmt-oke pools create gpu-training \
   --dry-run
 ```
 
+Create a managed RDMA pool and a dedicated Compute Cluster:
+
+```bash
+mgmt-oke pools create rdma-managed \
+  --type rdma \
+  --rdma-mode compute-cluster \
+  --count 1 \
+  --from-pool oke-gpu \
+  --availability-domain <availability-domain> \
+  --shape BM.GPU4.8 \
+  --compute-cluster-name rdma-managed-cc \
+  --dry-run
+```
+
+Use an existing Compute Cluster and Compute Host Group by adding
+`--compute-cluster-id <compute-cluster-ocid>` and
+`--host-group-id <host-group-ocid>`. The cluster must be enhanced, both
+placement resources must be `ACTIVE` in the selected AD, the shape must expose
+RDMA ports, and the OKE node-pool resource principal must have the applicable
+launch permission.
+
 Create a self-managed RDMA Cluster Network pool:
 
 ```bash
@@ -384,10 +413,10 @@ mgmt-oke pools create rdma-training \
 ```
 
 Creation always inherits a working OKE bootstrap from a matching source pool.
-The selected overrides are applied, the new Kubernetes pool identity is
-retargeted, and the source remains unchanged. CPU and GPU use OKE
-`CreateNodePool`; RDMA derives a new Instance Configuration and uses Compute
-Management `CreateClusterNetwork`. Apply a reviewed plan by removing
+CPU, GPU, and compute-cluster RDMA use OKE `CreateNodePool`; the first managed
+RDMA pool can use a managed GPU source, and later pools prefer an existing
+managed RDMA source. Legacy RDMA derives an Instance Configuration and uses
+Compute Management `CreateClusterNetwork`. Apply a reviewed plan by removing
 `--dry-run`, adding `--wait`, and completing the typed confirmation.
 
 Delete a complete pool after reviewing its drain and ownership plan:
@@ -726,7 +755,8 @@ CI runs pytest on Python 3.9, 3.10, 3.11, and 3.12, followed by Ruff and mypy.
   fresh sanitized status, plan, dry-run, ordering-guard, and checkpoint output,
   explicitly distinguished from an unperformed live version change
 - [`docs/live-pool-creation-validation.md`](docs/live-pool-creation-validation.md):
-  sanitized output from live managed GPU and self-managed RDMA creation validation
+  sanitized output from managed GPU, managed Compute Cluster RDMA, and legacy
+  self-managed RDMA creation validation
 - [`docs/live-pool-deletion-validation.md`](docs/live-pool-deletion-validation.md):
   sanitized output from live managed GPU deletion and RDMA deletion planning
 - [`docs/scope.md`](docs/scope.md): implemented features and planned items

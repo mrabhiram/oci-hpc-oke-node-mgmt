@@ -49,6 +49,81 @@ class ValidationTests(unittest.TestCase):
                     boot_volume_vpus_per_gb=10,
                 )
             )
+
+    def test_managed_rdma_mode_is_explicit_and_defaults_remain_legacy(self):
+        legacy = validate_pool_create_spec(PoolCreateSpec(pool_type="rdma"))
+        managed = validate_pool_create_spec(
+            PoolCreateSpec(
+                pool_type="rdma",
+                rdma_mode="compute-cluster",
+            )
+        )
+
+        self.assertEqual("cluster-network", legacy.effective_rdma_mode)
+        self.assertFalse(legacy.managed)
+        self.assertEqual("compute-cluster", managed.effective_rdma_mode)
+        self.assertTrue(managed.managed)
+        self.assertTrue(managed.creates_compute_cluster)
+
+    def test_managed_placement_options_reject_conflicting_backends(self):
+        invalid_specs = (
+            (
+                PoolCreateSpec(
+                    pool_type="gpu",
+                    rdma_mode="compute-cluster",
+                ),
+                "rdma-mode",
+            ),
+            (
+                PoolCreateSpec(
+                    pool_type="rdma",
+                    compute_cluster_id="compute-cluster-1",
+                ),
+                "compute-cluster-id",
+            ),
+            (
+                PoolCreateSpec(
+                    pool_type="rdma",
+                    host_group_id="host-group-1",
+                ),
+                "host-group-id",
+            ),
+            (
+                PoolCreateSpec(
+                    pool_type="rdma",
+                    rdma_mode="compute-cluster",
+                    fault_domains=("FD-1",),
+                ),
+                "fault domains",
+            ),
+            (
+                PoolCreateSpec(
+                    pool_type="gpu",
+                    host_group_id="host-group-1",
+                    capacity_reservation_id="capacity-1",
+                ),
+                "conflicting placement",
+            ),
+        )
+        for spec, message in invalid_specs:
+            with self.subTest(message=message), self.assertRaisesRegex(
+                ValueError,
+                message,
+            ):
+                validate_pool_create_spec(spec)
+
+    def test_existing_compute_cluster_disables_automatic_creation(self):
+        spec = validate_pool_create_spec(
+            PoolCreateSpec(
+                pool_type="rdma",
+                rdma_mode="compute-cluster",
+                compute_cluster_id="compute-cluster-1",
+                host_group_id="host-group-1",
+            )
+        )
+
+        self.assertFalse(spec.creates_compute_cluster)
+        self.assertEqual("host-group-1", spec.host_group_id)
         with self.assertRaisesRegex(ValueError, "managed OKE settings"):
             validate_pool_create_spec(
                 PoolCreateSpec(

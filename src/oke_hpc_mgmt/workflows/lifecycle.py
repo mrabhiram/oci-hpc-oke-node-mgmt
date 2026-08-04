@@ -4,7 +4,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from oke_hpc_mgmt.backends.oci import (
     BootVolumeAttachmentPending,
@@ -46,6 +46,14 @@ INSTANCE_CONFIGURATION_DERIVATION_NOTICE = (
 MANAGED_POOL_DERIVATION_NOTICE = (
     "A new managed OKE node pool is derived from the source; OKE bootstrap, "
     "networking, labels, and lifecycle defaults are preserved unless overridden."
+)
+COMPUTE_CLUSTER_IAM_NOTICE = (
+    "OKE requires a node-pool resource-principal policy granting "
+    "COMPUTE_CLUSTER_LAUNCH_INSTANCE on the selected Compute Cluster."
+)
+HOST_GROUP_IAM_NOTICE = (
+    "OKE requires a node-pool resource-principal policy granting "
+    "HOST_GROUP_LAUNCH_INSTANCE on the selected Compute Host Group."
 )
 
 
@@ -163,13 +171,10 @@ def prepare_pool_create(
     _require_complete_pool_inventory(snapshot)
     _ensure_pool_name_available(snapshot, normalized_name)
 
-    source_pool = _select_pool_template(
-        snapshot,
-        spec.pool_type,
-        source_identifier,
-    )
+    source_pool = _select_pool_template(snapshot, spec, source_identifier)
     backend = service.oci_backend()
-    if spec.pool_type == "rdma":
+    steps: tuple[str, ...]
+    if not spec.managed:
         if not source_pool.cluster_network_id or not source_pool.instance_pool_id:
             raise WorkflowError(
                 f"Source pool is missing its Cluster Network backing identifiers: "
@@ -191,6 +196,10 @@ def prepare_pool_create(
             "allow the inherited OKE bootstrap to register self-managed RDMA workers",
         )
     else:
+        if spec.uses_compute_cluster:
+            _require_enhanced_cluster(
+                backend.get_cluster_type(target.cluster_id)
+            )
         if not source_pool.node_pool_id:
             raise WorkflowError(
                 f"Source pool is missing its managed OKE node-pool OCID: "
@@ -204,14 +213,43 @@ def prepare_pool_create(
             count,
             spec,
         )
-        owner = "oke"
-        steps = (
+        owner = "oke+compute" if spec.creates_compute_cluster else "oke"
+        managed_steps = [
             f"derive a managed OKE node-pool request from {source_pool.name}",
             "apply requested shape, image, placement, networking, and bootstrap overrides",
             "retarget Kubernetes labels, metadata, tags, and node lifecycle settings",
-            "create the managed OKE node pool",
-            "allow OKE to provision and register workers",
+        ]
+        if spec.creates_compute_cluster:
+            managed_steps.append(
+                "create and wait for a dedicated Compute Cluster"
+            )
+        elif spec.compute_cluster_id:
+            managed_steps.append(
+                "use the validated existing Compute Cluster"
+            )
+        if spec.host_group_id:
+            managed_steps.append(
+                "place workers through the validated Compute Host Group"
+            )
+        managed_steps.extend(
+            [
+                "create the managed OKE node pool",
+                "allow OKE to provision and register workers",
+            ]
         )
+        steps = tuple(managed_steps)
+    warnings = [
+        (
+            INSTANCE_CONFIGURATION_DERIVATION_NOTICE
+            if not spec.managed
+            else MANAGED_POOL_DERIVATION_NOTICE
+        ),
+        IAC_CREATE_DRIFT_WARNING,
+    ]
+    if spec.uses_compute_cluster:
+        warnings.append(COMPUTE_CLUSTER_IAM_NOTICE)
+    if spec.host_group_id:
+        warnings.append(HOST_GROUP_IAM_NOTICE)
     plan = OperationPlan(
         operation="pool-create",
         target=normalized_name,
@@ -220,14 +258,7 @@ def prepare_pool_create(
         current_size=0,
         target_size=count,
         steps=steps,
-        warnings=(
-            (
-                INSTANCE_CONFIGURATION_DERIVATION_NOTICE
-                if spec.pool_type == "rdma"
-                else MANAGED_POOL_DERIVATION_NOTICE
-            ),
-            IAC_CREATE_DRIFT_WARNING,
-        ),
+        warnings=tuple(warnings),
         details={
             "source_pool": source_pool.name,
             "requested": spec.as_dict(),
@@ -268,14 +299,14 @@ def execute_pool_create(
         current_source = current_snapshot.pool_by_name(source_pool.backing_id or "")
         if current_source is None or not _pool_matches_create_type(
             current_source,
-            prepared.spec.pool_type,
+            prepared.spec,
         ):
             raise WorkflowError(
                 f"Source pool changed after planning: {source_pool.name}"
             )
 
         backend = service.oci_backend()
-        if prepared.spec.pool_type == "rdma":
+        if not prepared.spec.managed:
             if (
                 not current_source.cluster_network_id
                 or not current_source.instance_pool_id
@@ -299,7 +330,11 @@ def execute_pool_create(
                     f"Source pool is missing its managed OKE node-pool OCID: "
                     f"{current_source.name}"
                 )
-            created = backend.create_managed_node_pool(
+            if prepared.spec.uses_compute_cluster:
+                _require_enhanced_cluster(
+                    backend.get_cluster_type(target.cluster_id)
+                )
+            effective = backend.preview_managed_node_pool_create(
                 current_source.node_pool_id,
                 target.cluster_id,
                 target.compartment_id,
@@ -307,9 +342,81 @@ def execute_pool_create(
                 prepared.count,
                 prepared.spec,
             )
+            runtime_spec = prepared.spec
+            created_compute_cluster_id: str | None = None
+            if prepared.spec.creates_compute_cluster:
+                availability_domains = tuple(
+                    str(value)
+                    for value in effective.get("availability_domains", [])
+                    if value
+                )
+                if len(availability_domains) != 1:
+                    raise WorkflowError(
+                        "Compute Cluster creation requires exactly one effective "
+                        "availability domain."
+                    )
+                compute_cluster = backend.create_compute_cluster(
+                    compartment_id=(
+                        prepared.spec.compute_cluster_compartment_id
+                        or target.compartment_id
+                    ),
+                    availability_domain=availability_domains[0],
+                    display_name=(
+                        prepared.spec.compute_cluster_name
+                        or f"{prepared.name}-cc"
+                    ),
+                    pool_name=prepared.name,
+                    freeform_tags=dict(prepared.spec.freeform_tags),
+                )
+                created_compute_cluster_id = (
+                    compute_cluster.compute_cluster_id
+                )
+                wait_for_compute_cluster_active(
+                    backend,
+                    created_compute_cluster_id,
+                    timeout_seconds,
+                    poll_interval_seconds,
+                    progress=progress,
+                )
+                runtime_spec = replace(
+                    prepared.spec,
+                    compute_cluster_id=created_compute_cluster_id,
+                    compute_cluster_name=None,
+                    compute_cluster_compartment_id=None,
+                )
+            try:
+                created = backend.create_managed_node_pool(
+                    current_source.node_pool_id,
+                    target.cluster_id,
+                    target.compartment_id,
+                    prepared.name,
+                    prepared.count,
+                    runtime_spec,
+                )
+            except Exception as exc:
+                if created_compute_cluster_id:
+                    raise WorkflowError(
+                        f"{exc} Created Compute Cluster "
+                        f"{created_compute_cluster_id} is retained because the "
+                        "node-pool request outcome could not be proven."
+                    ) from exc
+                raise
+            if created_compute_cluster_id:
+                created = replace(
+                    created,
+                    compute_cluster_id=created_compute_cluster_id,
+                    compute_cluster_created=True,
+                )
         observed_pool: WorkerPoolInfo | None = None
         status = "submitted"
         if wait:
+            require_rdma_vf = bool(
+                source_pool.rdma_vf_required
+                or (
+                    prepared.spec.pool_type == "rdma"
+                    and current_snapshot.network_operator_active
+                )
+            )
             try:
                 observed_pool = wait_for_pool_creation(
                     service,
@@ -318,7 +425,7 @@ def execute_pool_create(
                     created,
                     timeout_seconds,
                     poll_interval_seconds,
-                    require_rdma_vf=source_pool.rdma_vf_required,
+                    require_rdma_vf=require_rdma_vf,
                     progress=progress,
                 )
             except Exception as exc:
@@ -328,6 +435,12 @@ def execute_pool_create(
                         f"{created.cluster_network_id} and derived Instance "
                         f"Configuration {created.instance_configuration_id} "
                         "may require cleanup."
+                    ) from exc
+                if created.compute_cluster_created:
+                    raise WorkflowError(
+                        f"{exc} Managed node pool {prepared.name} and Compute "
+                        f"Cluster {created.compute_cluster_id} are retained for "
+                        "inspection."
                     ) from exc
                 raise
             status = "ready"
@@ -1635,6 +1748,39 @@ def wait_for_pool_creation(
         time.sleep(poll_interval_seconds)
 
 
+def wait_for_compute_cluster_active(
+    backend: OciBackend,
+    compute_cluster_id: str,
+    timeout_seconds: int,
+    poll_interval_seconds: int,
+    progress: Callable[[str], None] | None = None,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    last_status = ""
+    while True:
+        cluster = backend.get_compute_cluster_info(compute_cluster_id)
+        lifecycle_state = cluster.lifecycle_state.upper()
+        status = (
+            f"{cluster.display_name}: compute_cluster={lifecycle_state}"
+        )
+        if progress and status != last_status:
+            progress(status)
+            last_status = status
+        if lifecycle_state == "ACTIVE":
+            return
+        if lifecycle_state == "DELETED":
+            raise WorkflowError(
+                f"Compute Cluster was deleted while waiting: "
+                f"{compute_cluster_id}"
+            )
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "Timed out waiting for Compute Cluster to become ACTIVE. "
+                f"Last status: {status}"
+            )
+        time.sleep(poll_interval_seconds)
+
+
 def wait_for_pool_deleted(
     service: DiscoveryService,
     original_pool: WorkerPoolInfo,
@@ -2045,7 +2191,9 @@ def pool_create_result_row(
         "placement": (
             "cluster-network"
             if isinstance(created, ClusterNetworkCreateResult)
-            else "standard"
+            else "compute-cluster"
+            if created.compute_cluster_id
+            else "host-group" if created.host_group_id else "standard"
         ),
         "type": prepared.spec.pool_type,
         "source_pool": source_pool.name,
@@ -2078,6 +2226,13 @@ def pool_create_result_row(
             if observed_pool and observed_pool.node_pool_id
             else created.node_pool_id
         )
+        if created.compute_cluster_id:
+            result["compute_cluster_id"] = created.compute_cluster_id
+            result["compute_cluster_created"] = (
+                created.compute_cluster_created
+            )
+        if created.host_group_id:
+            result["host_group_id"] = created.host_group_id
     return result
 
 
@@ -2230,13 +2385,14 @@ def _require_enhanced_cluster(cluster_type: str) -> None:
 
 def _select_pool_template(
     snapshot: DiscoverySnapshot,
-    pool_type: str,
+    spec: PoolCreateSpec,
     source_identifier: str | None,
 ) -> WorkerPoolInfo:
+    pool_type = spec.pool_type
     candidates = [
         pool
         for pool in snapshot.pools
-        if _pool_matches_create_type(pool, pool_type)
+        if _pool_matches_create_type(pool, spec)
     ]
     if source_identifier:
         selected = snapshot.pool_by_name(source_identifier)
@@ -2249,11 +2405,39 @@ def _select_pool_template(
             )
         return selected
 
+    if spec.uses_compute_cluster:
+        compute_cluster_sources = [
+            pool for pool in candidates if pool.compute_cluster_id
+        ]
+        conventional_rdma = [
+            pool
+            for pool in compute_cluster_sources
+            if pool.name == "oke-rdma"
+        ]
+        if len(conventional_rdma) == 1:
+            return conventional_rdma[0]
+        if len(compute_cluster_sources) == 1:
+            return compute_cluster_sources[0]
+        if len(compute_cluster_sources) > 1:
+            names = ", ".join(
+                sorted(pool.name for pool in compute_cluster_sources)
+            )
+            raise WorkflowError(
+                "Multiple managed Compute Cluster RDMA templates are "
+                f"available. Select one with --from-pool: {names}"
+            )
+
+        conventional_gpu = [
+            pool for pool in candidates if pool.name == "oke-gpu"
+        ]
+        if len(conventional_gpu) == 1:
+            return conventional_gpu[0]
+
     conventional_name = {
         "cpu": "oke-cpu",
         "gpu": "oke-gpu",
         "rdma": "oke-rdma",
-    }[pool_type]
+    }[spec.pool_type]
     conventional = [pool for pool in candidates if pool.name == conventional_name]
     if len(conventional) == 1:
         return conventional[0]
@@ -2270,12 +2454,23 @@ def _select_pool_template(
     )
 
 
-def _pool_matches_create_type(pool: WorkerPoolInfo, pool_type: str) -> bool:
-    if pool_type == "rdma":
+def _pool_matches_create_type(
+    pool: WorkerPoolInfo,
+    spec: PoolCreateSpec,
+) -> bool:
+    pool_type = spec.pool_type
+    if pool_type == "rdma" and not spec.managed:
         return bool(
             pool.kind == "cluster-network"
             and pool.cluster_network_id
             and pool.instance_pool_id
+        )
+    if pool_type == "rdma":
+        return bool(
+            pool.kind == "node-pool"
+            and pool.node_pool_id
+            and pool.gpu_resource
+            and (pool.compute_cluster_id or not pool.rdma_enabled)
         )
     if pool.kind != "node-pool" or not pool.node_pool_id:
         return False

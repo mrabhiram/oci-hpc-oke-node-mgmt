@@ -19,6 +19,9 @@ different.
 - working OCI and Kubernetes discovery
 - IAM permission to read and, for mutations, manage the owning pool resource;
   `--wait` also requires permission to inspect its work requests
+- for managed creation, OKE node-pool resource-principal permission
+  `COMPUTE_CLUSTER_LAUNCH_INSTANCE` and, when used,
+  `HOST_GROUP_LAUNCH_INSTANCE`
 - GPU and network device plug-ins initialized on the workers
 
 ## Identify the RDMA Ownership Model
@@ -51,7 +54,34 @@ mgmt-oke --auth instance_principal --format json pools get oke-rdma
 A managed pool exposes `node_pool_id` and `compute_cluster_id`. A legacy pool
 exposes `cluster_network_id` and `instance_pool_id`.
 
-## Create A Cluster Network RDMA Pool
+## Create A Managed Compute Cluster RDMA Pool
+
+Create the first managed RDMA pool from a regular managed GPU source and let
+the tool create a dedicated Compute Cluster:
+
+```bash
+mgmt-oke --auth instance_principal pools create oke-rdma-managed \
+  --type rdma \
+  --rdma-mode compute-cluster \
+  --count 1 \
+  --from-pool oke-gpu \
+  --availability-domain <availability-domain> \
+  --shape BM.GPU4.8 \
+  --compute-cluster-name oke-rdma-managed-cc \
+  --dry-run \
+  --format json
+```
+
+Use `--compute-cluster-id <ocid>` for an existing Compute Cluster. Add
+`--host-group-id <ocid>` to use an existing Compute Host Group in the selected
+AD. The dry run validates enhanced-cluster support, image/shape RDMA ports,
+single-AD placement, Compute Cluster state, and Host Group state and target.
+
+Apply by replacing `--dry-run --format json` with `--wait`. OKE owns the new
+node pool after creation, so resize and specific-node operations continue
+through OKE rather than through an internal Instance Pool.
+
+## Create A Legacy Cluster Network RDMA Pool
 
 Create a second self-managed Cluster Network pool from the existing `oke-rdma`
 configuration and placement:

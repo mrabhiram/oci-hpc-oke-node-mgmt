@@ -115,17 +115,46 @@ mgmt-oke pools create <new-pool-name> \
   --wait
 ```
 
-`cpu` and `gpu` create managed OKE node pools. `rdma` creates a self-managed
-Cluster Network and derived Instance Configuration. Custom images and
-backend-appropriate placement, shape, networking, boot, Kubernetes, lifecycle,
-metadata, cloud-init, FSS, Lustre, and NVMe settings are available. Unspecified
-values are inherited from the matching source.
+`cpu` and `gpu` create managed OKE node pools. `rdma` defaults to a legacy
+self-managed Cluster Network and derived Instance Configuration. Add
+`--rdma-mode compute-cluster` to create a managed OKE RDMA node pool in an
+existing or automatically created Compute Cluster.
+
+```bash
+mgmt-oke pools create <managed-rdma-pool> \
+  --type rdma \
+  --rdma-mode compute-cluster \
+  --count 1 \
+  --from-pool <managed-gpu-or-rdma-source> \
+  --availability-domain <availability-domain> \
+  --shape <rdma-capable-bare-metal-gpu-shape> \
+  --compute-cluster-name <new-compute-cluster-name> \
+  --dry-run
+```
+
+The example creates a dedicated Compute Cluster. To use existing placement,
+replace `--compute-cluster-name` with
+`--compute-cluster-id <compute-cluster-ocid>`. Add
+`--host-group-id <compute-host-group-ocid>` only when the workers must also use
+an existing Compute Host Group. Custom images and backend-appropriate
+placement, shape, networking, boot, Kubernetes, lifecycle, metadata,
+cloud-init, FSS, Lustre, and NVMe settings are available. Unspecified values
+are inherited from the matching source.
+
+| Placement option | Purpose |
+| --- | --- |
+| `--rdma-mode cluster-network\|compute-cluster` | Select legacy self-managed or managed OKE RDMA. Default: `cluster-network`. |
+| `--compute-cluster-id <ocid>` | Use an existing `ACTIVE` Compute Cluster. |
+| `--compute-cluster-name <name>` | Name an automatically created Compute Cluster. |
+| `--compute-cluster-compartment-id <ocid>` | Select the compartment for automatic Compute Cluster creation. |
+| `--host-group-id <ocid>` | Use an existing `ACTIVE` Compute Host Group for the single selected placement. |
+| `--availability-domain <name>` | Select placement using a canonical tenancy-prefixed or display-form AD name. |
 
 See [Creating Worker Pools](./creating-worker-pools.md) and
 [Worker Bootstrap and Storage](./worker-bootstrap-and-storage.md) for the full
 option matrix and examples. [Live Worker Pool Creation
 Validation](./live-pool-creation-validation.md) contains sanitized output from
-live managed GPU and self-managed RDMA creation operations.
+live managed GPU, managed Compute Cluster RDMA, and legacy RDMA operations.
 
 Replace every boot volume in a managed pool while applying at least one
 supported property update:

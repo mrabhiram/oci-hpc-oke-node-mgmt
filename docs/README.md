@@ -44,8 +44,8 @@ capacity naturally vary by deployment.
   from managed OKE, Compute Cluster-backed, Cluster Network, and standalone
   Instance Pools.
 - [Creating Worker Pools](./creating-worker-pools.md): Create managed CPU/GPU
-  pools or self-managed RDMA Cluster Network pools with inherited defaults and
-  explicit overrides.
+  pools, managed Compute Cluster RDMA pools, or legacy self-managed RDMA
+  Cluster Network pools with inherited defaults and explicit overrides.
 - [Worker Bootstrap and Storage](./worker-bootstrap-and-storage.md): Compose the
   official OCI HPC OKE cloud-init, NVMe RAID, FSS mount, and Lustre mount
   workflows.
@@ -63,8 +63,8 @@ capacity naturally vary by deployment.
   Review fresh status, plan, dry-run, ordering-guard, and checkpoint output,
   together with the explicit boundary that no live version change was made.
 - [Live Worker Pool Creation Validation](./live-pool-creation-validation.md):
-  Review sanitized output from managed GPU creation, self-managed RDMA
-  creation planning, and a capacity-limited RDMA submission.
+  Review sanitized output from managed GPU creation, managed Compute Cluster
+  RDMA validation, self-managed RDMA planning, and capacity-limited submissions.
 - [Live Worker Pool Deletion Validation](./live-pool-deletion-validation.md):
   Review sanitized output from managed GPU deletion, RDMA deletion planning,
   ownership-aware cleanup, and system-pool protection.

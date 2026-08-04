@@ -1,7 +1,7 @@
 # Live Worker Pool Creation Validation
 
-This report shows representative `mgmt-oke 0.7.0` commands and output captured
-from live worker-pool creation validation against an OCI HPC OKE cluster in
+This report shows representative `mgmt-oke` commands and output captured from
+live worker-pool creation validation against an OCI HPC OKE cluster in
 `uk-london-1`.
 
 The validation cluster contained:
@@ -9,6 +9,7 @@ The validation cluster contained:
 - a managed OKE GPU pool using `VM.GPU.A10.1`
 - a self-managed RDMA Cluster Network pool using `BM.GPU4.8`
 - working OKE bootstrap metadata on both source pools
+- an enhanced OKE control plane with the managed Compute Cluster API available
 
 OCI resource identifiers, availability-domain names, subnet identifiers,
 temporary pool names, and Kubernetes node names are replaced with descriptive
@@ -105,6 +106,359 @@ Example output:
 
 The command returned only after the new OKE node pool had one active OCI worker,
 one Ready Kubernetes node, and the expected allocatable GPU resource.
+
+## Managed Compute Cluster RDMA Pool
+
+This validation was executed on 2026-08-04. It used a regular managed GPU pool
+as the source for the first managed RDMA pool.
+
+### Fresh Placement Preview
+
+The command intentionally supplied the display-form AD name. The tool resolved
+it to the tenancy-prefixed canonical name before validating shape, image,
+network, and placement compatibility:
+
+```bash
+mgmt-oke pools create rdma-managed-validation \
+  --type rdma \
+  --rdma-mode compute-cluster \
+  --count 1 \
+  --from-pool oke-gpu \
+  --availability-domain UK-LONDON-1-AD-3 \
+  --shape BM.GPU4.8 \
+  --compute-cluster-name rdma-managed-validation-cc \
+  --dry-run \
+  --format json
+```
+
+Sanitized output excerpt from that command:
+
+```json
+[
+  {
+    "current_size": 0,
+    "details": {
+      "effective": {
+        "availability_domains": ["<canonical-ad-3>"],
+        "backend": "oke-node-pool",
+        "cni_type": "OCI_VCN_IP_NATIVE",
+        "compute_cluster_action": "create",
+        "compute_cluster_id": null,
+        "compute_cluster_name": "rdma-managed-validation-cc",
+        "count": 1,
+        "fault_domains": [],
+        "host_group_ids": [],
+        "kubernetes_version": "v1.35.2",
+        "name": "rdma-managed-validation",
+        "placement": "compute-cluster",
+        "shape": "BM.GPU4.8",
+        "storage": {
+          "fss_mounts": [],
+          "lustre_mounts": [],
+          "mode": "inherit",
+          "nvme_raid": null
+        }
+      },
+      "requested": {
+        "availability_domain": "UK-LONDON-1-AD-3",
+        "compute_cluster_name": "rdma-managed-validation-cc",
+        "create_compute_cluster": true,
+        "rdma_mode": "compute-cluster",
+        "shape": "BM.GPU4.8",
+        "storage_mode": "inherit",
+        "type": "rdma"
+      },
+      "source_pool": "oke-gpu"
+    },
+    "operation": "pool-create",
+    "owner": "oke+compute",
+    "pool": "rdma-managed-validation",
+    "status": "planned",
+    "target_size": 1
+  }
+]
+```
+
+The full captured output also retained the inherited image, worker subnet, pod
+subnet, NSGs, boot-volume size, maximum pods, and OKE bootstrap settings. Those
+resource identifiers are omitted here rather than replaced with realistic
+OCIDs.
+
+### Initial Capacity Failure
+
+The first mutation used the reviewed request with `--wait --yes`. The dedicated
+Compute Cluster reached `ACTIVE`, and OKE accepted creation of the managed node
+pool. The OKE worker-provisioning work request then failed:
+
+```text
+Error: OCI work request <oke-work-request-ocid> ended in FAILED: Out of host
+capacity. Managed node pool rdma-managed-validation and Compute Cluster
+<compute-cluster-ocid> are retained for inspection.
+```
+
+Post-failure inventory showed the node pool resource but no registered
+Kubernetes worker. The failed node pool was deleted through `mgmt-oke`, and the
+empty retained Compute Cluster was then deleted explicitly. A fresh OCI Compute
+Capacity Report still returned:
+
+```json
+[
+  {
+    "shape": "BM.GPU4.8",
+    "status": "OUT_OF_HOST_CAPACITY",
+    "available_count": 0,
+    "fault_domain": null
+  }
+]
+```
+
+This exercised Compute Cluster creation, OKE request submission, failed
+work-request monitoring, retained-resource reporting, and cleanup.
+
+### Successful Live Retry
+
+After OCI reported one available host, the same reviewed request was submitted
+again:
+
+```bash
+mgmt-oke pools create rdma-managed-validation \
+  --type rdma \
+  --rdma-mode compute-cluster \
+  --count 1 \
+  --from-pool oke-gpu \
+  --availability-domain UK-LONDON-1-AD-3 \
+  --shape BM.GPU4.8 \
+  --compute-cluster-name rdma-managed-validation-cc \
+  --wait \
+  --timeout 3600 \
+  --poll-interval 15 \
+  --yes \
+  --format json
+```
+
+Captured progress and sanitized result:
+
+```text
+Waiting: rdma-managed-validation-cc: compute_cluster=ACTIVE
+Waiting: rdma-managed-validation: desired=1 oci_active=1 k8s_ready=0 gpu_ready=0 rdma_ready=0
+Waiting: rdma-managed-validation: desired=1 oci_active=1 k8s_ready=1 gpu_ready=0 rdma_ready=1
+```
+
+```json
+[
+  {
+    "compute_cluster_created": true,
+    "compute_cluster_id": "<compute-cluster-ocid>",
+    "k8s_ready": 1,
+    "kind": "node-pool",
+    "name": "rdma-managed-validation",
+    "node_pool_id": "<managed-node-pool-ocid>",
+    "oci_active": 1,
+    "placement": "compute-cluster",
+    "shape": "BM.GPU4.8",
+    "source_pool": "oke-gpu",
+    "status": "ready",
+    "target_size": 1,
+    "type": "rdma",
+    "work_request_id": "<oke-work-request-ocid>"
+  }
+]
+```
+
+### Inventory And Health Output
+
+```bash
+mgmt-oke pools get rdma-managed-validation --format json
+```
+
+```json
+[
+  {
+    "compute_cluster_id": "<compute-cluster-ocid>",
+    "desired": 1,
+    "gpu": "nvidia.com/gpu",
+    "host_group_ids": [],
+    "k8s_ready": 1,
+    "kind": "node-pool",
+    "name": "rdma-managed-validation",
+    "oci_active": 1,
+    "placement": "compute-cluster",
+    "rdma": true,
+    "shape": "BM.GPU4.8"
+  }
+]
+```
+
+```bash
+mgmt-oke nodes list --pool rdma-managed-validation --format json
+```
+
+```json
+[
+  {
+    "gpu": {"nvidia.com/gpu": "8"},
+    "name": "rdma-managed-node-1",
+    "pool": "rdma-managed-validation",
+    "rdma": true,
+    "ready": true,
+    "schedulable": true,
+    "shape": "BM.GPU4.8",
+    "status": "Ready",
+    "workload_pods": 0
+  }
+]
+```
+
+```bash
+mgmt-oke topology list --pool rdma-managed-validation --format json
+```
+
+```json
+[
+  {
+    "hpc_island": "<hpc-island>",
+    "local_block": "<local-block>",
+    "network_block": "<network-block>",
+    "node_names": ["rdma-managed-node-1"],
+    "nodes": 1,
+    "ready": 1,
+    "shapes": ["BM.GPU4.8"]
+  }
+]
+```
+
+```bash
+mgmt-oke health run --type pool --pool rdma-managed-validation --format json
+mgmt-oke health run --type gpu --pool rdma-managed-validation --format json
+mgmt-oke health run --type rdma --pool rdma-managed-validation --format json
+```
+
+```json
+[
+  {
+    "check": "pool-convergence",
+    "message": "desired=1, oci_active=1, k8s_ready=1",
+    "scope": "rdma-managed-validation",
+    "status": "PASS"
+  }
+]
+```
+
+```json
+[
+  {
+    "check": "gpu-allocatable",
+    "message": "nvidia.com/gpu=8",
+    "scope": "rdma-managed-node-1",
+    "status": "PASS"
+  }
+]
+```
+
+```json
+[
+  {
+    "check": "rdma-topology",
+    "message": "Required OCI RDMA topology labels are valid.",
+    "scope": "rdma-managed-node-1",
+    "status": "PASS"
+  }
+]
+```
+
+```bash
+mgmt-oke addons validate \
+  --target gpu \
+  --pool rdma-managed-validation \
+  --format json
+mgmt-oke addons validate \
+  --target rdma \
+  --pool rdma-managed-validation \
+  --format json
+```
+
+```json
+[
+  {
+    "check": "addon-gpu-operator",
+    "message": "OKE add-on is active at version v25.10.1.",
+    "scope": "NvidiaGpuOperator",
+    "status": "PASS"
+  },
+  {
+    "check": "addon-node-feature-discovery",
+    "message": "OKE add-on is active at version v0.17.3-1.",
+    "scope": "NodeFeatureDiscovery",
+    "status": "PASS"
+  },
+  {
+    "check": "gpu-allocatable",
+    "message": "nvidia.com/gpu=8",
+    "scope": "rdma-managed-node-1",
+    "status": "PASS"
+  }
+]
+```
+
+```json
+[
+  {
+    "check": "addon-network-operator",
+    "message": "Optional OKE add-on is not enabled; host-network RDMA remains supported.",
+    "scope": "NvidiaNetworkOperator",
+    "status": "INFO"
+  },
+  {
+    "check": "addon-node-feature-discovery",
+    "message": "OKE add-on is active at version v0.17.3-1.",
+    "scope": "NodeFeatureDiscovery",
+    "status": "PASS"
+  },
+  {
+    "check": "rdma-topology",
+    "message": "Required OCI RDMA topology labels are valid.",
+    "scope": "rdma-managed-node-1",
+    "status": "PASS"
+  }
+]
+```
+
+A Compute instance list filtered by the dedicated Compute Cluster OCID returned
+the same running `BM.GPU4.8` worker, providing direct placement membership
+evidence in addition to the OKE node-pool configuration.
+
+### Cleanup Output
+
+The pool was workload-free. The deletion preview identified one managed worker
+and `placement=compute-cluster`. The reviewed deletion then returned:
+
+```bash
+mgmt-oke pools delete rdma-managed-validation \
+  --wait \
+  --timeout 1800 \
+  --poll-interval 15 \
+  --yes \
+  --format json
+```
+
+```json
+[
+  {
+    "kind": "node-pool",
+    "name": "rdma-managed-validation",
+    "old_size": 1,
+    "placement": "compute-cluster",
+    "status": "deleted",
+    "target_size": 0,
+    "work_request_id": "<oke-work-request-ocid>"
+  }
+]
+```
+
+The empty dedicated Compute Cluster was deleted separately and reached
+`DELETED`. Compute Host Group placement is covered by request-model,
+validation, discovery, CLI, and workflow tests; the live compartment contained
+no Compute Host Group for a placement mutation.
 
 ## Self-Managed RDMA Pool
 
