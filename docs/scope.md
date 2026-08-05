@@ -39,6 +39,9 @@ Management Tool.
 - guarded creation of managed RDMA node pools through OKE `CreateNodePool`,
   using an existing Compute Cluster or an automatically created dedicated
   Compute Cluster
+- explicit legacy Cluster Network bootstrap inheritance for managed Compute
+  Cluster creation, preserving legacy cloud-init and storage hooks while
+  retaining current managed OKE identity, CNI, version, and lifecycle fields
 - existing Compute Host Group placement for managed pools, with lifecycle,
   availability-domain, and shape or platform validation
 - canonical and display-form availability-domain resolution through OCI

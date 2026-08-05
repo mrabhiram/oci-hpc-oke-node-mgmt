@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import base64
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import replace
 from typing import Any, TypeVar
 
-from oke_hpc_mgmt.bootstrap import compose_worker_user_data
+from oke_hpc_mgmt.bootstrap import (
+    BootstrapCompositionError,
+    compose_worker_user_data,
+    summarize_worker_bootstrap,
+)
 from oke_hpc_mgmt.models import (
     AddonCompatibility,
     AddonInfo,
@@ -33,6 +37,24 @@ class BootVolumeAttachmentPending(OciDiscoveryError):
 
 
 T = TypeVar("T")
+
+_MANAGED_BOOTSTRAP_AUTHORITY_KEYS = frozenset(
+    {
+        "apiserver_host",
+        "cluster_ca_cert",
+        "oke-initial-node-labels",
+        "oke-k8version",
+        "oke-max-pods",
+        "oke-native-pod-networking",
+        "pod-nsgids",
+        "pod-subnets",
+        "ssh_authorized_keys",
+    }
+)
+_CLUSTER_IDENTITY_METADATA_KEYS = (
+    "apiserver_host",
+    "cluster_ca_cert",
+)
 
 
 class OciBackend:
@@ -664,6 +686,8 @@ class OciBackend:
         name: str,
         size: int,
         spec: PoolCreateSpec,
+        *,
+        bootstrap_metadata: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         details = self._build_managed_node_pool_create_details(
             source_node_pool_id,
@@ -672,6 +696,7 @@ class OciBackend:
             name,
             size,
             spec,
+            bootstrap_metadata=bootstrap_metadata,
         )
         return _managed_node_pool_create_preview(details, spec)
 
@@ -684,6 +709,7 @@ class OciBackend:
         size: int,
         spec: PoolCreateSpec,
         *,
+        bootstrap_metadata: Mapping[str, str] | None = None,
         opc_retry_token: str | None = None,
     ) -> ManagedNodePoolCreateResult:
         if spec.creates_compute_cluster:
@@ -698,6 +724,7 @@ class OciBackend:
             name,
             size,
             spec,
+            bootstrap_metadata=bootstrap_metadata,
         )
         response = self._call(
             "Managed OKE node pool creation",
@@ -730,6 +757,8 @@ class OciBackend:
         name: str,
         size: int,
         spec: PoolCreateSpec,
+        *,
+        bootstrap_metadata: Mapping[str, str] | None = None,
     ) -> Any:
         spec = self._with_resolved_availability_domain(
             compartment_id,
@@ -874,7 +903,15 @@ class OciBackend:
             )
         node_config = node_config_model(**node_config_values)
 
-        metadata = dict(getattr(source, "node_metadata", None) or {})
+        metadata = _string_metadata(
+            getattr(source, "node_metadata", None),
+            source="Managed OKE source pool",
+        )
+        if bootstrap_metadata is not None:
+            metadata = _merge_legacy_bootstrap_metadata(
+                metadata,
+                bootstrap_metadata,
+            )
         source_user_data = metadata.get("user_data")
         if not source_user_data:
             raise OciDiscoveryError(
@@ -1335,6 +1372,30 @@ class OciBackend:
             opc_retry_token=cluster_network_retry_token,
         )
 
+    def get_cluster_network_pool_bootstrap_metadata(
+        self,
+        source_cluster_network_id: str,
+        source_instance_pool_id: str,
+    ) -> dict[str, str]:
+        _source, source_pool, _placement = self._get_cluster_network_pool_source(
+            source_cluster_network_id,
+            source_instance_pool_id,
+        )
+        source_configuration = self._get_instance_configuration_template(
+            source_pool.instance_configuration_id
+        )
+        instance_details = getattr(source_configuration, "instance_details", None)
+        launch_details = getattr(instance_details, "launch_details", None)
+        if launch_details is None:
+            raise OciDiscoveryError(
+                "Legacy bootstrap source Instance Configuration does not expose "
+                "compute launch details."
+            )
+        return _required_oke_bootstrap_metadata(
+            getattr(launch_details, "metadata", None),
+            source="Legacy bootstrap source Instance Configuration",
+        )
+
     def _create_cluster_network_with_configuration(
         self,
         source: Any,
@@ -1493,6 +1554,7 @@ class OciBackend:
             "max_pods_per_node": _optional_int(
                 metadata.get("oke-max-pods")
             ),
+            "worker_bootstrap": _worker_bootstrap_preview(metadata),
             "storage": _storage_preview(spec),
         }
 
@@ -1559,21 +1621,10 @@ class OciBackend:
                 "Source Instance Configuration does not expose compute launch details."
             )
 
-        metadata = dict(getattr(launch_details, "metadata", None) or {})
-        required_metadata = (
-            "apiserver_host",
-            "cluster_ca_cert",
-            "oke-initial-node-labels",
-            "user_data",
+        metadata = _required_oke_bootstrap_metadata(
+            getattr(launch_details, "metadata", None),
+            source="Source Instance Configuration",
         )
-        missing_metadata = [
-            key for key in required_metadata if not metadata.get(key)
-        ]
-        if missing_metadata:
-            raise OciDiscoveryError(
-                "Source Instance Configuration is missing required OKE bootstrap "
-                f"metadata: {', '.join(missing_metadata)}"
-            )
         source_cni = (
             "OCI_VCN_IP_NATIVE"
             if _metadata_truthy(metadata.get("oke-native-pod-networking"))
@@ -3884,8 +3935,89 @@ def _managed_node_pool_create_preview(
             "max_pods_per_node",
             None,
         ),
+        "worker_bootstrap": _worker_bootstrap_preview(details.node_metadata),
         "storage": _storage_preview(spec),
     }
+
+
+def _string_metadata(value: Any, *, source: str) -> dict[str, str]:
+    metadata = dict(value or {})
+    invalid = sorted(
+        str(key)
+        for key, item in metadata.items()
+        if not isinstance(key, str) or not isinstance(item, str)
+    )
+    if invalid:
+        raise OciDiscoveryError(
+            f"{source} contains non-string metadata values: {', '.join(invalid)}."
+        )
+    return metadata
+
+
+def _worker_bootstrap_preview(metadata: Mapping[str, str]) -> dict[str, Any]:
+    try:
+        return summarize_worker_bootstrap(metadata)
+    except BootstrapCompositionError as exc:
+        raise OciDiscoveryError(
+            f"Worker cloud-init cannot be inspected safely: {exc}"
+        ) from exc
+
+
+def _required_oke_bootstrap_metadata(
+    value: Any,
+    *,
+    source: str,
+) -> dict[str, str]:
+    metadata = _string_metadata(value, source=source)
+    required = (
+        "apiserver_host",
+        "cluster_ca_cert",
+        "oke-initial-node-labels",
+        "user_data",
+    )
+    missing = [key for key in required if not metadata.get(key)]
+    if missing:
+        raise OciDiscoveryError(
+            f"{source} is missing required OKE bootstrap metadata: "
+            f"{', '.join(missing)}"
+        )
+    return metadata
+
+
+def _merge_legacy_bootstrap_metadata(
+    managed_metadata: Mapping[str, str],
+    legacy_metadata: Mapping[str, str],
+) -> dict[str, str]:
+    current = _string_metadata(
+        managed_metadata,
+        source="Managed OKE source pool",
+    )
+    legacy = _required_oke_bootstrap_metadata(
+        legacy_metadata,
+        source="Legacy bootstrap source Instance Configuration",
+    )
+    for key in _CLUSTER_IDENTITY_METADATA_KEYS:
+        current_value = current.get(key)
+        legacy_value = legacy.get(key)
+        if current_value and legacy_value and current_value != legacy_value:
+            raise OciDiscoveryError(
+                "Legacy bootstrap source does not belong to the same OKE cluster: "
+                f"{key} differs from the managed source pool."
+            )
+
+    merged = dict(current)
+    for key in _CLUSTER_IDENTITY_METADATA_KEYS:
+        if not merged.get(key) and legacy.get(key):
+            merged[key] = legacy[key]
+    merged.update(
+        {
+            key: value
+            for key, value in legacy.items()
+            if key not in _MANAGED_BOOTSTRAP_AUTHORITY_KEYS
+        }
+    )
+    merged["user_data"] = legacy["user_data"]
+    return merged
 
 
 def _requires_user_data_composition(spec: PoolCreateSpec) -> bool:

@@ -26,6 +26,7 @@ from oke_hpc_mgmt.workflows.lifecycle import (
     IAC_CREATE_DRIFT_WARNING,
     IAC_DRIFT_WARNING,
     INSTANCE_CONFIGURATION_DERIVATION_NOTICE,
+    LEGACY_BOOTSTRAP_INHERITANCE_NOTICE,
     WorkflowError,
     WorkflowNotFound,
     execute_node_boot_volume_replace,
@@ -1011,6 +1012,175 @@ class LifecycleWorkflowTests(unittest.TestCase):
             1,
             spec,
         )
+
+    def test_managed_rdma_can_inherit_bootstrap_from_legacy_rdma_pool(self):
+        legacy_rdma = WorkerPoolInfo(
+            name="oke-rdma",
+            kind="cluster-network",
+            cluster_network_id="cluster-network-1",
+            instance_pool_id="instance-pool-1",
+            shape="BM.GPU4.8",
+            gpu_resource="nvidia.com/gpu",
+            rdma_enabled=True,
+        )
+        gpu = WorkerPoolInfo(
+            name="oke-gpu",
+            kind="node-pool",
+            node_pool_id="node-pool-gpu",
+            shape="VM.GPU.A10.1",
+            gpu_resource="nvidia.com/gpu",
+        )
+        service = _service(DiscoverySnapshot(pools=[legacy_rdma, gpu]))
+        backend = service.oci_backend.return_value
+        planned_metadata = {"user_data": "reviewed-cloud-init"}
+        runtime_metadata = dict(planned_metadata)
+        backend.get_cluster_network_pool_bootstrap_metadata.side_effect = [
+            planned_metadata,
+            runtime_metadata,
+        ]
+        backend.create_managed_node_pool.return_value = (
+            ManagedNodePoolCreateResult(
+                node_pool_id="node-pool-new",
+                work_request_id="work-request-new",
+                compute_cluster_id="compute-cluster-target",
+            )
+        )
+        spec = PoolCreateSpec(
+            pool_type="rdma",
+            rdma_mode="compute-cluster",
+            compute_cluster_id="compute-cluster-target",
+            shape="BM.GPU4.8",
+        )
+
+        prepared = prepare_pool_create(
+            service,
+            "rdma-managed",
+            2,
+            spec=spec,
+            source_identifier="oke-gpu",
+            bootstrap_source_identifier="oke-rdma",
+        )
+        result = execute_pool_create(service, prepared, lock=False)
+
+        self.assertEqual(legacy_rdma, prepared.bootstrap_source_pool)
+        self.assertEqual(
+            "oke-rdma",
+            prepared.plan.details["bootstrap_source_pool"],
+        )
+        bootstrap_summary = prepared.plan.details["effective"][
+            "bootstrap_source"
+        ]
+        self.assertEqual("oke-rdma", bootstrap_summary["pool"])
+        self.assertRegex(
+            bootstrap_summary["user_data_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertIn(
+            LEGACY_BOOTSTRAP_INHERITANCE_NOTICE,
+            prepared.plan.warnings,
+        )
+        self.assertEqual(2, backend.get_cluster_network_pool_bootstrap_metadata.call_count)
+        backend.preview_managed_node_pool_create.assert_any_call(
+            "node-pool-gpu",
+            "cluster-1",
+            "compartment-1",
+            "rdma-managed",
+            2,
+            spec,
+            bootstrap_metadata=planned_metadata,
+        )
+        self.assertEqual(
+            runtime_metadata,
+            backend.create_managed_node_pool.call_args.kwargs[
+                "bootstrap_metadata"
+            ],
+        )
+        self.assertEqual(2, backend.create_managed_node_pool.call_args.args[4])
+        self.assertEqual("submitted", result["status"])
+
+    def test_managed_rdma_rejects_bootstrap_change_after_planning(self):
+        legacy_rdma = WorkerPoolInfo(
+            name="oke-rdma",
+            kind="cluster-network",
+            cluster_network_id="cluster-network-1",
+            instance_pool_id="instance-pool-1",
+            shape="BM.GPU4.8",
+            gpu_resource="nvidia.com/gpu",
+            rdma_enabled=True,
+        )
+        gpu = WorkerPoolInfo(
+            name="oke-gpu",
+            kind="node-pool",
+            node_pool_id="node-pool-gpu",
+            shape="VM.GPU.A10.1",
+            gpu_resource="nvidia.com/gpu",
+        )
+        service = _service(DiscoverySnapshot(pools=[legacy_rdma, gpu]))
+        backend = service.oci_backend.return_value
+        backend.get_cluster_network_pool_bootstrap_metadata.side_effect = [
+            {"user_data": "reviewed-cloud-init"},
+            {"user_data": "changed-cloud-init"},
+        ]
+        spec = PoolCreateSpec(
+            pool_type="rdma",
+            rdma_mode="compute-cluster",
+            compute_cluster_id="compute-cluster-target",
+            shape="BM.GPU4.8",
+        )
+        prepared = prepare_pool_create(
+            service,
+            "rdma-managed",
+            2,
+            spec=spec,
+            source_identifier="oke-gpu",
+            bootstrap_source_identifier="oke-rdma",
+        )
+
+        with self.assertRaisesRegex(
+            WorkflowError,
+            "changed after planning",
+        ):
+            execute_pool_create(service, prepared, lock=False)
+
+        backend.preview_managed_node_pool_create.assert_called_once()
+        backend.create_managed_node_pool.assert_not_called()
+
+    def test_legacy_bootstrap_source_requires_managed_compute_cluster_target(self):
+        legacy_rdma = WorkerPoolInfo(
+            name="oke-rdma",
+            kind="cluster-network",
+            cluster_network_id="cluster-network-1",
+            instance_pool_id="instance-pool-1",
+        )
+        gpu = WorkerPoolInfo(
+            name="oke-gpu",
+            kind="node-pool",
+            node_pool_id="node-pool-gpu",
+            gpu_resource="nvidia.com/gpu",
+        )
+        service = _service(DiscoverySnapshot(pools=[legacy_rdma, gpu]))
+
+        with self.assertRaisesRegex(WorkflowError, "valid only"):
+            prepare_pool_create(
+                service,
+                "gpu-batch",
+                1,
+                spec=PoolCreateSpec(pool_type="gpu"),
+                bootstrap_source_identifier="oke-rdma",
+            )
+        with self.assertRaisesRegex(WorkflowError, "Cluster Network-backed"):
+            prepare_pool_create(
+                service,
+                "rdma-managed",
+                1,
+                spec=PoolCreateSpec(
+                    pool_type="rdma",
+                    rdma_mode="compute-cluster",
+                    shape="BM.GPU4.8",
+                ),
+                source_identifier="oke-gpu",
+                bootstrap_source_identifier="oke-gpu",
+            )
 
     def test_managed_rdma_prefers_existing_compute_cluster_template(self):
         gpu = WorkerPoolInfo(

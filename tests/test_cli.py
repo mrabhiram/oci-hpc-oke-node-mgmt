@@ -732,6 +732,8 @@ class CliTests(unittest.TestCase):
                     "2",
                     "--from-pool",
                     "oke-rdma",
+                    "--bootstrap-from-pool",
+                    "legacy-rdma",
                     "--compute-cluster-id",
                     "compute-cluster-target",
                     "--host-group-id",
@@ -748,6 +750,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual("compute-cluster-target", spec.compute_cluster_id)
         self.assertEqual("host-group-1", spec.host_group_id)
         self.assertFalse(spec.creates_compute_cluster)
+        self.assertEqual(
+            "legacy-rdma",
+            prepare.call_args.kwargs["bootstrap_source_identifier"],
+        )
 
     def test_pool_create_rejects_storage_without_composition_mode(self):
         result = self.runner.invoke(

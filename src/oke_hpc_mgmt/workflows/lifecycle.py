@@ -10,6 +10,10 @@ from oke_hpc_mgmt.backends.oci import (
     BootVolumeAttachmentPending,
     OciBackend,
 )
+from oke_hpc_mgmt.bootstrap import (
+    BootstrapCompositionError,
+    summarize_worker_bootstrap,
+)
 from oke_hpc_mgmt.discovery import DiscoveryService
 from oke_hpc_mgmt.models import (
     ClusterNetworkCreateResult,
@@ -55,6 +59,11 @@ HOST_GROUP_IAM_NOTICE = (
     "OKE requires a node-pool resource-principal policy granting "
     "HOST_GROUP_LAUNCH_INSTANCE on the selected Compute Host Group."
 )
+LEGACY_BOOTSTRAP_INHERITANCE_NOTICE = (
+    "The managed pool will execute cloud-init inherited from a legacy RDMA "
+    "Instance Configuration. Current managed OKE cluster identity, CNI, version, "
+    "networking, and lifecycle settings remain authoritative."
+)
 
 
 class WorkflowError(RuntimeError):
@@ -92,6 +101,8 @@ class PreparedPoolCreate:
     count: int
     spec: PoolCreateSpec
     plan: OperationPlan
+    bootstrap_source_pool: WorkerPoolInfo | None = None
+    bootstrap_source_metadata: tuple[tuple[str, str], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +158,7 @@ def prepare_pool_create(
     count: int,
     spec: PoolCreateSpec | None = None,
     source_identifier: str | None = None,
+    bootstrap_source_identifier: str | None = None,
 ) -> PreparedPoolCreate:
     spec = spec or PoolCreateSpec(pool_type="rdma")
     try:
@@ -172,6 +184,12 @@ def prepare_pool_create(
     _ensure_pool_name_available(snapshot, normalized_name)
 
     source_pool = _select_pool_template(snapshot, spec, source_identifier)
+    bootstrap_source_pool = _select_legacy_bootstrap_template(
+        snapshot,
+        spec,
+        bootstrap_source_identifier,
+    )
+    bootstrap_source_metadata: tuple[tuple[str, str], ...] | None = None
     backend = service.oci_backend()
     steps: tuple[str, ...]
     if not spec.managed:
@@ -205,6 +223,18 @@ def prepare_pool_create(
                 f"Source pool is missing its managed OKE node-pool OCID: "
                 f"{source_pool.name}"
             )
+        bootstrap_metadata: dict[str, str] | None = None
+        if bootstrap_source_pool is not None:
+            bootstrap_metadata = _load_legacy_bootstrap_metadata(
+                backend,
+                bootstrap_source_pool,
+            )
+            bootstrap_source_metadata = tuple(sorted(bootstrap_metadata.items()))
+        preview_kwargs = (
+            {"bootstrap_metadata": bootstrap_metadata}
+            if bootstrap_metadata is not None
+            else {}
+        )
         effective = backend.preview_managed_node_pool_create(
             source_pool.node_pool_id,
             target.cluster_id,
@@ -212,13 +242,29 @@ def prepare_pool_create(
             normalized_name,
             count,
             spec,
+            **preview_kwargs,
         )
+        if bootstrap_source_pool is not None and bootstrap_metadata is not None:
+            effective = dict(effective)
+            effective["bootstrap_source"] = {
+                "pool": bootstrap_source_pool.name,
+                **_legacy_bootstrap_summary(
+                    bootstrap_source_pool,
+                    bootstrap_metadata,
+                ),
+            }
         owner = "oke+compute" if spec.creates_compute_cluster else "oke"
         managed_steps = [
             f"derive a managed OKE node-pool request from {source_pool.name}",
             "apply requested shape, image, placement, networking, and bootstrap overrides",
             "retarget Kubernetes labels, metadata, tags, and node lifecycle settings",
         ]
+        if bootstrap_source_pool is not None:
+            managed_steps.insert(
+                1,
+                "inherit legacy RDMA cloud-init and supported bootstrap metadata "
+                f"from {bootstrap_source_pool.name}",
+            )
         if spec.creates_compute_cluster:
             managed_steps.append(
                 "create and wait for a dedicated Compute Cluster"
@@ -250,6 +296,15 @@ def prepare_pool_create(
         warnings.append(COMPUTE_CLUSTER_IAM_NOTICE)
     if spec.host_group_id:
         warnings.append(HOST_GROUP_IAM_NOTICE)
+    if bootstrap_source_pool is not None:
+        warnings.append(LEGACY_BOOTSTRAP_INHERITANCE_NOTICE)
+    details: dict[str, object] = {
+        "source_pool": source_pool.name,
+        "requested": spec.as_dict(),
+        "effective": effective,
+    }
+    if bootstrap_source_pool is not None:
+        details["bootstrap_source_pool"] = bootstrap_source_pool.name
     plan = OperationPlan(
         operation="pool-create",
         target=normalized_name,
@@ -259,11 +314,7 @@ def prepare_pool_create(
         target_size=count,
         steps=steps,
         warnings=tuple(warnings),
-        details={
-            "source_pool": source_pool.name,
-            "requested": spec.as_dict(),
-            "effective": effective,
-        },
+        details=details,
     )
     return PreparedPoolCreate(
         snapshot=snapshot,
@@ -272,6 +323,8 @@ def prepare_pool_create(
         count=count,
         spec=spec,
         plan=plan,
+        bootstrap_source_pool=bootstrap_source_pool,
+        bootstrap_source_metadata=bootstrap_source_metadata,
     )
 
 
@@ -334,6 +387,33 @@ def execute_pool_create(
                 _require_enhanced_cluster(
                     backend.get_cluster_type(target.cluster_id)
                 )
+            runtime_bootstrap_metadata: dict[str, str] | None = None
+            if prepared.bootstrap_source_pool is not None:
+                current_bootstrap_source = current_snapshot.pool_by_name(
+                    prepared.bootstrap_source_pool.backing_id or ""
+                )
+                if current_bootstrap_source is None:
+                    raise WorkflowError(
+                        "Legacy bootstrap source changed after planning: "
+                        f"{prepared.bootstrap_source_pool.name}"
+                    )
+                runtime_bootstrap_metadata = _load_legacy_bootstrap_metadata(
+                    backend,
+                    current_bootstrap_source,
+                )
+                if tuple(sorted(runtime_bootstrap_metadata.items())) != (
+                    prepared.bootstrap_source_metadata
+                ):
+                    raise WorkflowError(
+                        "Legacy bootstrap source changed after planning: "
+                        f"{prepared.bootstrap_source_pool.name}. Rerun the command "
+                        "to review and confirm the current bootstrap."
+                    )
+            preview_kwargs = (
+                {"bootstrap_metadata": runtime_bootstrap_metadata}
+                if runtime_bootstrap_metadata is not None
+                else {}
+            )
             effective = backend.preview_managed_node_pool_create(
                 current_source.node_pool_id,
                 target.cluster_id,
@@ -341,6 +421,7 @@ def execute_pool_create(
                 prepared.name,
                 prepared.count,
                 prepared.spec,
+                **preview_kwargs,
             )
             runtime_spec = prepared.spec
             created_compute_cluster_id: str | None = None
@@ -385,14 +466,25 @@ def execute_pool_create(
                     compute_cluster_compartment_id=None,
                 )
             try:
-                created = backend.create_managed_node_pool(
-                    current_source.node_pool_id,
-                    target.cluster_id,
-                    target.compartment_id,
-                    prepared.name,
-                    prepared.count,
-                    runtime_spec,
-                )
+                if runtime_bootstrap_metadata is None:
+                    created = backend.create_managed_node_pool(
+                        current_source.node_pool_id,
+                        target.cluster_id,
+                        target.compartment_id,
+                        prepared.name,
+                        prepared.count,
+                        runtime_spec,
+                    )
+                else:
+                    created = backend.create_managed_node_pool(
+                        current_source.node_pool_id,
+                        target.cluster_id,
+                        target.compartment_id,
+                        prepared.name,
+                        prepared.count,
+                        runtime_spec,
+                        bootstrap_metadata=runtime_bootstrap_metadata,
+                    )
             except Exception as exc:
                 if created_compute_cluster_id:
                     raise WorkflowError(
@@ -2452,6 +2544,60 @@ def _select_pool_template(
         f"Multiple {pool_type} pool templates are available. Select one with "
         f"--from-pool: {names}"
     )
+
+
+def _select_legacy_bootstrap_template(
+    snapshot: DiscoverySnapshot,
+    spec: PoolCreateSpec,
+    identifier: str | None,
+) -> WorkerPoolInfo | None:
+    if not identifier:
+        return None
+    if not spec.uses_compute_cluster:
+        raise WorkflowError(
+            "--bootstrap-from-pool is valid only with --type rdma "
+            "--rdma-mode compute-cluster."
+        )
+    pool = snapshot.pool_by_name(identifier)
+    if pool is None:
+        raise WorkflowNotFound(f"Legacy bootstrap source pool not found: {identifier}")
+    if (
+        pool.kind != "cluster-network"
+        or not pool.cluster_network_id
+        or not pool.instance_pool_id
+    ):
+        raise WorkflowError(
+            "Legacy bootstrap source must be a Cluster Network-backed RDMA pool: "
+            f"{pool.name}"
+        )
+    return pool
+
+
+def _load_legacy_bootstrap_metadata(
+    backend: OciBackend,
+    pool: WorkerPoolInfo,
+) -> dict[str, str]:
+    if not pool.cluster_network_id or not pool.instance_pool_id:
+        raise WorkflowError(
+            "Legacy bootstrap source is missing Cluster Network identifiers: "
+            f"{pool.name}"
+        )
+    return backend.get_cluster_network_pool_bootstrap_metadata(
+        pool.cluster_network_id,
+        pool.instance_pool_id,
+    )
+
+
+def _legacy_bootstrap_summary(
+    pool: WorkerPoolInfo,
+    metadata: dict[str, str],
+) -> dict[str, object]:
+    try:
+        return summarize_worker_bootstrap(metadata)
+    except BootstrapCompositionError as exc:
+        raise WorkflowError(
+            f"Legacy bootstrap source {pool.name} cannot be inspected safely: {exc}"
+        ) from exc
 
 
 def _pool_matches_create_type(

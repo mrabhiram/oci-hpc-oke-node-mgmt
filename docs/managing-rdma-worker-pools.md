@@ -81,6 +81,29 @@ Apply by replacing `--dry-run --format json` with `--wait`. OKE owns the new
 node pool after creation, so resize and specific-node operations continue
 through OKE rather than through an internal Instance Pool.
 
+When the existing FSS, Lustre, NVMe RAID, or custom bootstrap is stored in a
+legacy `oke-rdma` Instance Configuration, import it explicitly while retaining
+`oke-gpu` as the managed OKE template:
+
+```bash
+mgmt-oke --auth instance_principal pools create oke-rdma-managed \
+  --type rdma \
+  --rdma-mode compute-cluster \
+  --count 2 \
+  --from-pool oke-gpu \
+  --bootstrap-from-pool oke-rdma \
+  --availability-domain <availability-domain> \
+  --shape BM.GPU4.8 \
+  --compute-cluster-name oke-rdma-managed-cc \
+  --dry-run \
+  --format json
+```
+
+The managed source controls current OKE identity, CNI, networking, version, and
+lifecycle fields. The legacy source contributes its complete `user_data`,
+supported bootstrap hooks, and non-reserved custom metadata. The dry run fails
+if the sources expose different OKE endpoints or cluster CA values.
+
 ## Create A Legacy Cluster Network RDMA Pool
 
 Create a second self-managed Cluster Network pool from the existing `oke-rdma`

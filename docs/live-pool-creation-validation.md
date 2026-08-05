@@ -184,6 +184,171 @@ subnet, NSGs, boot-volume size, maximum pods, and OKE bootstrap settings. Those
 resource identifiers are omitted here rather than replaced with realistic
 OCIDs.
 
+### Legacy Bootstrap Migration Preview
+
+The following fresh live dry-run was captured on 2026-08-04 against the real
+managed `oke-gpu` source and self-managed `oke-rdma` source. The managed source
+provides the OKE node-pool, Kubernetes, networking, and lifecycle settings. The
+legacy source provides the existing RDMA cloud-init and supported bootstrap
+metadata:
+
+```bash
+mgmt-oke pools create rdma-managed-bootstrap-preview \
+  --type rdma \
+  --rdma-mode compute-cluster \
+  --count 2 \
+  --from-pool oke-gpu \
+  --bootstrap-from-pool oke-rdma \
+  --availability-domain UK-LONDON-1-AD-3 \
+  --shape BM.GPU4.8 \
+  --compute-cluster-name rdma-managed-bootstrap-preview-cc \
+  --dry-run \
+  --format json
+```
+
+Sanitized output excerpt:
+
+```json
+[
+  {
+    "details": {
+      "bootstrap_source_pool": "oke-rdma",
+      "effective": {
+        "backend": "oke-node-pool",
+        "bootstrap_source": {
+          "bootstrap_hook_keys": [],
+          "decoded_bytes": 4184,
+          "oke_bootstrap_detected": true,
+          "pool": "oke-rdma",
+          "storage_scripts_detected": ["oke-nvme-raid.sh"],
+          "user_data_sha256": "<sha256>"
+        },
+        "compute_cluster_action": "create",
+        "count": 2,
+        "placement": "compute-cluster",
+        "shape": "BM.GPU4.8",
+        "worker_bootstrap": {
+          "bootstrap_hook_keys": [],
+          "decoded_bytes": 4184,
+          "oke_bootstrap_detected": true,
+          "storage_scripts_detected": ["oke-nvme-raid.sh"],
+          "user_data_sha256": "<sha256>"
+        }
+      },
+      "source_pool": "oke-gpu"
+    },
+    "operation": "pool-create",
+    "owner": "oke+compute",
+    "pool": "rdma-managed-bootstrap-preview",
+    "status": "planned",
+    "target_size": 2
+  }
+]
+```
+
+The matching byte count, script inventory, and digest show that the final
+managed-worker payload retained the source cloud-init exactly. The live legacy
+source contained the OKE worker bootstrap and NVMe RAID script; it did not
+contain FSS or Lustre configuration.
+
+The same sources were then previewed in append mode with example FSS and Lustre
+endpoints:
+
+```bash
+mgmt-oke pools create rdma-managed-storage-preview \
+  --type rdma \
+  --rdma-mode compute-cluster \
+  --count 2 \
+  --from-pool oke-gpu \
+  --bootstrap-from-pool oke-rdma \
+  --availability-domain UK-LONDON-1-AD-3 \
+  --shape BM.GPU4.8 \
+  --compute-cluster-name rdma-managed-storage-preview-cc \
+  --storage-mode append \
+  --fss-mount-target-ip 10.0.0.5 \
+  --fss-export-path /training \
+  --fss-mount-path /mnt/oci-fss \
+  --lustre-management-address 10.0.0.6 \
+  --lustre-filesystem-name training \
+  --lustre-mount-path /mnt/oci-lustre \
+  --dry-run \
+  --format json
+```
+
+Sanitized output excerpt:
+
+```json
+[
+  {
+    "details": {
+      "bootstrap_source_pool": "oke-rdma",
+      "effective": {
+        "bootstrap_source": {
+          "decoded_bytes": 4184,
+          "oke_bootstrap_detected": true,
+          "storage_scripts_detected": ["oke-nvme-raid.sh"],
+          "user_data_sha256": "<source-sha256>"
+        },
+        "count": 2,
+        "storage": {
+          "fss_mounts": [
+            {
+              "export_path": "/training",
+              "mount_path": "/mnt/oci-fss",
+              "mount_target_ip": "10.0.0.5"
+            }
+          ],
+          "lustre_mounts": [
+            {
+              "filesystem_name": "training",
+              "management_address": "10.0.0.6",
+              "mount_path": "/mnt/oci-lustre"
+            }
+          ],
+          "mode": "append",
+          "nvme_raid": null
+        },
+        "worker_bootstrap": {
+          "decoded_bytes": 10628,
+          "oke_bootstrap_detected": true,
+          "storage_scripts_detected": [
+            "oke-nvme-raid.sh",
+            "oke-fss-mount.sh",
+            "oke-lustre-mount.sh"
+          ],
+          "user_data_sha256": "<composed-sha256>"
+        }
+      },
+      "source_pool": "oke-gpu"
+    },
+    "operation": "pool-create",
+    "pool": "rdma-managed-storage-preview",
+    "status": "planned",
+    "target_size": 2
+  }
+]
+```
+
+This proves live source discovery, dual-source validation, request construction,
+and cloud-init composition. The FSS and Lustre addresses above are documentation
+examples; no workers were created and no mounts were attempted by either
+`--dry-run`. The final capacity check returned:
+
+```json
+[
+  {
+    "available_count": 0,
+    "fault_domain": null,
+    "shape": "BM.GPU4.8",
+    "status": "OUT_OF_HOST_CAPACITY"
+  }
+]
+```
+
+The legacy source remained healthy at desired, active, and Ready capacity
+`1/1/1`. A two-worker mutation, runtime storage verification, and restoration
+of that source to its normal size of two remain pending sufficient capacity.
+
 ### Initial Capacity Failure
 
 The first mutation used the reviewed request with `--wait --yes`. The dedicated

@@ -284,6 +284,33 @@ Verify that the OKE node-pool resource principal has
 `COMPUTE_CLUSTER_LAUNCH_INSTANCE` and, when a Host Group is selected,
 `HOST_GROUP_LAUNCH_INSTANCE` permission for the placement resource.
 
+## Legacy Bootstrap Inheritance Is Refused
+
+`--bootstrap-from-pool` accepts only a legacy Cluster Network-backed RDMA pool
+and only for managed Compute Cluster RDMA creation. Review both sources:
+
+```bash
+mgmt-oke pools get <managed-source-pool> --format json
+mgmt-oke pools get <legacy-bootstrap-source-pool> --format json
+mgmt-oke pools create <new-rdma-pool> \
+  --type rdma \
+  --rdma-mode compute-cluster \
+  --count 1 \
+  --from-pool <managed-source-pool> \
+  --bootstrap-from-pool <legacy-bootstrap-source-pool> \
+  --availability-domain <availability-domain> \
+  --shape <rdma-capable-bare-metal-gpu-shape> \
+  --dry-run \
+  --format json
+```
+
+The legacy Instance Configuration must expose `apiserver_host`,
+`cluster_ca_cert`, `oke-initial-node-labels`, and `user_data`. If endpoint or CA
+values differ from those exposed by the managed source, the tool treats the
+sources as belonging to different OKE clusters and refuses creation. Select
+sources from the same deployment or update the source pool through the stack
+before retrying.
+
 ## Managed RDMA Creation Is Out Of Host Capacity
 
 `Out of host capacity` is an OCI placement result, not a client validation

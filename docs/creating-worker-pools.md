@@ -32,6 +32,12 @@ When creating the first such pool, a regular managed GPU source such as
 `oke-gpu` is eligible; specify an RDMA-capable shape and, when needed, a
 compatible image override.
 
+The managed source and bootstrap source can be separated during migration from
+legacy RDMA. `--from-pool` selects the managed OKE node-pool template;
+`--bootstrap-from-pool` selects a legacy Cluster Network pool whose cloud-init,
+bootstrap hooks, and non-reserved custom metadata are carried into the new
+managed pool. The two pools must belong to the same OKE cluster.
+
 ## Managed CPU Pool
 
 Preview a Flex CPU pool:
@@ -115,6 +121,43 @@ dedicated Compute Cluster, waits for `ACTIVE`, and then submits OKE
 `CreateNodePool` with its OCID. Use
 `--compute-cluster-compartment-id <ocid>` to create that placement resource in
 another accessible compartment.
+
+### Inherit Legacy RDMA Bootstrap
+
+Use a managed source for OKE node-pool configuration and a legacy RDMA source
+for existing FSS, Lustre, NVMe RAID, and custom worker bootstrap:
+
+```bash
+mgmt-oke pools create rdma-managed \
+  --type rdma \
+  --rdma-mode compute-cluster \
+  --count 2 \
+  --from-pool oke-gpu \
+  --bootstrap-from-pool oke-rdma \
+  --availability-domain <availability-domain> \
+  --shape BM.GPU4.8 \
+  --compute-cluster-name rdma-managed-cc \
+  --dry-run \
+  --format json
+```
+
+The legacy Instance Configuration is read during planning and again under the
+mutation Lease. If its metadata changed after planning, creation stops and a
+new preview is required. Its complete `user_data`, `pre_oke`, `post_oke`,
+`kubelet-extra-args`, and non-reserved custom metadata are eligible for
+inheritance. Current values from the managed source remain authoritative for:
+
+- API endpoint and cluster CA
+- Kubernetes version and initial labels
+- CNI, pod subnets, pod NSGs, and maximum pods
+- managed placement, image, worker networking, cycling, and eviction settings
+
+If both sources expose different API endpoints or cluster CA values, creation
+fails before mutation. `--storage-mode inherit` preserves the imported
+`user_data`; `append` or `replace` composes reviewed storage changes onto it.
+The dry-run reports the decoded byte count, SHA-256 fingerprint, detected
+official OKE and storage scripts, and configured bootstrap hook keys without
+printing cloud-init contents.
 
 Use an existing Compute Cluster instead:
 
@@ -259,6 +302,7 @@ Dry-run performs live, read-only validation before producing a plan:
 - availability-domain-scoped subnet compatibility
 - CNI compatibility with the source OKE bootstrap
 - required OKE cloud-init and registration metadata
+- legacy bootstrap source type, required metadata, and matching OKE cluster
 - backend-specific option compatibility
 
 `--dry-run` makes no OCI or Kubernetes mutation. The plan contains separate

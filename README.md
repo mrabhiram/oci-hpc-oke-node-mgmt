@@ -26,6 +26,9 @@ management for OCI HPC OKE clusters:
   lifecycle state, availability domain, and shape or platform target `[Implemented]`
 - compose the official OCI HPC OKE worker bootstrap for existing FSS and Lustre
   mounts and local NVMe RAID `[Implemented]`
+- carry legacy Cluster Network RDMA cloud-init and storage bootstrap into a
+  managed Compute Cluster pool while retaining current managed OKE identity,
+  CNI, version, networking, and lifecycle settings `[Implemented]`
 - discover control-plane, virtual-pool, declared worker, and actual kubelet
   versions together with OKE-advertised upgrade targets `[Implemented]`
 - resolve a minor target to the latest supported production patch and validate
@@ -183,6 +186,7 @@ Pool creation options:
 | `--compute-cluster-compartment-id <ocid>` | Create the dedicated Compute Cluster in another accessible compartment. Default: the discovered OKE compartment. |
 | `--host-group-id <ocid>` | Place a managed pool through an existing Compute Host Group. A single ID requires one selected AD. |
 | `--from-pool <pool>` | Select the source template. If omitted, the matching conventional pool (`oke-cpu`, `oke-gpu`, or `oke-rdma`) is used when present; otherwise the only eligible pool is used. |
+| `--bootstrap-from-pool <legacy-rdma-pool>` | For managed Compute Cluster RDMA creation, inherit cloud-init, bootstrap hooks, and non-reserved custom metadata from a legacy Cluster Network pool. |
 | `--image-id`, `--shape`, `--availability-domain`, `--subnet-id` | Override the inherited worker image, shape, placement, or primary subnet. Availability domains accept canonical or display-form names. |
 | `--pod-subnet-id`, `--node-nsg-id`, `--pod-nsg-id` | Override worker and VCN-native pod networking. Repeat where supported. |
 | `--boot-volume-*`, `--ocpus`, `--memory-in-gbs` | Override boot-volume and Flex-shape settings. |
@@ -391,6 +395,29 @@ mgmt-oke pools create rdma-managed \
   --dry-run
 ```
 
+To retain FSS, Lustre, NVMe RAID, or other bootstrap from an existing legacy
+RDMA pool while using a managed GPU pool as the OKE API template, add:
+
+```bash
+mgmt-oke pools create rdma-managed \
+  --type rdma \
+  --rdma-mode compute-cluster \
+  --count 2 \
+  --from-pool oke-gpu \
+  --bootstrap-from-pool oke-rdma \
+  --availability-domain <availability-domain> \
+  --shape BM.GPU4.8 \
+  --compute-cluster-name rdma-managed-cc \
+  --dry-run \
+  --format json
+```
+
+The managed source remains authoritative for the current cluster endpoint, CA,
+CNI, Kubernetes version, pod networking, cycling, and eviction
+configuration. The legacy source supplies `user_data`, supported bootstrap
+hooks, and non-reserved custom metadata. Conflicting cluster identity metadata
+is rejected before OCI mutation.
+
 Use an existing Compute Cluster and Compute Host Group by adding
 `--compute-cluster-id <compute-cluster-ocid>` and
 `--host-group-id <host-group-ocid>`. The cluster must be enhanced, both
@@ -415,9 +442,11 @@ mgmt-oke pools create rdma-training \
 Creation always inherits a working OKE bootstrap from a matching source pool.
 CPU, GPU, and compute-cluster RDMA use OKE `CreateNodePool`; the first managed
 RDMA pool can use a managed GPU source, and later pools prefer an existing
-managed RDMA source. Legacy RDMA derives an Instance Configuration and uses
-Compute Management `CreateClusterNetwork`. Apply a reviewed plan by removing
-`--dry-run`, adding `--wait`, and completing the typed confirmation.
+managed RDMA source. `--bootstrap-from-pool` explicitly bridges legacy RDMA
+cloud-init into that managed request without carrying stale cluster identity or
+network settings. Legacy RDMA derives an Instance Configuration and uses Compute
+Management `CreateClusterNetwork`. Apply a reviewed plan by removing `--dry-run`,
+adding `--wait`, and completing the typed confirmation.
 
 Delete a complete pool after reviewing its drain and ownership plan:
 

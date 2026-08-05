@@ -141,6 +141,23 @@ placement, shape, networking, boot, Kubernetes, lifecycle, metadata,
 cloud-init, FSS, Lustre, and NVMe settings are available. Unspecified values
 are inherited from the matching source.
 
+During migration from a legacy Cluster Network pool, retain the managed source
+for OKE-owned fields and add the legacy bootstrap source:
+
+```bash
+mgmt-oke pools create <managed-rdma-pool> \
+  --type rdma \
+  --rdma-mode compute-cluster \
+  --count 2 \
+  --from-pool <managed-gpu-or-rdma-source> \
+  --bootstrap-from-pool <legacy-cluster-network-pool> \
+  --availability-domain <availability-domain> \
+  --shape <rdma-capable-bare-metal-gpu-shape> \
+  --compute-cluster-name <new-compute-cluster-name> \
+  --dry-run \
+  --format json
+```
+
 | Placement option | Purpose |
 | --- | --- |
 | `--rdma-mode cluster-network\|compute-cluster` | Select legacy self-managed or managed OKE RDMA. Default: `cluster-network`. |
@@ -148,6 +165,7 @@ are inherited from the matching source.
 | `--compute-cluster-name <name>` | Name an automatically created Compute Cluster. |
 | `--compute-cluster-compartment-id <ocid>` | Select the compartment for automatic Compute Cluster creation. |
 | `--host-group-id <ocid>` | Use an existing `ACTIVE` Compute Host Group for the single selected placement. |
+| `--bootstrap-from-pool <pool>` | Import cloud-init, bootstrap hooks, and non-reserved custom metadata from a legacy Cluster Network RDMA pool into managed Compute Cluster creation. |
 | `--availability-domain <name>` | Select placement using a canonical tenancy-prefixed or display-form AD name. |
 
 See [Creating Worker Pools](./creating-worker-pools.md) and

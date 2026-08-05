@@ -315,6 +315,17 @@ bootstrap, CNI, pod networking, labels, tags, cycling, and eviction settings
 unless a dedicated option overrides them. The new pool name and identity labels
 are retargeted.
 
+Managed Compute Cluster migration can use a second, explicit legacy bootstrap
+source. `--bootstrap-from-pool` resolves a Cluster Network and embedded Instance
+Pool, reads its Instance Configuration, and validates the required OKE metadata.
+The workflow performs that lookup during planning and again under the mutation
+Lease. Any metadata change after planning aborts the operation and requires a
+new reviewed plan. It overlays legacy `user_data`, bootstrap hooks, and
+non-reserved custom metadata onto the managed request. Managed endpoint, CA, version, labels, CNI,
+pod networking, placement, and lifecycle fields remain authoritative. Mismatched
+endpoint or CA values fail before mutation, preventing a legacy template from a
+different OKE cluster from being executed.
+
 Managed RDMA validates that the OKE cluster is enhanced, resolves display-form
 AD names to canonical tenancy-prefixed values, requires one placement with no
 fault domains, and verifies that the shape/image advertises RDMA ports. An

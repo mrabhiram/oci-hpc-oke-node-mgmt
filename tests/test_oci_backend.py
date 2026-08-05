@@ -1045,6 +1045,108 @@ class OciBackendMutationTests(unittest.TestCase):
         self.assertEqual("compute-cluster-target", created.compute_cluster_id)
         self.assertEqual("host-group-1", created.host_group_id)
 
+    def test_managed_rdma_pool_inherits_legacy_bootstrap_without_stale_identity(self):
+        source = _managed_node_pool("VM.GPU.A10.1")
+        source.node_metadata.update(
+            {
+                "cluster_ca_cert": "current-certificate",
+                "oke-k8version": "v1.35.2",
+                "pod-subnets": "pod-subnet-source",
+                "managed-custom": "current",
+            }
+        )
+        backend = _backend(node_pools=[source])
+        backend._compute.compute_clusters["compute-cluster-target"] = (
+            SimpleNamespace(
+                id="compute-cluster-target",
+                display_name="target-cc",
+                availability_domain="AD-1",
+                compartment_id="compartment-1",
+                lifecycle_state="ACTIVE",
+            )
+        )
+        legacy_metadata = {
+            "apiserver_host": "10.0.0.1:6443",
+            "cluster_ca_cert": "current-certificate",
+            "oke-initial-node-labels": "stale=true",
+            "oke-k8version": "v1.34.1",
+            "pod-subnets": "stale-pod-subnet",
+            "user_data": "legacy-rdma-cloud-init",
+            "pre_oke": "legacy-pre-hook",
+            "legacy-custom": "preserved",
+        }
+        spec = PoolCreateSpec(
+            pool_type="rdma",
+            rdma_mode="compute-cluster",
+            compute_cluster_id="compute-cluster-target",
+            shape="BM.GPU4.8",
+        )
+
+        preview = backend.preview_managed_node_pool_create(
+            source.id,
+            "cluster-1",
+            "compartment-1",
+            "rdma-batch",
+            2,
+            spec,
+            bootstrap_metadata=legacy_metadata,
+        )
+        backend.create_managed_node_pool(
+            source.id,
+            "cluster-1",
+            "compartment-1",
+            "rdma-batch",
+            2,
+            spec,
+            bootstrap_metadata=legacy_metadata,
+        )
+
+        call = next(
+            item
+            for item in backend._container_engine.calls
+            if item[0] == "create_node_pool"
+        )
+        metadata = call[1].node_metadata
+        self.assertEqual("legacy-rdma-cloud-init", metadata["user_data"])
+        self.assertEqual("legacy-pre-hook", metadata["pre_oke"])
+        self.assertEqual("preserved", metadata["legacy-custom"])
+        self.assertEqual("current", metadata["managed-custom"])
+        self.assertEqual("v1.35.2", metadata["oke-k8version"])
+        self.assertEqual("pod-subnet-source", metadata["pod-subnets"])
+        self.assertNotEqual("stale=true", metadata.get("oke-initial-node-labels"))
+        self.assertEqual(2, call[1].node_config_details.size)
+        self.assertEqual(
+            len("legacy-rdma-cloud-init"),
+            preview["worker_bootstrap"]["decoded_bytes"],
+        )
+
+    def test_managed_rdma_pool_rejects_legacy_bootstrap_from_another_cluster(self):
+        source = _managed_node_pool("VM.GPU.A10.1")
+        source.node_metadata["cluster_ca_cert"] = "current-certificate"
+        backend = _backend(node_pools=[source])
+        spec = PoolCreateSpec(
+            pool_type="rdma",
+            rdma_mode="compute-cluster",
+            shape="BM.GPU4.8",
+        )
+        legacy_metadata = {
+            "apiserver_host": "another-cluster:6443",
+            "cluster_ca_cert": "another-certificate",
+            "oke-initial-node-labels": "pool=legacy",
+            "user_data": "legacy-rdma-cloud-init",
+        }
+
+        with self.assertRaisesRegex(OciDiscoveryError, "same OKE cluster"):
+            backend.preview_managed_node_pool_create(
+                source.id,
+                "cluster-1",
+                "compartment-1",
+                "rdma-batch",
+                2,
+                spec,
+                bootstrap_metadata=legacy_metadata,
+            )
+
     def test_managed_rdma_preview_plans_dedicated_compute_cluster(self):
         source = _managed_node_pool("BM.GPU4.8")
         source.name = "oke-rdma"
@@ -1336,7 +1438,7 @@ class OciBackendMutationTests(unittest.TestCase):
         source.node_config_details.placement_configs[0].fault_domains = []
         backend = _backend(node_pools=[source])
         backend._identity.availability_domains = [
-            SimpleNamespace(name="jLaG:UK-LONDON-1-AD-3")
+            SimpleNamespace(name="example:UK-LONDON-1-AD-3")
         ]
 
         preview = backend.preview_managed_node_pool_create(
@@ -1353,14 +1455,14 @@ class OciBackendMutationTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            ["jLaG:UK-LONDON-1-AD-3"],
+            ["example:UK-LONDON-1-AD-3"],
             preview["availability_domains"],
         )
 
     def test_availability_domain_resolution_rejects_unknown_alias(self):
         backend = _backend()
         backend._identity.availability_domains = [
-            SimpleNamespace(name="jLaG:UK-LONDON-1-AD-3")
+            SimpleNamespace(name="example:UK-LONDON-1-AD-3")
         ]
 
         with self.assertRaisesRegex(OciDiscoveryError, "was not found"):
@@ -1771,6 +1873,39 @@ class OciBackendMutationTests(unittest.TestCase):
         self.assertNotEqual(
             instance_config_kwargs["opc_retry_token"],
             kwargs["opc_retry_token"],
+        )
+
+    def test_reads_validated_bootstrap_metadata_from_cluster_network_pool(self):
+        source_pool = SimpleNamespace(
+            id="instance-pool-source",
+            instance_configuration_id="instance-configuration-source",
+        )
+        cluster_network = SimpleNamespace(
+            id="cluster-network-source",
+            compartment_id="compartment-1",
+            lifecycle_state="RUNNING",
+            instance_pools=[source_pool],
+            placement_configuration=SimpleNamespace(
+                availability_domain="UK-LONDON-1-AD-3",
+                placement_constraint="PACKED_DISTRIBUTION_MULTI_BLOCK",
+                primary_subnet_id="subnet-1",
+                primary_vnic_subnets=None,
+            ),
+        )
+        backend = _backend(cluster_network=cluster_network)
+
+        metadata = backend.get_cluster_network_pool_bootstrap_metadata(
+            "cluster-network-source",
+            "instance-pool-source",
+        )
+
+        self.assertEqual("cloud-init", metadata["user_data"])
+        self.assertEqual("certificate", metadata["cluster_ca_cert"])
+        metadata["user_data"] = "modified"
+        self.assertEqual(
+            "cloud-init",
+            backend._compute_mgmt.instance_configuration.instance_details
+            .launch_details.metadata["user_data"],
         )
         self.assertEqual(
             "oke-rdma",

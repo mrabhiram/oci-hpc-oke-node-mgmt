@@ -82,6 +82,14 @@ def pool_create_options(function: CommandFunction) -> CommandFunction:
             "source_identifier",
             help="Source pool whose proven OKE bootstrap and defaults are inherited.",
         ),
+        click.option(
+            "--bootstrap-from-pool",
+            "bootstrap_source_identifier",
+            help=(
+                "Legacy Cluster Network RDMA pool whose cloud-init and supported "
+                "bootstrap metadata are inherited by a managed Compute Cluster pool."
+            ),
+        ),
         click.option("--availability-domain", help="Target availability domain name."),
         click.option("--shape", help="OCI Compute shape override."),
         click.option("--image-id", help="Custom or platform image OCID override."),

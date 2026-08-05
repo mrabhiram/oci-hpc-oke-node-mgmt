@@ -235,7 +235,7 @@ these checks when the operator kubeconfig identifies one OKE cluster.
 The current mutating commands are:
 
 ```bash
-mgmt-oke pools create <name> --type <cpu|gpu|rdma> --count <n> [--rdma-mode <mode>] [--from-pool <pool>] [--dry-run] [--wait]
+mgmt-oke pools create <name> --type <cpu|gpu|rdma> --count <n> [--rdma-mode <mode>] [--from-pool <pool>] [--bootstrap-from-pool <legacy-rdma-pool>] [--dry-run] [--wait]
 mgmt-oke pools delete <pool> [--dry-run] [--wait]
 mgmt-oke pools resize <pool> (--size <n> | --delta <n>) [--dry-run] [--wait]
 mgmt-oke pools add <pool> --count <n> [--dry-run] [--wait]
@@ -263,6 +263,8 @@ Safety behavior:
 - Mutations acquire a Kubernetes Lease by default to prevent concurrent tool operations.
 - Pool creation inherits cluster bootstrap from a matching source and validates
   custom image, shape, placement, and network compatibility before submission.
+- Managed Compute Cluster creation can explicitly inherit legacy RDMA
+  cloud-init while preserving current managed OKE identity and network fields.
 - Whole-pool deletion drains by default and protects `oke-system`.
 - Waited deletion removes only derived Instance Configurations carrying the
   tool's ownership tag; stack-owned configurations are preserved.
@@ -334,6 +336,7 @@ mgmt-oke pools create rdma-managed \
   --rdma-mode compute-cluster \
   --count 1 \
   --from-pool oke-gpu \
+  --bootstrap-from-pool oke-rdma \
   --availability-domain <availability-domain> \
   --shape BM.GPU4.8 \
   --dry-run
@@ -347,7 +350,8 @@ mgmt-oke pools create rdma-training \
 CPU, GPU, and compute-cluster RDMA submit OKE `CreateNodePool`; managed RDMA
 first validates or creates its Compute Cluster. Legacy RDMA derives a new
 Instance Configuration and creates a Cluster Network with an embedded Instance
-Pool.
+Pool. In the managed RDMA example, `oke-gpu` supplies OKE-owned pool settings
+and `oke-rdma` supplies legacy cloud-init and storage bootstrap.
 See [`creating-worker-pools.md`](creating-worker-pools.md) and
 [`worker-bootstrap-and-storage.md`](worker-bootstrap-and-storage.md).
 Sanitized live lifecycle output is available in
