@@ -9,6 +9,7 @@ from oke_hpc_mgmt.models import (
     NODE_POOL_CNI_TYPES,
     POOL_CREATE_TYPES,
     POOL_STORAGE_MODES,
+    RDMA_POOL_MODES,
     PoolBootVolumeReplaceSpec,
     PoolCreateSpec,
 )
@@ -92,6 +93,40 @@ def validate_pool_create_spec(spec: PoolCreateSpec) -> PoolCreateSpec:
         raise ValueError(
             f"Storage mode must be one of: {', '.join(POOL_STORAGE_MODES)}."
         )
+    if spec.rdma_mode and spec.rdma_mode not in RDMA_POOL_MODES:
+        raise ValueError(
+            f"RDMA mode must be one of: {', '.join(RDMA_POOL_MODES)}."
+        )
+    if spec.pool_type != "rdma" and spec.rdma_mode:
+        raise ValueError("--rdma-mode is valid only with --type rdma.")
+    if spec.compute_cluster_id and not spec.uses_compute_cluster:
+        raise ValueError(
+            "--compute-cluster-id requires --type rdma --rdma-mode compute-cluster."
+        )
+    if (
+        spec.compute_cluster_name or spec.compute_cluster_compartment_id
+    ) and not spec.creates_compute_cluster:
+        raise ValueError(
+            "--compute-cluster-name and --compute-cluster-compartment-id are "
+            "valid only when mgmt-oke creates the Compute Cluster."
+        )
+    if spec.host_group_id and not spec.managed:
+        raise ValueError(
+            "--host-group-id is valid only for managed OKE node pools."
+        )
+    if spec.host_group_id and spec.capacity_reservation_id:
+        raise ValueError(
+            "--host-group-id and --capacity-reservation-id select conflicting "
+            "placement capacity."
+        )
+    if spec.uses_compute_cluster and spec.fault_domains:
+        raise ValueError(
+            "Compute Cluster-backed node pools cannot specify fault domains."
+        )
+    if spec.uses_compute_cluster and spec.capacity_reservation_id:
+        raise ValueError(
+            "Compute Cluster-backed node pools cannot specify a capacity reservation."
+        )
     if spec.cni_type and spec.cni_type not in NODE_POOL_CNI_TYPES:
         raise ValueError(
             f"CNI type must be one of: {', '.join(NODE_POOL_CNI_TYPES)}."
@@ -136,7 +171,7 @@ def validate_pool_create_spec(spec: PoolCreateSpec) -> PoolCreateSpec:
             f"overridden: {', '.join(reserved_tags)}."
         )
 
-    if spec.pool_type == "rdma":
+    if not spec.managed:
         managed_only = {
             "--node-cycling-enabled": spec.node_cycling_enabled,
             "--node-cycling-max-surge": spec.node_cycling_max_surge,
@@ -153,7 +188,8 @@ def validate_pool_create_spec(spec: PoolCreateSpec) -> PoolCreateSpec:
         selected = [name for name, value in managed_only.items() if value is not None]
         if selected:
             raise ValueError(
-                "Self-managed RDMA pools do not support managed OKE settings: "
+                "Self-managed RDMA Cluster Network pools do not support managed "
+                "OKE settings: "
                 + ", ".join(selected)
                 + "."
             )
@@ -171,7 +207,7 @@ def validate_pool_create_spec(spec: PoolCreateSpec) -> PoolCreateSpec:
         selected = [name for name, value in rdma_only.items() if value is not None]
         if selected:
             raise ValueError(
-                "Managed CPU/GPU pools do not support Cluster Network settings: "
+                "Managed OKE pools do not support Cluster Network settings: "
                 + ", ".join(selected)
                 + "."
             )

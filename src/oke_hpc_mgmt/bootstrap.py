@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import base64
 import gzip
+import hashlib
 import re
+from collections.abc import Mapping
 from copy import deepcopy
 from email import policy
 from email.message import EmailMessage, Message
@@ -21,6 +23,11 @@ STORAGE_SCRIPT_NAMES = (
     "oke-nvme-raid.sh",
     "oke-fss-mount.sh",
     "oke-lustre-mount.sh",
+)
+BOOTSTRAP_HOOK_KEYS = (
+    "pre_oke",
+    "post_oke",
+    "kubelet-extra-args",
 )
 _OKE_VERSION_PATTERNS = (
     re.compile(
@@ -87,6 +94,26 @@ def load_upstream_asset(name: str) -> bytes:
     if name not in (*STORAGE_SCRIPT_NAMES, "oke-ubuntu-cloud-init.sh"):
         raise BootstrapCompositionError(f"Unknown bundled bootstrap asset: {name}")
     return resources.files(ASSET_PACKAGE).joinpath(name).read_bytes()
+
+
+def summarize_worker_bootstrap(metadata: Mapping[str, str]) -> dict[str, Any]:
+    user_data = metadata.get("user_data")
+    if not user_data:
+        raise BootstrapCompositionError(
+            "The bootstrap source does not contain OKE worker cloud-init."
+        )
+    raw = decode_user_data(user_data)
+    return {
+        "bootstrap_hook_keys": [
+            key for key in BOOTSTRAP_HOOK_KEYS if metadata.get(key)
+        ],
+        "decoded_bytes": len(raw),
+        "oke_bootstrap_detected": b"oke-ubuntu-cloud-init.sh" in raw,
+        "storage_scripts_detected": [
+            name for name in STORAGE_SCRIPT_NAMES if name.encode("ascii") in raw
+        ],
+        "user_data_sha256": hashlib.sha256(raw).hexdigest(),
+    }
 
 
 def _looks_like_cloud_init(value: bytes) -> bool:

@@ -249,6 +249,99 @@ response omits its identifier. A failed or canceled request stops the wait and
 prints the service error details. Resolve that OCI error before submitting
 another mutation.
 
+## Managed Compute Cluster Placement Is Refused
+
+Run the complete preflight without mutation:
+
+```bash
+mgmt-oke pools create <new-rdma-pool> \
+  --type rdma \
+  --rdma-mode compute-cluster \
+  --count 1 \
+  --from-pool <managed-gpu-or-rdma-source> \
+  --availability-domain <availability-domain> \
+  --shape <rdma-capable-bare-metal-gpu-shape> \
+  --compute-cluster-id <compute-cluster-ocid> \
+  --dry-run \
+  --format json
+```
+
+The selected OKE cluster must be enhanced. The node pool must have exactly one
+placement and availability domain, no fault domains, and an image/shape pair
+that advertises RDMA ports in that AD. An existing Compute Cluster must be
+`ACTIVE` in the same AD.
+
+If `--host-group-id` is supplied, the existing Compute Host Group must also be
+`ACTIVE` in the same AD and expose a `VALID` target matching the selected shape
+or OCI platform name. `mgmt-oke` validates Host Groups but does not create them
+or add hosts.
+
+Display-form names such as `UK-LONDON-1-AD-3` are resolved automatically to the
+tenancy-prefixed canonical AD name. An unknown or ambiguous display name is
+refused before pool creation.
+
+Verify that the OKE node-pool resource principal has
+`COMPUTE_CLUSTER_LAUNCH_INSTANCE` and, when a Host Group is selected,
+`HOST_GROUP_LAUNCH_INSTANCE` permission for the placement resource.
+
+## Legacy Bootstrap Inheritance Is Refused
+
+`--bootstrap-from-pool` accepts only a legacy Cluster Network-backed RDMA pool
+and only for managed Compute Cluster RDMA creation. Review both sources:
+
+```bash
+mgmt-oke pools get <managed-source-pool> --format json
+mgmt-oke pools get <legacy-bootstrap-source-pool> --format json
+mgmt-oke pools create <new-rdma-pool> \
+  --type rdma \
+  --rdma-mode compute-cluster \
+  --count 1 \
+  --from-pool <managed-source-pool> \
+  --bootstrap-from-pool <legacy-bootstrap-source-pool> \
+  --availability-domain <availability-domain> \
+  --shape <rdma-capable-bare-metal-gpu-shape> \
+  --dry-run \
+  --format json
+```
+
+The legacy Instance Configuration must expose `apiserver_host`,
+`cluster_ca_cert`, `oke-initial-node-labels`, and `user_data`. If endpoint or CA
+values differ from those exposed by the managed source, the tool treats the
+sources as belonging to different OKE clusters and refuses creation. Select
+sources from the same deployment or update the source pool through the stack
+before retrying.
+
+## Managed RDMA Creation Is Out Of Host Capacity
+
+`Out of host capacity` is an OCI placement result, not a client validation
+failure. Do not submit duplicate node pools while the original work request is
+still running. Inspect the pool and placement resource first:
+
+```bash
+mgmt-oke pools get <new-rdma-pool> --format json
+oci compute compute-cluster get \
+  --compute-cluster-id <compute-cluster-ocid> \
+  --auth instance_principal
+```
+
+If the failed OKE request created a node-pool resource, delete that pool after
+reviewing its membership. A dedicated Compute Cluster created by `mgmt-oke` is
+retained deliberately when the node-pool request fails or is ambiguous:
+
+```bash
+mgmt-oke pools delete <failed-pool> \
+  --no-drain \
+  --allow-workloads \
+  --wait
+oci compute compute-cluster delete \
+  --compute-cluster-id <compute-cluster-ocid> \
+  --auth instance_principal
+```
+
+Delete the Compute Cluster only after confirming that it is empty and no node
+pool references it. Automatic rollback is avoided because an interrupted OKE
+request might have succeeded after the client lost its response.
+
 ## Resize or Removal Timed Out
 
 A timeout means convergence was not observed before the deadline. It does not

@@ -196,6 +196,7 @@ selecting a resize or node-removal API.
 | --- | --- | --- | --- | --- |
 | Standard managed OKE pool | `kind=node-pool` | `standard` | OKE `UpdateNodePool` | OKE `DeleteNode` |
 | Managed OKE RDMA pool | `kind=node-pool` | `compute-cluster` | OKE `UpdateNodePool` | OKE `DeleteNode` |
+| Managed OKE Host Group pool | `kind=node-pool` | `host-group` | OKE `UpdateNodePool` | OKE `DeleteNode` |
 | Legacy self-managed RDMA pool | `kind=cluster-network` | `cluster-network` | Compute Management `UpdateClusterNetwork` | Compute Management instance-pool detach |
 | Standalone instance pool | `kind=instance-pool` | `instance-pool` or `compute-cluster` | Compute Management `UpdateInstancePool` | Compute Management instance-pool detach |
 
@@ -215,6 +216,10 @@ details and records:
 When `compute_cluster_id` is present, the pool remains an OKE `node-pool` but is
 reported with `placement=compute-cluster` and RDMA enabled. The Compute Cluster
 is placement metadata; it is not treated as the worker-pool owner.
+
+When placement rows contain `host_group_id` without a Compute Cluster, the pool
+is reported with `placement=host-group`. A pool using both remains
+`placement=compute-cluster` and exposes its Host Group OCIDs separately.
 
 OKE may expose an internal Instance Pool that backs the managed node pool. The
 tool suppresses that resource from standalone Instance Pool inventory when it
@@ -294,26 +299,54 @@ matching, working stack pool:
 
 - `cpu`: managed non-GPU, non-RDMA OKE source
 - `gpu`: managed GPU, non-RDMA OKE source
-- `rdma`: self-managed Cluster Network source
+- `rdma --rdma-mode compute-cluster`: existing managed Compute Cluster RDMA
+  source, then a regular managed GPU source for the first pool
+- `rdma` or `rdma --rdma-mode cluster-network`: legacy Cluster Network source
 
 Preparation requires complete OCI pool discovery, rejects duplicate names, and
 selects the source through `--from-pool`, conventional stack naming, or an
 unambiguous single candidate. A managed Compute Cluster RDMA pool is not
-eligible as a regular GPU source.
+eligible as a regular GPU source, but is preferred for another managed RDMA
+pool.
 
-For CPU and GPU, the backend reads the source OKE node pool and builds
-`CreateNodePoolDetails`. It preserves cluster-specific bootstrap, CNI, pod
-networking, labels, tags, cycling, and eviction settings unless a dedicated
-option overrides them. The new pool name and identity labels are retargeted.
+For CPU, GPU, and managed Compute Cluster RDMA, the backend reads the source OKE
+node pool and builds `CreateNodePoolDetails`. It preserves cluster-specific
+bootstrap, CNI, pod networking, labels, tags, cycling, and eviction settings
+unless a dedicated option overrides them. The new pool name and identity labels
+are retargeted.
 
-For RDMA, the backend reads the source Cluster Network, embedded Instance Pool,
-and Instance Configuration. It deep-copies launch details, including the image,
-shape, cloud-init, OKE join metadata, agent settings, primary and secondary
-VNICs, block volumes, and networking. It applies selected overrides, retargets
-instance and VNIC tags, updates the Kubernetes pool identity, and removes
-source Terraform module and state labels.
+Managed Compute Cluster migration can use a second, explicit legacy bootstrap
+source. `--bootstrap-from-pool` resolves a Cluster Network and embedded Instance
+Pool, reads its Instance Configuration, and validates the required OKE metadata.
+The workflow performs that lookup during planning and again under the mutation
+Lease. Any metadata change after planning aborts the operation and requires a
+new reviewed plan. It overlays legacy `user_data`, bootstrap hooks, and
+non-reserved custom metadata onto the managed request. Managed endpoint, CA, version, labels, CNI,
+pod networking, placement, and lifecycle fields remain authoritative. Mismatched
+endpoint or CA values fail before mutation, preventing a legacy template from a
+different OKE cluster from being executed.
 
-The RDMA backend calls `CreateInstanceConfiguration`, then
+Managed RDMA validates that the OKE cluster is enhanced, resolves display-form
+AD names to canonical tenancy-prefixed values, requires one placement with no
+fault domains, and verifies that the shape/image advertises RDMA ports. An
+existing Compute Cluster must be `ACTIVE` in that AD. If no OCID is supplied,
+the workflow creates and waits for a dedicated Compute Cluster before OKE
+`CreateNodePool`. A supplied Host Group must be `ACTIVE` in the same AD and
+have a `VALID` target matching the selected shape or an OCI platform name.
+
+Compute Cluster and Host Group OCIDs are placed only in OKE's supported
+`compute_cluster_id` and placement `host_group_id` fields. The tool verifies the
+installed OCI SDK exposes both fields. It creates Compute Clusters but does not
+create Host Groups or attach hosts.
+
+For legacy RDMA, the backend reads the source Cluster Network, embedded Instance
+Pool, and Instance Configuration. It deep-copies launch details, including the
+image, shape, cloud-init, OKE join metadata, agent settings, primary and
+secondary VNICs, block volumes, and networking. It applies selected overrides,
+retargets instance and VNIC tags, updates the Kubernetes pool identity, and
+removes source Terraform module and state labels.
+
+The legacy RDMA backend calls `CreateInstanceConfiguration`, then
 `CreateClusterNetwork` with one embedded Instance Pool. Already allocated
 network-block configuration is not copied; Compute Management allocates
 placement for the new Cluster Network. The source resources remain unchanged.
@@ -333,6 +366,11 @@ If RDMA Instance Configuration creation succeeds but Cluster Network creation
 fails, the error reports the derived Instance Configuration OCID. With
 `--wait`, creation monitors the work request and uses the same OCI, Kubernetes,
 GPU, RDMA topology, and applicable RDMA VF convergence checks as resize.
+
+If dedicated Compute Cluster creation succeeds but OKE node-pool submission or
+convergence fails, both OCIDs are reported and retained. This avoids deleting a
+placement resource while an accepted but not yet observable OKE request could
+still reference it.
 
 ### Legacy Node Removal Or Replacement
 

@@ -34,6 +34,7 @@ RDMA_VF_RESOURCE = "nvidia.com/rdma-vf"
 SLINKY_HOSTNAME_ANNOTATION = "nodeset.slinky.slurm.net/hostname-override"
 SLINKY_HOSTNAME_PREFIX_LABEL = "oci.oraclecloud.com/slinky-hostname-prefix"
 POOL_CREATE_TYPES = ("cpu", "gpu", "rdma")
+RDMA_POOL_MODES = ("cluster-network", "compute-cluster")
 POOL_STORAGE_MODES = ("inherit", "append", "replace")
 CLUSTER_NETWORK_PLACEMENT_CONSTRAINTS = (
     "SINGLE_TIER",
@@ -359,6 +360,18 @@ class ClusterNetworkCreateResult:
 class ManagedNodePoolCreateResult:
     node_pool_id: str | None = None
     work_request_id: str | None = None
+    compute_cluster_id: str | None = None
+    compute_cluster_created: bool = False
+    host_group_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ComputeClusterInfo:
+    compute_cluster_id: str
+    display_name: str
+    availability_domain: str
+    compartment_id: str
+    lifecycle_state: str
 
 
 @dataclass(frozen=True)
@@ -433,6 +446,11 @@ class NvmeRaidSpec:
 @dataclass(frozen=True)
 class PoolCreateSpec:
     pool_type: str
+    rdma_mode: str | None = None
+    compute_cluster_id: str | None = None
+    compute_cluster_name: str | None = None
+    compute_cluster_compartment_id: str | None = None
+    host_group_id: str | None = None
     availability_domain: str | None = None
     shape: str | None = None
     image_id: str | None = None
@@ -474,9 +492,33 @@ class PoolCreateSpec:
     fss_mounts: tuple[FssMountSpec, ...] = ()
     lustre_mounts: tuple[LustreMountSpec, ...] = ()
 
+    @property
+    def effective_rdma_mode(self) -> str | None:
+        if self.pool_type != "rdma":
+            return None
+        return self.rdma_mode or "cluster-network"
+
+    @property
+    def managed(self) -> bool:
+        return self.pool_type != "rdma" or self.effective_rdma_mode == "compute-cluster"
+
+    @property
+    def uses_compute_cluster(self) -> bool:
+        return self.pool_type == "rdma" and self.effective_rdma_mode == "compute-cluster"
+
+    @property
+    def creates_compute_cluster(self) -> bool:
+        return self.uses_compute_cluster and not self.compute_cluster_id
+
     def as_dict(self) -> dict[str, Any]:
         values: dict[str, Any] = {
             "type": self.pool_type,
+            "rdma_mode": self.effective_rdma_mode,
+            "compute_cluster_id": self.compute_cluster_id,
+            "compute_cluster_name": self.compute_cluster_name,
+            "compute_cluster_compartment_id": self.compute_cluster_compartment_id,
+            "create_compute_cluster": self.creates_compute_cluster or None,
+            "host_group_id": self.host_group_id,
             "availability_domain": self.availability_domain,
             "shape": self.shape,
             "image_id": self.image_id,

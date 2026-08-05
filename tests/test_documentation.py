@@ -229,6 +229,21 @@ class DocumentationTests(unittest.TestCase):
             self.assertIn(field, readiness_guide)
         self.assertIn("node_present=False", readiness_guide)
 
+    def test_managed_rdma_docs_cover_legacy_bootstrap_inheritance(self):
+        creation_guide = (
+            PROJECT_ROOT / "docs" / "creating-worker-pools.md"
+        ).read_text(encoding="utf-8")
+        bootstrap_guide = (
+            PROJECT_ROOT / "docs" / "worker-bootstrap-and-storage.md"
+        ).read_text(encoding="utf-8")
+
+        for document in (creation_guide, bootstrap_guide):
+            self.assertIn("--bootstrap-from-pool", document)
+            self.assertIn("--from-pool oke-gpu", document)
+            self.assertIn("--bootstrap-from-pool oke-rdma", document)
+        self.assertIn("API endpoint and cluster CA", creation_guide)
+        self.assertIn("complete legacy `user_data`", bootstrap_guide)
+
     def test_bvr_docs_distinguish_individual_and_pool_image_updates(self):
         guide = (
             PROJECT_ROOT / "docs" / "replacing-worker-boot-volumes.md"

@@ -499,7 +499,18 @@ def _prepare_pool_upgrade_from_snapshot(
             details.update(preview)
         else:
             preview_spec = PoolCreateSpec(
-                pool_type="gpu" if pool.gpu_resource else "cpu",
+                pool_type=(
+                    "rdma"
+                    if pool.rdma_enabled
+                    else "gpu" if pool.gpu_resource else "cpu"
+                ),
+                rdma_mode=(
+                    "compute-cluster" if pool.rdma_enabled else None
+                ),
+                compute_cluster_id=pool.compute_cluster_id,
+                host_group_id=(
+                    next(iter(sorted(pool.host_group_ids)), None)
+                ),
                 kubernetes_version=str(target_version),
                 image_id=spec.image_id,
             )

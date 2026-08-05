@@ -46,6 +46,41 @@ Use `replace` when changing an inherited mount or RAID configuration. Selecting
 `replace` without a storage option removes official storage bootstrap from the
 new pool while preserving OKE bootstrap.
 
+## Legacy To Managed RDMA Bootstrap
+
+A legacy Cluster Network stores worker bootstrap in its Instance Configuration,
+while a managed Compute Cluster pool requires an OKE node pool as its primary
+template. Supply both sources explicitly:
+
+```bash
+mgmt-oke pools create rdma-managed \
+  --type rdma \
+  --rdma-mode compute-cluster \
+  --count 2 \
+  --from-pool oke-gpu \
+  --bootstrap-from-pool oke-rdma \
+  --availability-domain <availability-domain> \
+  --shape BM.GPU4.8 \
+  --compute-cluster-name rdma-managed-cc \
+  --dry-run \
+  --format json
+```
+
+The complete legacy `user_data` is inherited, so existing official FSS,
+Lustre, and NVMe RAID commands remain present with the default
+`--storage-mode inherit`. Supported hooks and non-reserved custom metadata are
+also copied. Current managed OKE endpoint, CA, Kubernetes, CNI, pod-networking,
+placement, and lifecycle values are retained. Different endpoint or CA values
+between the sources are rejected.
+
+The dry-run exposes only a SHA-256 fingerprint, decoded size, detected official
+script names, and bootstrap hook keys. It does not print inherited cloud-init or
+metadata values.
+
+Use `--storage-mode append` to keep inherited storage and add another reviewed
+configuration. Use `replace` to remove recognized official storage commands and
+embed only the explicitly supplied FSS, Lustre, and NVMe settings.
+
 ## Local NVMe RAID
 
 ```bash

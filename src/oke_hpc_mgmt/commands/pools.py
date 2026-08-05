@@ -192,8 +192,8 @@ pools.add_command(replace_pool_boot_volumes, "bvr")
 @pools.command(
     "create",
     help=(
-        "Create a managed CPU/GPU pool or self-managed RDMA Cluster Network "
-        "pool from a proven OKE source."
+        "Create a managed CPU/GPU pool, managed Compute Cluster RDMA pool, "
+        "or self-managed RDMA Cluster Network pool from a proven OKE source."
     ),
 )
 @click.argument("name")
@@ -207,6 +207,7 @@ def create_pool(
     name: str,
     count: int,
     source_identifier: str | None,
+    bootstrap_source_identifier: str | None,
     wait: bool,
     timeout: int,
     poll_interval: int,
@@ -231,6 +232,7 @@ def create_pool(
         count,
         spec=spec,
         source_identifier=source_identifier,
+        bootstrap_source_identifier=bootstrap_source_identifier,
     )
     if dry_run:
         emit_plans(state, output_override, [prepared.plan])

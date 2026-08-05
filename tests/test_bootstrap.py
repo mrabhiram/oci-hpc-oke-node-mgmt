@@ -14,6 +14,7 @@ from oke_hpc_mgmt.bootstrap import (
     decode_user_data,
     encode_user_data,
     load_upstream_asset,
+    summarize_worker_bootstrap,
 )
 from oke_hpc_mgmt.models import (
     FssMountSpec,
@@ -90,6 +91,29 @@ class BootstrapTests(unittest.TestCase):
 
         self.assertEqual(payload, decode_user_data(encoded))
         self.assertEqual(encoded, encode_user_data(payload))
+
+    def test_bootstrap_summary_reports_hash_size_hooks_and_storage_scripts(self):
+        source = _source_user_data()
+
+        summary = summarize_worker_bootstrap(
+            {
+                "user_data": source,
+                "pre_oke": "encoded-hook",
+            }
+        )
+
+        self.assertEqual(["pre_oke"], summary["bootstrap_hook_keys"])
+        self.assertGreater(summary["decoded_bytes"], 0)
+        self.assertTrue(summary["oke_bootstrap_detected"])
+        self.assertEqual(
+            ["oke-nvme-raid.sh", "oke-fss-mount.sh"],
+            summary["storage_scripts_detected"],
+        )
+        self.assertRegex(summary["user_data_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_bootstrap_summary_requires_user_data(self):
+        with self.assertRaisesRegex(BootstrapCompositionError, "cloud-init"):
+            summarize_worker_bootstrap({})
 
     def test_replace_storage_preserves_bootstrap_order_and_embeds_assets(self):
         spec = PoolCreateSpec(

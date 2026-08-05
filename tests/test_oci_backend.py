@@ -17,6 +17,18 @@ from oke_hpc_mgmt.models import (
 
 
 class _Model:
+    swagger_types = {
+        "compute_cluster_id": "str",
+        "host_group_id": "str",
+    }
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class _LegacyModel:
+    swagger_types: dict[str, str] = {}
+
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
 
@@ -250,6 +262,8 @@ class _Compute:
         self.calls = []
         self.gpu_memory_clusters = []
         self.gpu_memory_cluster = None
+        self.compute_clusters = {}
+        self.compute_host_groups = {}
 
     def get_instance(self, instance_id):
         self.calls.append(("get_instance", instance_id))
@@ -269,6 +283,27 @@ class _Compute:
     def terminate_instance(self, instance_id, **kwargs):
         self.calls.append(("terminate_instance", instance_id, kwargs))
         return SimpleNamespace(headers={})
+
+    def get_compute_cluster(self, compute_cluster_id):
+        self.calls.append(("get_compute_cluster", compute_cluster_id))
+        return SimpleNamespace(data=self.compute_clusters[compute_cluster_id])
+
+    def create_compute_cluster(self, details, **kwargs):
+        self.calls.append(("create_compute_cluster", details, kwargs))
+        created = SimpleNamespace(
+            id="compute-cluster-new",
+            display_name=details.display_name,
+            availability_domain=details.availability_domain,
+            compartment_id=details.compartment_id,
+            lifecycle_state="ACTIVE",
+            freeform_tags=details.freeform_tags,
+        )
+        self.compute_clusters[created.id] = created
+        return SimpleNamespace(data=created, headers={"etag": "cc-etag"})
+
+    def get_compute_host_group(self, host_group_id):
+        self.calls.append(("get_compute_host_group", host_group_id))
+        return SimpleNamespace(data=self.compute_host_groups[host_group_id])
 
     def list_compute_gpu_memory_clusters(self, compartment_id):
         return SimpleNamespace(data=self.gpu_memory_clusters)
@@ -321,10 +356,36 @@ class _Compute:
     def list_shapes(self, compartment_id, **kwargs):
         return SimpleNamespace(
             data=[
-                SimpleNamespace(shape="BM.GPU4.8", local_disks=8),
-                SimpleNamespace(shape="VM.Standard.E5.Flex", local_disks=0),
-                SimpleNamespace(shape="VM.GPU.A10.1", local_disks=0),
-                SimpleNamespace(shape="VM.GPU.A10.2", local_disks=0),
+                SimpleNamespace(
+                    shape="BM.GPU4.8",
+                    local_disks=8,
+                    rdma_ports=8,
+                    platform_names=["NVIDIA A100"],
+                ),
+                SimpleNamespace(
+                    shape="BM.GPU.Test.8",
+                    local_disks=0,
+                    rdma_ports=0,
+                    platform_names=["Test GPU"],
+                ),
+                SimpleNamespace(
+                    shape="VM.Standard.E5.Flex",
+                    local_disks=0,
+                    rdma_ports=0,
+                    platform_names=[],
+                ),
+                SimpleNamespace(
+                    shape="VM.GPU.A10.1",
+                    local_disks=0,
+                    rdma_ports=0,
+                    platform_names=["NVIDIA A10"],
+                ),
+                SimpleNamespace(
+                    shape="VM.GPU.A10.2",
+                    local_disks=0,
+                    rdma_ports=0,
+                    platform_names=["NVIDIA A10"],
+                ),
             ]
         )
 
@@ -353,6 +414,18 @@ class _VirtualNetwork:
         return SimpleNamespace(
             data=SimpleNamespace(id=nsg_id, vcn_id="vcn-1")
         )
+
+
+class _Identity:
+    def __init__(self):
+        self.availability_domains = [
+            SimpleNamespace(name="AD-1"),
+            SimpleNamespace(name="AD-2"),
+            SimpleNamespace(name="AD-3"),
+        ]
+
+    def list_availability_domains(self, compartment_id):
+        return SimpleNamespace(data=self.availability_domains)
 
 
 class _Pagination:
@@ -456,6 +529,7 @@ def _backend(cluster_network=None, instance_configuration=None, node_pools=None)
                 UpdateComputeGpuMemoryClusterDetails=_Model,
                 CreateInstancePoolDetails=_Model,
                 CreateComputeGpuMemoryClusterDetails=_Model,
+                CreateComputeClusterDetails=_Model,
             )
         )
     )
@@ -465,6 +539,7 @@ def _backend(cluster_network=None, instance_configuration=None, node_pools=None)
     )
     backend._container_engine = _ContainerEngine(node_pools=node_pools)
     backend._compute = _Compute()
+    backend._identity = _Identity()
     backend._virtual_network = _VirtualNetwork()
     backend._work_requests = _WorkRequests()
     return backend
@@ -899,6 +974,503 @@ class OciBackendMutationTests(unittest.TestCase):
         self.assertNotIn("oke.oraclecloud.com/tf.state_id", labels)
         self.assertEqual("ai", details.freeform_tags["team"])
 
+    def test_create_managed_rdma_pool_uses_compute_cluster_and_host_group(self):
+        source = _managed_node_pool("BM.GPU4.8")
+        source.name = "oke-rdma"
+        source.node_config_details.compute_cluster_id = "compute-cluster-source"
+        source.node_config_details.placement_configs[0].fault_domains = []
+        backend = _backend(node_pools=[source])
+        backend._compute.compute_clusters["compute-cluster-target"] = (
+            SimpleNamespace(
+                id="compute-cluster-target",
+                display_name="target-cc",
+                availability_domain="AD-1",
+                compartment_id="compartment-1",
+                lifecycle_state="ACTIVE",
+            )
+        )
+        backend._compute.compute_host_groups["host-group-1"] = (
+            SimpleNamespace(
+                id="host-group-1",
+                availability_domain="AD-1",
+                compartment_id="compartment-1",
+                lifecycle_state="ACTIVE",
+                configurations=[
+                    SimpleNamespace(
+                        target="BM.GPU4.8",
+                        state="VALID",
+                    )
+                ],
+            )
+        )
+        spec = PoolCreateSpec(
+            pool_type="rdma",
+            rdma_mode="compute-cluster",
+            compute_cluster_id="compute-cluster-target",
+            host_group_id="host-group-1",
+        )
+
+        preview = backend.preview_managed_node_pool_create(
+            source.id,
+            "cluster-1",
+            "compartment-1",
+            "rdma-batch",
+            2,
+            spec,
+        )
+        created = backend.create_managed_node_pool(
+            source.id,
+            "cluster-1",
+            "compartment-1",
+            "rdma-batch",
+            2,
+            spec,
+        )
+
+        call = next(
+            item
+            for item in backend._container_engine.calls
+            if item[0] == "create_node_pool"
+        )
+        node_config = call[1].node_config_details
+        placement = node_config.placement_configs[0]
+        self.assertEqual("compute-cluster", preview["placement"])
+        self.assertEqual(
+            "compute-cluster-target",
+            node_config.compute_cluster_id,
+        )
+        self.assertEqual("host-group-1", placement.host_group_id)
+        self.assertEqual([], placement.fault_domains)
+        self.assertEqual([], preview["fault_domains"])
+        self.assertEqual("compute-cluster-target", created.compute_cluster_id)
+        self.assertEqual("host-group-1", created.host_group_id)
+
+    def test_managed_rdma_pool_inherits_legacy_bootstrap_without_stale_identity(self):
+        source = _managed_node_pool("VM.GPU.A10.1")
+        source.node_metadata.update(
+            {
+                "cluster_ca_cert": "current-certificate",
+                "oke-k8version": "v1.35.2",
+                "pod-subnets": "pod-subnet-source",
+                "managed-custom": "current",
+            }
+        )
+        backend = _backend(node_pools=[source])
+        backend._compute.compute_clusters["compute-cluster-target"] = (
+            SimpleNamespace(
+                id="compute-cluster-target",
+                display_name="target-cc",
+                availability_domain="AD-1",
+                compartment_id="compartment-1",
+                lifecycle_state="ACTIVE",
+            )
+        )
+        legacy_metadata = {
+            "apiserver_host": "10.0.0.1:6443",
+            "cluster_ca_cert": "current-certificate",
+            "oke-initial-node-labels": "stale=true",
+            "oke-k8version": "v1.34.1",
+            "pod-subnets": "stale-pod-subnet",
+            "user_data": "legacy-rdma-cloud-init",
+            "pre_oke": "legacy-pre-hook",
+            "legacy-custom": "preserved",
+        }
+        spec = PoolCreateSpec(
+            pool_type="rdma",
+            rdma_mode="compute-cluster",
+            compute_cluster_id="compute-cluster-target",
+            shape="BM.GPU4.8",
+        )
+
+        preview = backend.preview_managed_node_pool_create(
+            source.id,
+            "cluster-1",
+            "compartment-1",
+            "rdma-batch",
+            2,
+            spec,
+            bootstrap_metadata=legacy_metadata,
+        )
+        backend.create_managed_node_pool(
+            source.id,
+            "cluster-1",
+            "compartment-1",
+            "rdma-batch",
+            2,
+            spec,
+            bootstrap_metadata=legacy_metadata,
+        )
+
+        call = next(
+            item
+            for item in backend._container_engine.calls
+            if item[0] == "create_node_pool"
+        )
+        metadata = call[1].node_metadata
+        self.assertEqual("legacy-rdma-cloud-init", metadata["user_data"])
+        self.assertEqual("legacy-pre-hook", metadata["pre_oke"])
+        self.assertEqual("preserved", metadata["legacy-custom"])
+        self.assertEqual("current", metadata["managed-custom"])
+        self.assertEqual("v1.35.2", metadata["oke-k8version"])
+        self.assertEqual("pod-subnet-source", metadata["pod-subnets"])
+        self.assertNotEqual("stale=true", metadata.get("oke-initial-node-labels"))
+        self.assertEqual(2, call[1].node_config_details.size)
+        self.assertEqual(
+            len("legacy-rdma-cloud-init"),
+            preview["worker_bootstrap"]["decoded_bytes"],
+        )
+
+    def test_managed_rdma_pool_rejects_legacy_bootstrap_from_another_cluster(self):
+        source = _managed_node_pool("VM.GPU.A10.1")
+        source.node_metadata["cluster_ca_cert"] = "current-certificate"
+        backend = _backend(node_pools=[source])
+        spec = PoolCreateSpec(
+            pool_type="rdma",
+            rdma_mode="compute-cluster",
+            shape="BM.GPU4.8",
+        )
+        legacy_metadata = {
+            "apiserver_host": "another-cluster:6443",
+            "cluster_ca_cert": "another-certificate",
+            "oke-initial-node-labels": "pool=legacy",
+            "user_data": "legacy-rdma-cloud-init",
+        }
+
+        with self.assertRaisesRegex(OciDiscoveryError, "same OKE cluster"):
+            backend.preview_managed_node_pool_create(
+                source.id,
+                "cluster-1",
+                "compartment-1",
+                "rdma-batch",
+                2,
+                spec,
+                bootstrap_metadata=legacy_metadata,
+            )
+
+    def test_managed_rdma_preview_plans_dedicated_compute_cluster(self):
+        source = _managed_node_pool("BM.GPU4.8")
+        source.name = "oke-rdma"
+        source.node_config_details.compute_cluster_id = "compute-cluster-source"
+        source.node_config_details.placement_configs[0].fault_domains = []
+        backend = _backend(node_pools=[source])
+
+        preview = backend.preview_managed_node_pool_create(
+            source.id,
+            "cluster-1",
+            "compartment-1",
+            "rdma-batch",
+            2,
+            PoolCreateSpec(
+                pool_type="rdma",
+                rdma_mode="compute-cluster",
+            ),
+        )
+
+        self.assertEqual("create", preview["compute_cluster_action"])
+        self.assertEqual("rdma-batch-cc", preview["compute_cluster_name"])
+        self.assertIsNone(preview["compute_cluster_id"])
+
+    def test_managed_rdma_can_derive_from_regular_managed_gpu_pool(self):
+        source = _managed_node_pool("VM.GPU.A10.1")
+        backend = _backend(node_pools=[source])
+
+        preview = backend.preview_managed_node_pool_create(
+            source.id,
+            "cluster-1",
+            "compartment-1",
+            "rdma-batch",
+            1,
+            PoolCreateSpec(
+                pool_type="rdma",
+                rdma_mode="compute-cluster",
+                shape="BM.GPU4.8",
+                availability_domain="AD-1",
+            ),
+        )
+
+        self.assertEqual("compute-cluster", preview["placement"])
+        self.assertEqual("BM.GPU4.8", preview["shape"])
+        self.assertEqual("create", preview["compute_cluster_action"])
+
+    def test_managed_compute_cluster_may_use_another_compartment(self):
+        source = _managed_node_pool("BM.GPU4.8")
+        source.node_config_details.placement_configs[0].fault_domains = []
+        backend = _backend(node_pools=[source])
+        backend._compute.compute_clusters["compute-cluster-target"] = (
+            SimpleNamespace(
+                id="compute-cluster-target",
+                display_name="target-cc",
+                availability_domain="AD-1",
+                compartment_id="compute-compartment-2",
+                lifecycle_state="ACTIVE",
+            )
+        )
+
+        preview = backend.preview_managed_node_pool_create(
+            source.id,
+            "cluster-1",
+            "node-pool-compartment-1",
+            "rdma-batch",
+            1,
+            PoolCreateSpec(
+                pool_type="rdma",
+                rdma_mode="compute-cluster",
+                compute_cluster_id="compute-cluster-target",
+            ),
+        )
+
+        self.assertEqual("compute-cluster-target", preview["compute_cluster_id"])
+
+    def test_managed_placement_rejects_invalid_compute_resources(self):
+        source = _managed_node_pool("BM.GPU4.8")
+        source.node_config_details.placement_configs[0].fault_domains = []
+        spec = PoolCreateSpec(
+            pool_type="rdma",
+            rdma_mode="compute-cluster",
+            compute_cluster_id="compute-cluster-target",
+        )
+        invalid_clusters = (
+            ("DELETED", "AD-1", "not ACTIVE"),
+            ("ACTIVE", "AD-2", "but the node-pool placement uses"),
+        )
+        for lifecycle_state, availability_domain, message in invalid_clusters:
+            with self.subTest(message=message):
+                backend = _backend(node_pools=[source])
+                backend._compute.compute_clusters[
+                    "compute-cluster-target"
+                ] = SimpleNamespace(
+                    id="compute-cluster-target",
+                    display_name="target-cc",
+                    availability_domain=availability_domain,
+                    compartment_id="compartment-1",
+                    lifecycle_state=lifecycle_state,
+                )
+                with self.assertRaisesRegex(OciDiscoveryError, message):
+                    backend.preview_managed_node_pool_create(
+                        source.id,
+                        "cluster-1",
+                        "compartment-1",
+                        "rdma-batch",
+                        2,
+                        spec,
+                    )
+
+    def test_host_group_requires_matching_active_shape_and_ad(self):
+        source = _managed_node_pool("VM.GPU.A10.1")
+        spec = PoolCreateSpec(
+            pool_type="gpu",
+            host_group_id="host-group-1",
+        )
+        backend = _backend(node_pools=[source])
+        backend._compute.compute_host_groups["host-group-1"] = (
+            SimpleNamespace(
+                id="host-group-1",
+                availability_domain="AD-1",
+                lifecycle_state="ACTIVE",
+                configurations=[
+                    SimpleNamespace(
+                        target="BM.GPU4.8",
+                        state="VALID",
+                    )
+                ],
+            )
+        )
+
+        with self.assertRaisesRegex(OciDiscoveryError, "for shape"):
+            backend.preview_managed_node_pool_create(
+                source.id,
+                "cluster-1",
+                "compartment-1",
+                "gpu-host-group",
+                1,
+                spec,
+            )
+
+    def test_host_group_accepts_valid_shape_platform_target(self):
+        source = _managed_node_pool("VM.GPU.A10.1")
+        spec = PoolCreateSpec(
+            pool_type="gpu",
+            host_group_id="host-group-1",
+        )
+        backend = _backend(node_pools=[source])
+        backend._compute.compute_host_groups["host-group-1"] = (
+            SimpleNamespace(
+                id="host-group-1",
+                availability_domain="AD-1",
+                lifecycle_state="ACTIVE",
+                configurations=[
+                    SimpleNamespace(
+                        target="NVIDIA A10",
+                        state="VALID",
+                    )
+                ],
+            )
+        )
+
+        preview = backend.preview_managed_node_pool_create(
+            source.id,
+            "cluster-1",
+            "compartment-1",
+            "gpu-host-group",
+            1,
+            spec,
+        )
+
+        self.assertEqual("host-group", preview["placement"])
+        self.assertEqual(["host-group-1"], preview["host_group_ids"])
+
+    def test_host_group_requires_active_state_and_matching_ad(self):
+        source = _managed_node_pool("VM.GPU.A10.1")
+        spec = PoolCreateSpec(
+            pool_type="gpu",
+            host_group_id="host-group-1",
+        )
+        invalid_groups = (
+            ("DELETED", "AD-1", "not ACTIVE"),
+            ("ACTIVE", "AD-2", "but the node-pool placement uses"),
+        )
+        for lifecycle_state, availability_domain, message in invalid_groups:
+            with self.subTest(message=message):
+                backend = _backend(node_pools=[source])
+                backend._compute.compute_host_groups["host-group-1"] = (
+                    SimpleNamespace(
+                        id="host-group-1",
+                        availability_domain=availability_domain,
+                        lifecycle_state=lifecycle_state,
+                        configurations=[
+                            SimpleNamespace(
+                                target="NVIDIA A10",
+                                state="VALID",
+                            )
+                        ],
+                    )
+                )
+                with self.assertRaisesRegex(OciDiscoveryError, message):
+                    backend.preview_managed_node_pool_create(
+                        source.id,
+                        "cluster-1",
+                        "compartment-1",
+                        "gpu-host-group",
+                        1,
+                        spec,
+                    )
+
+    def test_managed_rdma_requires_shape_with_rdma_ports(self):
+        source = _managed_node_pool("VM.GPU.A10.1")
+        backend = _backend(node_pools=[source])
+
+        with self.assertRaisesRegex(OciDiscoveryError, "does not advertise RDMA"):
+            backend.preview_managed_node_pool_create(
+                source.id,
+                "cluster-1",
+                "compartment-1",
+                "rdma-bad-shape",
+                1,
+                PoolCreateSpec(
+                    pool_type="rdma",
+                    rdma_mode="compute-cluster",
+                    shape="BM.GPU.Test.8",
+                    availability_domain="AD-1",
+                ),
+            )
+
+    def test_managed_placement_requires_current_oci_sdk_fields(self):
+        source = _managed_node_pool("BM.GPU4.8")
+        source.node_config_details.placement_configs[0].fault_domains = []
+        backend = _backend(node_pools=[source])
+        backend._oci.container_engine.models.CreateNodePoolNodeConfigDetails = (
+            _LegacyModel
+        )
+
+        with self.assertRaisesRegex(OciDiscoveryError, "installed OCI Python SDK"):
+            backend.preview_managed_node_pool_create(
+                source.id,
+                "cluster-1",
+                "compartment-1",
+                "rdma-old-sdk",
+                1,
+                PoolCreateSpec(
+                    pool_type="rdma",
+                    rdma_mode="compute-cluster",
+                    compute_cluster_id="compute-cluster-1",
+                ),
+            )
+
+        backend = _backend(node_pools=[source])
+        backend._oci.container_engine.models.NodePoolPlacementConfigDetails = (
+            _LegacyModel
+        )
+        with self.assertRaisesRegex(OciDiscoveryError, "Compute Host Groups"):
+            backend.preview_managed_node_pool_create(
+                source.id,
+                "cluster-1",
+                "compartment-1",
+                "gpu-old-sdk",
+                1,
+                PoolCreateSpec(
+                    pool_type="gpu",
+                    host_group_id="host-group-1",
+                ),
+            )
+
+    def test_create_compute_cluster_tags_ownership(self):
+        backend = _backend()
+
+        created = backend.create_compute_cluster(
+            compartment_id="compartment-1",
+            availability_domain="AD-1",
+            display_name="rdma-batch-cc",
+            pool_name="rdma-batch",
+            freeform_tags={"team": "ai"},
+            opc_retry_token="retry-token",
+        )
+
+        call = backend._compute.calls[-1]
+        self.assertEqual("compute-cluster-new", created.compute_cluster_id)
+        self.assertEqual("create_compute_cluster", call[0])
+        self.assertEqual("true", call[1].freeform_tags["mgmt-oke-created"])
+        self.assertEqual("rdma-batch", call[1].freeform_tags["mgmt-oke-pool"])
+        self.assertEqual("ai", call[1].freeform_tags["team"])
+        self.assertEqual("retry-token", call[2]["opc_retry_token"])
+
+    def test_availability_domain_display_name_resolves_to_canonical_name(self):
+        source = _managed_node_pool("BM.GPU4.8")
+        source.node_config_details.placement_configs[0].fault_domains = []
+        backend = _backend(node_pools=[source])
+        backend._identity.availability_domains = [
+            SimpleNamespace(name="example:UK-LONDON-1-AD-3")
+        ]
+
+        preview = backend.preview_managed_node_pool_create(
+            source.id,
+            "cluster-1",
+            "compartment-1",
+            "rdma-canonical-ad",
+            1,
+            PoolCreateSpec(
+                pool_type="rdma",
+                rdma_mode="compute-cluster",
+                availability_domain="UK-LONDON-1-AD-3",
+            ),
+        )
+
+        self.assertEqual(
+            ["example:UK-LONDON-1-AD-3"],
+            preview["availability_domains"],
+        )
+
+    def test_availability_domain_resolution_rejects_unknown_alias(self):
+        backend = _backend()
+        backend._identity.availability_domains = [
+            SimpleNamespace(name="example:UK-LONDON-1-AD-3")
+        ]
+
+        with self.assertRaisesRegex(OciDiscoveryError, "was not found"):
+            backend.resolve_availability_domain(
+                "compartment-1",
+                "UK-LONDON-1-AD-2",
+            )
+
     def test_managed_pool_type_rejects_incompatible_shape(self):
         source = _managed_node_pool()
         backend = _backend(node_pools=[source])
@@ -1301,6 +1873,39 @@ class OciBackendMutationTests(unittest.TestCase):
         self.assertNotEqual(
             instance_config_kwargs["opc_retry_token"],
             kwargs["opc_retry_token"],
+        )
+
+    def test_reads_validated_bootstrap_metadata_from_cluster_network_pool(self):
+        source_pool = SimpleNamespace(
+            id="instance-pool-source",
+            instance_configuration_id="instance-configuration-source",
+        )
+        cluster_network = SimpleNamespace(
+            id="cluster-network-source",
+            compartment_id="compartment-1",
+            lifecycle_state="RUNNING",
+            instance_pools=[source_pool],
+            placement_configuration=SimpleNamespace(
+                availability_domain="UK-LONDON-1-AD-3",
+                placement_constraint="PACKED_DISTRIBUTION_MULTI_BLOCK",
+                primary_subnet_id="subnet-1",
+                primary_vnic_subnets=None,
+            ),
+        )
+        backend = _backend(cluster_network=cluster_network)
+
+        metadata = backend.get_cluster_network_pool_bootstrap_metadata(
+            "cluster-network-source",
+            "instance-pool-source",
+        )
+
+        self.assertEqual("cloud-init", metadata["user_data"])
+        self.assertEqual("certificate", metadata["cluster_ca_cert"])
+        metadata["user_data"] = "modified"
+        self.assertEqual(
+            "cloud-init",
+            backend._compute_mgmt.instance_configuration.instance_details
+            .launch_details.metadata["user_data"],
         )
         self.assertEqual(
             "oke-rdma",
@@ -1910,6 +2515,38 @@ class OciBackendDiscoveryTests(unittest.TestCase):
         self.assertTrue(discovered.rdma_enabled)
         self.assertEqual({"instance-active"}, discovered.oci_instance_ids)
         self.assertEqual("rdma", discovered.labels["oci.oraclecloud.com/slinky-hostname-prefix"])
+
+    def test_managed_host_group_pool_preserves_placement_metadata(self):
+        node_config = SimpleNamespace(
+            size=1,
+            compute_cluster_id=None,
+            placement_configs=[
+                SimpleNamespace(
+                    availability_domain="AD-1",
+                    host_group_id="host-group-1",
+                )
+            ],
+        )
+        pool = SimpleNamespace(
+            id="node-pool-1",
+            name="oke-gpu-host-group",
+            node_shape="VM.GPU.A10.1",
+            node_config_details=node_config,
+            initial_node_labels=[],
+            nodes=[],
+        )
+        backend = _backend()
+        backend._container_engine = _ContainerEngine([pool])
+
+        discovered = backend.list_managed_node_pools(
+            "compartment-1",
+            "cluster-1",
+        )[0]
+
+        self.assertEqual("host-group", discovered.placement_type)
+        self.assertIsNone(discovered.compute_cluster_id)
+        self.assertEqual({"host-group-1"}, discovered.host_group_ids)
+        self.assertFalse(discovered.rdma_enabled)
 
     def test_list_cluster_addons_maps_lifecycle_version_and_error(self):
         addons = [

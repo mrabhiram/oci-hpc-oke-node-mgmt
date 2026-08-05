@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import base64
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any, TypeVar
 
-from oke_hpc_mgmt.bootstrap import compose_worker_user_data
+from oke_hpc_mgmt.bootstrap import (
+    BootstrapCompositionError,
+    compose_worker_user_data,
+    summarize_worker_bootstrap,
+)
 from oke_hpc_mgmt.models import (
     AddonCompatibility,
     AddonInfo,
     ClusterInfo,
     ClusterNetworkCreateResult,
+    ComputeClusterInfo,
     ManagedNodePoolCreateResult,
     PoolBootVolumeReplaceSpec,
     PoolCreateSpec,
@@ -32,6 +38,24 @@ class BootVolumeAttachmentPending(OciDiscoveryError):
 
 T = TypeVar("T")
 
+_MANAGED_BOOTSTRAP_AUTHORITY_KEYS = frozenset(
+    {
+        "apiserver_host",
+        "cluster_ca_cert",
+        "oke-initial-node-labels",
+        "oke-k8version",
+        "oke-max-pods",
+        "oke-native-pod-networking",
+        "pod-nsgids",
+        "pod-subnets",
+        "ssh_authorized_keys",
+    }
+)
+_CLUSTER_IDENTITY_METADATA_KEYS = (
+    "apiserver_host",
+    "cluster_ca_cert",
+)
+
 
 class OciBackend:
     def __init__(
@@ -51,6 +75,7 @@ class OciBackend:
         self._container_engine = None
         self._compute_mgmt = None
         self._compute = None
+        self._identity = None
         self._virtual_network = None
         self._work_requests = None
 
@@ -63,6 +88,7 @@ class OciBackend:
             import oci.config
             import oci.container_engine
             import oci.core
+            import oci.identity
             import oci.pagination
             import oci.work_requests
         except ImportError as exc:
@@ -113,6 +139,16 @@ class OciBackend:
         if self._compute is None:
             self._compute = self.oci.core.ComputeClient(config=self._config or {}, signer=self._signer)
         return self._compute
+
+    @property
+    def identity(self):
+        self._ensure_loaded()
+        if self._identity is None:
+            self._identity = self.oci.identity.IdentityClient(
+                config=self._config or {},
+                signer=self._signer,
+            )
+        return self._identity
 
     @property
     def virtual_network(self):
@@ -166,6 +202,11 @@ class OciBackend:
             node_config = getattr(node_pool, "node_config_details", None)
             placement_configs = list(getattr(node_config, "placement_configs", None) or [])
             compute_cluster_id = getattr(node_config, "compute_cluster_id", None)
+            host_group_ids = {
+                host_group_id
+                for placement in placement_configs
+                if (host_group_id := getattr(placement, "host_group_id", None))
+            }
             pools.append(
                 WorkerPoolInfo(
                     name=getattr(node_pool, "name", None) or getattr(summary, "name", None) or summary.id,
@@ -178,13 +219,13 @@ class OciBackend:
                     created_by_mgmt_oke=_is_mgmt_oke_created(
                         getattr(node_pool, "freeform_tags", None)
                     ),
-                    placement_type="compute-cluster" if compute_cluster_id else "standard",
+                    placement_type=(
+                        "compute-cluster"
+                        if compute_cluster_id
+                        else "host-group" if host_group_ids else "standard"
+                    ),
                     compute_cluster_id=compute_cluster_id,
-                    host_group_ids={
-                        host_group_id
-                        for placement in placement_configs
-                        if (host_group_id := getattr(placement, "host_group_id", None))
-                    },
+                    host_group_ids=host_group_ids,
                     availability_domain=_first_node_pool_placement_ad(node_config),
                     oci_instance_ids={
                         node_id for node in active_nodes if (node_id := _object_id(node))
@@ -554,6 +595,89 @@ class OciBackend:
         )
         return response.headers.get("opc-work-request-id")
 
+    def get_compute_cluster_info(
+        self,
+        compute_cluster_id: str,
+    ) -> ComputeClusterInfo:
+        response = self._call(
+            "Compute Cluster lookup",
+            self.compute.get_compute_cluster,
+            compute_cluster_id,
+        )
+        return _compute_cluster_info(response.data)
+
+    def resolve_availability_domain(
+        self,
+        compartment_id: str,
+        requested_name: str,
+    ) -> str:
+        requested = requested_name.strip()
+        if not requested:
+            raise OciDiscoveryError("Availability domain cannot be empty.")
+        if ":" in requested:
+            return requested
+
+        response = self._call(
+            "Availability domain lookup",
+            self.identity.list_availability_domains,
+            compartment_id,
+        )
+        names = tuple(
+            str(name)
+            for item in response.data
+            if (name := getattr(item, "name", None))
+        )
+        requested_folded = requested.casefold()
+        matches = tuple(
+            name
+            for name in names
+            if name.casefold() == requested_folded
+            or name.rsplit(":", 1)[-1].casefold() == requested_folded
+        )
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise OciDiscoveryError(
+                f"Availability domain name is ambiguous: {requested}. "
+                "Use its canonical tenancy-prefixed name."
+            )
+        available = ", ".join(sorted(names)) or "none visible"
+        raise OciDiscoveryError(
+            f"Availability domain was not found: {requested}. Available: "
+            f"{available}."
+        )
+
+    def create_compute_cluster(
+        self,
+        *,
+        compartment_id: str,
+        availability_domain: str,
+        display_name: str,
+        pool_name: str,
+        freeform_tags: dict[str, str] | None = None,
+        opc_retry_token: str | None = None,
+    ) -> ComputeClusterInfo:
+        tags = dict(freeform_tags or {})
+        tags.update(
+            {
+                "mgmt-oke-created": "true",
+                "mgmt-oke-pool": pool_name,
+            }
+        )
+        details = self.oci.core.models.CreateComputeClusterDetails(
+            availability_domain=availability_domain,
+            compartment_id=compartment_id,
+            display_name=display_name,
+            freeform_tags=tags,
+        )
+        response = self._call(
+            "Compute Cluster creation",
+            self.compute.create_compute_cluster,
+            details,
+            opc_retry_token=opc_retry_token or str(uuid.uuid4()),
+        )
+        return _compute_cluster_info(response.data)
+
     def preview_managed_node_pool_create(
         self,
         source_node_pool_id: str,
@@ -562,6 +686,8 @@ class OciBackend:
         name: str,
         size: int,
         spec: PoolCreateSpec,
+        *,
+        bootstrap_metadata: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         details = self._build_managed_node_pool_create_details(
             source_node_pool_id,
@@ -570,6 +696,7 @@ class OciBackend:
             name,
             size,
             spec,
+            bootstrap_metadata=bootstrap_metadata,
         )
         return _managed_node_pool_create_preview(details, spec)
 
@@ -582,8 +709,14 @@ class OciBackend:
         size: int,
         spec: PoolCreateSpec,
         *,
+        bootstrap_metadata: Mapping[str, str] | None = None,
         opc_retry_token: str | None = None,
     ) -> ManagedNodePoolCreateResult:
+        if spec.creates_compute_cluster:
+            raise OciDiscoveryError(
+                "Create the dedicated Compute Cluster before submitting the "
+                "managed node-pool request."
+            )
         details = self._build_managed_node_pool_create_details(
             source_node_pool_id,
             cluster_id,
@@ -591,6 +724,7 @@ class OciBackend:
             name,
             size,
             spec,
+            bootstrap_metadata=bootstrap_metadata,
         )
         response = self._call(
             "Managed OKE node pool creation",
@@ -599,6 +733,7 @@ class OciBackend:
             opc_retry_token=opc_retry_token or str(uuid.uuid4()),
         )
         headers = getattr(response, "headers", None) or {}
+        node_config = getattr(details, "node_config_details", None)
         return ManagedNodePoolCreateResult(
             node_pool_id=getattr(
                 getattr(response, "data", None),
@@ -606,6 +741,12 @@ class OciBackend:
                 None,
             ),
             work_request_id=headers.get("opc-work-request-id"),
+            compute_cluster_id=getattr(
+                node_config,
+                "compute_cluster_id",
+                None,
+            ),
+            host_group_id=spec.host_group_id,
         )
 
     def _build_managed_node_pool_create_details(
@@ -616,16 +757,23 @@ class OciBackend:
         name: str,
         size: int,
         spec: PoolCreateSpec,
+        *,
+        bootstrap_metadata: Mapping[str, str] | None = None,
     ) -> Any:
+        spec = self._with_resolved_availability_domain(
+            compartment_id,
+            spec,
+        )
         try:
             normalized_name = normalize_pool_name(name)
         except ValueError as exc:
             raise OciDiscoveryError(str(exc)) from exc
         if size < 1:
             raise OciDiscoveryError("Managed node pool size must be at least one.")
-        if spec.pool_type not in {"cpu", "gpu"}:
+        if spec.pool_type not in {"cpu", "gpu"} and not spec.uses_compute_cluster:
             raise OciDiscoveryError(
-                "Managed node-pool creation requires pool type cpu or gpu."
+                "Managed node-pool creation requires pool type cpu or gpu, or "
+                "RDMA mode compute-cluster."
             )
 
         source = self._call(
@@ -697,51 +845,73 @@ class OciBackend:
             normalized_name,
         )
         node_config_freeform_tags.update(dict(spec.freeform_tags))
-        node_config = (
-            self.oci.container_engine.models.CreateNodePoolNodeConfigDetails(
-                size=size,
-                nsg_ids=(
-                    list(spec.node_nsg_ids)
-                    if spec.node_nsg_ids
-                    else list(getattr(source_config, "nsg_ids", None) or [])
-                ),
-                kms_key_id=(
-                    spec.boot_volume_kms_key_id
-                    or getattr(source_config, "kms_key_id", None)
-                ),
-                is_pv_encryption_in_transit_enabled=(
-                    spec.pv_encryption_in_transit
-                    if spec.pv_encryption_in_transit is not None
-                    else getattr(
-                        source_config,
-                        "is_pv_encryption_in_transit_enabled",
-                        None,
-                    )
-                ),
-                freeform_tags=node_config_freeform_tags,
-                defined_tags=deepcopy(
-                    getattr(source_config, "defined_tags", None)
-                ),
-                placement_configs=placement_configs,
-                node_pool_pod_network_option_details=pod_network,
-            )
-        )
         source_compute_cluster_id = getattr(
             source_config,
             "compute_cluster_id",
             None,
         )
-        if source_compute_cluster_id:
-            supported_fields = getattr(node_config, "swagger_types", {})
-            if "compute_cluster_id" not in supported_fields:
+        effective_compute_cluster_id = spec.compute_cluster_id
+        if (
+            not effective_compute_cluster_id
+            and not spec.creates_compute_cluster
+            and source_compute_cluster_id
+        ):
+            effective_compute_cluster_id = source_compute_cluster_id
+
+        node_config_values: dict[str, Any] = {
+            "size": size,
+            "nsg_ids": (
+                list(spec.node_nsg_ids)
+                if spec.node_nsg_ids
+                else list(getattr(source_config, "nsg_ids", None) or [])
+            ),
+            "kms_key_id": (
+                spec.boot_volume_kms_key_id
+                or getattr(source_config, "kms_key_id", None)
+            ),
+            "is_pv_encryption_in_transit_enabled": (
+                spec.pv_encryption_in_transit
+                if spec.pv_encryption_in_transit is not None
+                else getattr(
+                    source_config,
+                    "is_pv_encryption_in_transit_enabled",
+                    None,
+                )
+            ),
+            "freeform_tags": node_config_freeform_tags,
+            "defined_tags": deepcopy(
+                getattr(source_config, "defined_tags", None)
+            ),
+            "placement_configs": placement_configs,
+            "node_pool_pod_network_option_details": pod_network,
+        }
+        node_config_model = (
+            self.oci.container_engine.models.CreateNodePoolNodeConfigDetails
+        )
+        if effective_compute_cluster_id:
+            if not _sdk_model_supports_field(
+                node_config_model,
+                "compute_cluster_id",
+            ):
                 raise OciDiscoveryError(
-                    "The installed OCI Python SDK cannot clone managed Compute "
-                    "Cluster placement. Upgrade the OCI SDK to the version "
+                    "The installed OCI Python SDK cannot create managed Compute "
+                    "Cluster node pools. Upgrade the OCI SDK to the version "
                     "declared by this project."
                 )
-            node_config.compute_cluster_id = source_compute_cluster_id
+            node_config_values["compute_cluster_id"] = (
+                effective_compute_cluster_id
+            )
+        node_config = node_config_model(**node_config_values)
 
-        metadata = dict(getattr(source, "node_metadata", None) or {})
+        metadata = _string_metadata(
+            getattr(source, "node_metadata", None),
+            source="Managed OKE source pool",
+        )
+        if bootstrap_metadata is not None:
+            metadata = _merge_legacy_bootstrap_metadata(
+                metadata,
+                bootstrap_metadata,
+            )
         source_user_data = metadata.get("user_data")
         if not source_user_data:
             raise OciDiscoveryError(
@@ -789,7 +959,7 @@ class OciBackend:
                 "Source managed node pool does not expose a Kubernetes version."
             )
 
-        self._validate_create_compatibility(
+        shape_targets_by_ad = self._validate_create_compatibility(
             compartment_id=compartment_id,
             shape=shape,
             image_id=image_id,
@@ -824,6 +994,15 @@ class OciBackend:
                 )
             ),
             require_local_nvme=spec.nvme_raid is not None,
+            require_rdma=spec.uses_compute_cluster,
+        )
+        self._validate_managed_placement(
+            shape=shape,
+            placements=tuple(placement_configs),
+            compute_cluster_id=effective_compute_cluster_id,
+            create_compute_cluster=spec.creates_compute_cluster,
+            host_group_id=spec.host_group_id,
+            shape_targets_by_ad=shape_targets_by_ad,
         )
 
         return self.oci.container_engine.models.CreateNodePoolDetails(
@@ -856,7 +1035,9 @@ class OciBackend:
         pod_subnet_ids: tuple[str, ...],
         nsg_ids: tuple[str, ...],
         require_local_nvme: bool,
-    ) -> None:
+        require_rdma: bool = False,
+    ) -> dict[str, frozenset[str]]:
+        shape_targets_by_ad: dict[str, frozenset[str]] = {}
         for availability_domain in dict.fromkeys(availability_domains):
             if not availability_domain:
                 raise OciDiscoveryError(
@@ -888,6 +1069,28 @@ class OciBackend:
                     f"NVMe RAID was requested, but shape {shape} does not "
                     "advertise local disks."
                 )
+            if require_rdma and not any(
+                int(getattr(candidate, "rdma_ports", 0) or 0) > 0
+                for candidate in matches
+            ):
+                raise OciDiscoveryError(
+                    "Managed Compute Cluster RDMA was requested, but shape "
+                    f"{shape} does not advertise RDMA ports in "
+                    f"{availability_domain}."
+                )
+            shape_targets_by_ad[availability_domain] = frozenset(
+                {
+                    shape,
+                    *(
+                        str(platform_name)
+                        for candidate in matches
+                        for platform_name in (
+                            getattr(candidate, "platform_names", None) or ()
+                        )
+                        if platform_name
+                    ),
+                }
+            )
 
         source_vcn_id: str | None = None
         if source_subnet_id:
@@ -934,6 +1137,120 @@ class OciBackend:
                     f"Network security group {nsg_id} is not in the source "
                     "worker pool VCN."
                 )
+        return shape_targets_by_ad
+
+    def _validate_managed_placement(
+        self,
+        *,
+        shape: str,
+        placements: tuple[Any, ...],
+        compute_cluster_id: str | None,
+        create_compute_cluster: bool,
+        host_group_id: str | None,
+        shape_targets_by_ad: dict[str, frozenset[str]],
+    ) -> None:
+        if not placements:
+            raise OciDiscoveryError(
+                "Managed node-pool creation requires a placement configuration."
+            )
+        availability_domains = {
+            str(getattr(placement, "availability_domain", "") or "")
+            for placement in placements
+        }
+        availability_domains.discard("")
+
+        if compute_cluster_id or create_compute_cluster:
+            if len(placements) != 1 or len(availability_domains) != 1:
+                raise OciDiscoveryError(
+                    "Compute Cluster-backed node pools require exactly one "
+                    "placement configuration in one availability domain."
+                )
+            if any(
+                getattr(placement, "fault_domains", None)
+                for placement in placements
+            ):
+                raise OciDiscoveryError(
+                    "Compute Cluster-backed node pools cannot specify fault domains."
+                )
+            if compute_cluster_id:
+                cluster = self.get_compute_cluster_info(compute_cluster_id)
+                if cluster.lifecycle_state.upper() != "ACTIVE":
+                    raise OciDiscoveryError(
+                        f"Compute Cluster is not ACTIVE: "
+                        f"{cluster.lifecycle_state or 'UNKNOWN'}"
+                    )
+                selected_ad = next(iter(availability_domains))
+                if cluster.availability_domain != selected_ad:
+                    raise OciDiscoveryError(
+                        f"Compute Cluster is in {cluster.availability_domain}, "
+                        f"but the node-pool placement uses {selected_ad}."
+                    )
+
+        if not host_group_id:
+            return
+        if len(placements) != 1 or len(availability_domains) != 1:
+            raise OciDiscoveryError(
+                "One --host-group-id requires exactly one managed node-pool "
+                "placement configuration. Select its availability domain with "
+                "--availability-domain."
+            )
+        get_host_group = getattr(self.compute, "get_compute_host_group", None)
+        if get_host_group is None:
+            raise OciDiscoveryError(
+                "The installed OCI Python SDK cannot inspect Compute Host "
+                "Groups. Upgrade the OCI SDK to the version declared by this "
+                "project."
+            )
+        response = self._call(
+            "Compute Host Group lookup",
+            get_host_group,
+            host_group_id,
+        )
+        host_group = response.data
+        lifecycle_state = str(
+            getattr(host_group, "lifecycle_state", "") or ""
+        ).upper()
+        if lifecycle_state != "ACTIVE":
+            raise OciDiscoveryError(
+                f"Compute Host Group is not ACTIVE: "
+                f"{lifecycle_state or 'UNKNOWN'}"
+            )
+        selected_ad = next(iter(availability_domains))
+        host_group_ad = str(
+            getattr(host_group, "availability_domain", "") or ""
+        )
+        if host_group_ad != selected_ad:
+            raise OciDiscoveryError(
+                f"Compute Host Group is in {host_group_ad or 'an unknown AD'}, "
+                f"but the node-pool placement uses {selected_ad}."
+            )
+        configurations = list(
+            getattr(host_group, "configurations", None) or []
+        )
+        valid_targets = {
+            str(getattr(configuration, "target", "") or "")
+            for configuration in configurations
+            if str(
+                getattr(configuration, "state", "VALID") or "VALID"
+            ).upper()
+            == "VALID"
+        }
+        valid_targets.discard("")
+        compatible_targets = shape_targets_by_ad.get(
+            selected_ad,
+            frozenset({shape}),
+        )
+        if not {
+            target.casefold() for target in valid_targets
+        }.intersection(
+            target.casefold() for target in compatible_targets
+        ):
+            targets = ", ".join(sorted(valid_targets)) or "none"
+            raise OciDiscoveryError(
+                f"Compute Host Group does not expose a VALID configuration "
+                f"for shape {shape} or one of its OCI platforms. Reported "
+                f"targets: {targets}."
+            )
 
     def resize_cluster_network(
         self,
@@ -1053,6 +1370,30 @@ class OciBackend:
             str(instance_configuration_id),
             spec,
             opc_retry_token=cluster_network_retry_token,
+        )
+
+    def get_cluster_network_pool_bootstrap_metadata(
+        self,
+        source_cluster_network_id: str,
+        source_instance_pool_id: str,
+    ) -> dict[str, str]:
+        _source, source_pool, _placement = self._get_cluster_network_pool_source(
+            source_cluster_network_id,
+            source_instance_pool_id,
+        )
+        source_configuration = self._get_instance_configuration_template(
+            source_pool.instance_configuration_id
+        )
+        instance_details = getattr(source_configuration, "instance_details", None)
+        launch_details = getattr(instance_details, "launch_details", None)
+        if launch_details is None:
+            raise OciDiscoveryError(
+                "Legacy bootstrap source Instance Configuration does not expose "
+                "compute launch details."
+            )
+        return _required_oke_bootstrap_metadata(
+            getattr(launch_details, "metadata", None),
+            source="Legacy bootstrap source Instance Configuration",
         )
 
     def _create_cluster_network_with_configuration(
@@ -1213,6 +1554,7 @@ class OciBackend:
             "max_pods_per_node": _optional_int(
                 metadata.get("oke-max-pods")
             ),
+            "worker_bootstrap": _worker_bootstrap_preview(metadata),
             "storage": _storage_preview(spec),
         }
 
@@ -1264,6 +1606,10 @@ class OciBackend:
         spec: PoolCreateSpec | None = None,
     ) -> Any:
         spec = spec or PoolCreateSpec(pool_type="rdma")
+        spec = self._with_resolved_availability_domain(
+            compartment_id,
+            spec,
+        )
         if spec.pool_type != "rdma":
             raise OciDiscoveryError(
                 "Cluster Network creation requires pool type rdma."
@@ -1275,21 +1621,10 @@ class OciBackend:
                 "Source Instance Configuration does not expose compute launch details."
             )
 
-        metadata = dict(getattr(launch_details, "metadata", None) or {})
-        required_metadata = (
-            "apiserver_host",
-            "cluster_ca_cert",
-            "oke-initial-node-labels",
-            "user_data",
+        metadata = _required_oke_bootstrap_metadata(
+            getattr(launch_details, "metadata", None),
+            source="Source Instance Configuration",
         )
-        missing_metadata = [
-            key for key in required_metadata if not metadata.get(key)
-        ]
-        if missing_metadata:
-            raise OciDiscoveryError(
-                "Source Instance Configuration is missing required OKE bootstrap "
-                f"metadata: {', '.join(missing_metadata)}"
-            )
         source_cni = (
             "OCI_VCN_IP_NATIVE"
             if _metadata_truthy(metadata.get("oke-native-pod-networking"))
@@ -1463,6 +1798,24 @@ class OciBackend:
             freeform_tags=instance_configuration_tags,
             source="NONE",
             instance_details=instance_details,
+        )
+
+    def _with_resolved_availability_domain(
+        self,
+        compartment_id: str,
+        spec: PoolCreateSpec,
+    ) -> PoolCreateSpec:
+        if not spec.availability_domain:
+            return spec
+        availability_domain = self.resolve_availability_domain(
+            compartment_id,
+            spec.availability_domain,
+        )
+        if availability_domain == spec.availability_domain:
+            return spec
+        return replace(
+            spec,
+            availability_domain=availability_domain,
         )
 
     def _get_cluster_network_pool_source(
@@ -2531,7 +2884,11 @@ class OciBackend:
             raise OciDiscoveryError(
                 f"Managed pool {pool.name} has no source OCID or positive size."
             )
-        pool_type = "gpu" if pool.gpu_resource else "cpu"
+        pool_type = (
+            "rdma"
+            if pool.rdma_enabled
+            else "gpu" if pool.gpu_resource else "cpu"
+        )
         return self.create_managed_node_pool(
             pool.node_pool_id,
             cluster_id,
@@ -2540,6 +2897,13 @@ class OciBackend:
             pool.desired_size,
             PoolCreateSpec(
                 pool_type=pool_type,
+                rdma_mode=(
+                    "compute-cluster" if pool.rdma_enabled else None
+                ),
+                compute_cluster_id=pool.compute_cluster_id,
+                host_group_id=(
+                    next(iter(sorted(pool.host_group_ids)), None)
+                ),
                 kubernetes_version=target_version,
                 image_id=image_id,
                 freeform_tags=(
@@ -3170,32 +3534,48 @@ def _build_managed_placement_configs(
         ]
         source_placements = matching or [source_placements[0]]
 
+    placement_model = (
+        oci_module.container_engine.models.NodePoolPlacementConfigDetails
+    )
+    if spec.host_group_id and not _sdk_model_supports_field(
+        placement_model,
+        "host_group_id",
+    ):
+        raise OciDiscoveryError(
+            "The installed OCI Python SDK cannot create managed node pools "
+            "with Compute Host Groups. Upgrade the OCI SDK to the version "
+            "declared by this project."
+        )
+
     placements = []
     for source in source_placements:
-        placements.append(
-            oci_module.container_engine.models.NodePoolPlacementConfigDetails(
-                availability_domain=(
-                    spec.availability_domain
-                    or getattr(source, "availability_domain", None)
-                ),
-                subnet_id=(
-                    spec.primary_subnet_id
-                    or getattr(source, "subnet_id", None)
-                ),
-                capacity_reservation_id=(
-                    spec.capacity_reservation_id
-                    or getattr(source, "capacity_reservation_id", None)
-                ),
-                preemptible_node_config=deepcopy(
-                    getattr(source, "preemptible_node_config", None)
-                ),
-                fault_domains=(
-                    list(spec.fault_domains)
-                    if spec.fault_domains
-                    else list(getattr(source, "fault_domains", None) or [])
-                ),
-            )
-        )
+        values: dict[str, Any] = {
+            "availability_domain": (
+                spec.availability_domain
+                or getattr(source, "availability_domain", None)
+            ),
+            "subnet_id": (
+                spec.primary_subnet_id
+                or getattr(source, "subnet_id", None)
+            ),
+            "capacity_reservation_id": (
+                spec.capacity_reservation_id
+                or getattr(source, "capacity_reservation_id", None)
+            ),
+            "preemptible_node_config": deepcopy(
+                getattr(source, "preemptible_node_config", None)
+            ),
+            "fault_domains": (
+                []
+                if spec.uses_compute_cluster
+                else list(spec.fault_domains)
+                if spec.fault_domains
+                else list(getattr(source, "fault_domains", None) or [])
+            ),
+        }
+        if spec.host_group_id:
+            values["host_group_id"] = spec.host_group_id
+        placements.append(placement_model(**values))
     if any(
         not getattr(placement, "availability_domain", None)
         or not getattr(placement, "subnet_id", None)
@@ -3483,8 +3863,23 @@ def _managed_node_pool_create_preview(
     source = details.node_source_details
     pod_network = config.node_pool_pod_network_option_details
     placements = list(config.placement_configs or [])
+    compute_cluster_id = getattr(config, "compute_cluster_id", None)
+    host_group_ids = [
+        host_group_id
+        for placement in placements
+        if (host_group_id := getattr(placement, "host_group_id", None))
+    ]
+    fault_domains = [
+        list(getattr(placement, "fault_domains", None) or [])
+        for placement in placements
+    ]
     return {
         "backend": "oke-node-pool",
+        "placement": (
+            "compute-cluster"
+            if compute_cluster_id or spec.creates_compute_cluster
+            else "host-group" if host_group_ids else "standard"
+        ),
         "name": details.name,
         "count": config.size,
         "shape": details.node_shape,
@@ -3509,10 +3904,24 @@ def _managed_node_pool_create_preview(
             getattr(placement, "subnet_id", None)
             for placement in placements
         ],
-        "fault_domains": [
-            list(getattr(placement, "fault_domains", None) or [])
-            for placement in placements
-        ],
+        "fault_domains": fault_domains if any(fault_domains) else [],
+        "compute_cluster_action": (
+            "create"
+            if spec.creates_compute_cluster
+            else "use-existing" if compute_cluster_id else None
+        ),
+        "compute_cluster_id": compute_cluster_id,
+        "compute_cluster_name": (
+            spec.compute_cluster_name or f"{details.name}-cc"
+            if spec.creates_compute_cluster
+            else None
+        ),
+        "compute_cluster_compartment_id": (
+            spec.compute_cluster_compartment_id or details.compartment_id
+            if spec.creates_compute_cluster
+            else None
+        ),
+        "host_group_ids": host_group_ids,
         "node_nsg_ids": list(config.nsg_ids or []),
         "cni_type": getattr(pod_network, "cni_type", None),
         "pod_subnet_ids": list(
@@ -3526,8 +3935,89 @@ def _managed_node_pool_create_preview(
             "max_pods_per_node",
             None,
         ),
+        "worker_bootstrap": _worker_bootstrap_preview(details.node_metadata),
         "storage": _storage_preview(spec),
     }
+
+
+def _string_metadata(value: Any, *, source: str) -> dict[str, str]:
+    metadata = dict(value or {})
+    invalid = sorted(
+        str(key)
+        for key, item in metadata.items()
+        if not isinstance(key, str) or not isinstance(item, str)
+    )
+    if invalid:
+        raise OciDiscoveryError(
+            f"{source} contains non-string metadata values: {', '.join(invalid)}."
+        )
+    return metadata
+
+
+def _worker_bootstrap_preview(metadata: Mapping[str, str]) -> dict[str, Any]:
+    try:
+        return summarize_worker_bootstrap(metadata)
+    except BootstrapCompositionError as exc:
+        raise OciDiscoveryError(
+            f"Worker cloud-init cannot be inspected safely: {exc}"
+        ) from exc
+
+
+def _required_oke_bootstrap_metadata(
+    value: Any,
+    *,
+    source: str,
+) -> dict[str, str]:
+    metadata = _string_metadata(value, source=source)
+    required = (
+        "apiserver_host",
+        "cluster_ca_cert",
+        "oke-initial-node-labels",
+        "user_data",
+    )
+    missing = [key for key in required if not metadata.get(key)]
+    if missing:
+        raise OciDiscoveryError(
+            f"{source} is missing required OKE bootstrap metadata: "
+            f"{', '.join(missing)}"
+        )
+    return metadata
+
+
+def _merge_legacy_bootstrap_metadata(
+    managed_metadata: Mapping[str, str],
+    legacy_metadata: Mapping[str, str],
+) -> dict[str, str]:
+    current = _string_metadata(
+        managed_metadata,
+        source="Managed OKE source pool",
+    )
+    legacy = _required_oke_bootstrap_metadata(
+        legacy_metadata,
+        source="Legacy bootstrap source Instance Configuration",
+    )
+    for key in _CLUSTER_IDENTITY_METADATA_KEYS:
+        current_value = current.get(key)
+        legacy_value = legacy.get(key)
+        if current_value and legacy_value and current_value != legacy_value:
+            raise OciDiscoveryError(
+                "Legacy bootstrap source does not belong to the same OKE cluster: "
+                f"{key} differs from the managed source pool."
+            )
+
+    merged = dict(current)
+    for key in _CLUSTER_IDENTITY_METADATA_KEYS:
+        if not merged.get(key) and legacy.get(key):
+            merged[key] = legacy[key]
+    merged.update(
+        {
+            key: value
+            for key, value in legacy.items()
+            if key not in _MANAGED_BOOTSTRAP_AUTHORITY_KEYS
+        }
+    )
+    merged["user_data"] = legacy["user_data"]
+    return merged
 
 
 def _requires_user_data_composition(spec: PoolCreateSpec) -> bool:
@@ -3563,7 +4053,7 @@ def _validate_shape_for_pool_type(shape: str, pool_type: str) -> None:
         )
     if pool_type == "rdma" and not shape.upper().startswith("BM.GPU"):
         raise OciDiscoveryError(
-            f"Self-managed RDMA pool type requires a BM.GPU shape: {shape}"
+            f"RDMA pool type requires a BM.GPU shape: {shape}"
         )
 
 
@@ -3717,6 +4207,38 @@ def _gpu_resource_for_shape(shape: str | None) -> str | None:
     if ".MI" in shape:
         return "amd.com/gpu"
     return "nvidia.com/gpu"
+
+
+def _compute_cluster_info(resource: Any) -> ComputeClusterInfo:
+    compute_cluster_id = str(getattr(resource, "id", "") or "")
+    availability_domain = str(
+        getattr(resource, "availability_domain", "") or ""
+    )
+    compartment_id = str(getattr(resource, "compartment_id", "") or "")
+    if not compute_cluster_id or not availability_domain or not compartment_id:
+        raise OciDiscoveryError(
+            "Compute Cluster response is missing its OCID, compartment, or "
+            "availability domain."
+        )
+    return ComputeClusterInfo(
+        compute_cluster_id=compute_cluster_id,
+        display_name=str(
+            getattr(resource, "display_name", "") or compute_cluster_id
+        ),
+        availability_domain=availability_domain,
+        compartment_id=compartment_id,
+        lifecycle_state=str(
+            getattr(resource, "lifecycle_state", "") or "UNKNOWN"
+        ),
+    )
+
+
+def _sdk_model_supports_field(model_type: Any, field_name: str) -> bool:
+    try:
+        model = model_type()
+    except Exception:
+        return False
+    return field_name in dict(getattr(model, "swagger_types", {}) or {})
 
 
 def _clone_pool_freeform_tags(

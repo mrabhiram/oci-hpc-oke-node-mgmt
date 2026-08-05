@@ -12,6 +12,7 @@ from oke_hpc_mgmt.models import (
     NODE_POOL_CNI_TYPES,
     POOL_CREATE_TYPES,
     POOL_STORAGE_MODES,
+    RDMA_POOL_MODES,
     FssMountSpec,
     LustreMountSpec,
     NvmeRaidSpec,
@@ -32,7 +33,10 @@ def pool_create_options(function: CommandFunction) -> CommandFunction:
             "pool_type",
             type=click.Choice(POOL_CREATE_TYPES, case_sensitive=False),
             required=True,
-            help="Pool backend: managed CPU, managed GPU, or self-managed RDMA.",
+            help=(
+                "Pool workload type: CPU, GPU, or RDMA. RDMA uses a legacy "
+                "Cluster Network unless --rdma-mode compute-cluster is set."
+            ),
         ),
         click.option(
             "--count",
@@ -41,9 +45,50 @@ def pool_create_options(function: CommandFunction) -> CommandFunction:
             help="Initial number of workers.",
         ),
         click.option(
+            "--rdma-mode",
+            type=click.Choice(RDMA_POOL_MODES, case_sensitive=False),
+            help=(
+                "RDMA backend. Defaults to cluster-network for compatibility; "
+                "compute-cluster creates a managed OKE node pool."
+            ),
+        ),
+        click.option(
+            "--compute-cluster-id",
+            help=(
+                "Existing Compute Cluster OCID for managed RDMA placement. "
+                "When omitted, mgmt-oke creates a dedicated Compute Cluster."
+            ),
+        ),
+        click.option(
+            "--compute-cluster-name",
+            help=(
+                "Display name for an automatically created Compute Cluster. "
+                "Defaults to <pool>-cc."
+            ),
+        ),
+        click.option(
+            "--compute-cluster-compartment-id",
+            help=(
+                "Compartment for an automatically created Compute Cluster. "
+                "Defaults to the discovered OKE cluster compartment."
+            ),
+        ),
+        click.option(
+            "--host-group-id",
+            help="Existing Compute Host Group OCID for managed node placement.",
+        ),
+        click.option(
             "--from-pool",
             "source_identifier",
             help="Source pool whose proven OKE bootstrap and defaults are inherited.",
+        ),
+        click.option(
+            "--bootstrap-from-pool",
+            "bootstrap_source_identifier",
+            help=(
+                "Legacy Cluster Network RDMA pool whose cloud-init and supported "
+                "bootstrap metadata are inherited by a managed Compute Cluster pool."
+            ),
         ),
         click.option("--availability-domain", help="Target availability domain name."),
         click.option("--shape", help="OCI Compute shape override."),
@@ -256,6 +301,11 @@ def pool_create_options(function: CommandFunction) -> CommandFunction:
 def build_pool_create_spec(
     *,
     pool_type: str,
+    rdma_mode: str | None,
+    compute_cluster_id: str | None,
+    compute_cluster_name: str | None,
+    compute_cluster_compartment_id: str | None,
+    host_group_id: str | None,
     availability_domain: str | None,
     shape: str | None,
     image_id: str | None,
@@ -320,6 +370,13 @@ def build_pool_create_spec(
     )
     spec = PoolCreateSpec(
         pool_type=pool_type.lower(),
+        rdma_mode=rdma_mode.lower() if rdma_mode else None,
+        compute_cluster_id=_stripped(compute_cluster_id),
+        compute_cluster_name=_stripped(compute_cluster_name),
+        compute_cluster_compartment_id=_stripped(
+            compute_cluster_compartment_id
+        ),
+        host_group_id=_stripped(host_group_id),
         availability_domain=_stripped(availability_domain),
         shape=_stripped(shape),
         image_id=_stripped(image_id),
