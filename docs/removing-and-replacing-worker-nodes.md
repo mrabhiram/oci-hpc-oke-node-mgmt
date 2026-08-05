@@ -36,11 +36,20 @@ the owning service launches a replacement.
 | Legacy Cluster Network | `DetachInstancePoolInstance` with automatic termination |
 | Standalone Instance Pool | `DetachInstancePoolInstance` with automatic termination |
 
+Before termination, the operator can report a bad host through the defined
+tag `ComputeInstanceHostActions.CustomerReportedHostStatus=unhealthy`. The CLI
+preserves all other defined tags, updates the instance with its current ETag,
+and verifies the value through a second OCI read. If any requested tag cannot
+be applied or verified, no selected worker is submitted for termination.
+
 ## Prerequisites
 
 - complete OCI and Kubernetes inventory
 - IAM permission to delete an OKE node or detach an Instance Pool instance and
   inspect its work requests when using `--wait`
+- permission to inspect and update Compute instances when using
+  `--tag unhealthy`, plus access to the `ComputeInstanceHostActions` tag
+  namespace and `CustomerReportedHostStatus` tag definition
 - Kubernetes permission to read nodes and pods, patch nodes, create pod
   evictions, and manage the `kube-system/mgmt-oke-mutation` Lease
 - no Cluster Autoscaler ownership of the target pool
@@ -82,7 +91,7 @@ mgmt-oke --auth instance_principal pools get <pool-name>
 
 ```bash
 mgmt-oke --auth instance_principal nodes terminate gpu-node-1 \
-  --keep-size --dry-run --format json
+  --tag unhealthy --keep-size --dry-run --format json
 ```
 
 Example replacement dry-run output:
@@ -92,6 +101,9 @@ Example replacement dry-run output:
   {
     "current_size": 1,
     "decrement_size": false,
+    "details": {
+      "customer_reported_host_status": "unhealthy"
+    },
     "operation": "node-remove",
     "owner": "oke",
     "pool": "oke-gpu",
@@ -99,6 +111,8 @@ Example replacement dry-run output:
     "steps": [
       "cordon Kubernetes node",
       "evict non-DaemonSet pods through the Eviction API",
+      "tag OCI instance as customer-reported unhealthy",
+      "verify OCI instance unhealthy tag",
       "delete the selected worker through OKE DeleteNode"
     ],
     "target": "gpu-node-1",
@@ -113,7 +127,35 @@ Example replacement dry-run output:
 
 Preflight resolves the owning OCI service, calculates target capacity, lists
 pods, checks dry-run eviction admission, and reports every planned step. It
-does not cordon, evict, or terminate the node.
+does not cordon, evict, tag, or terminate the node.
+
+## Host Health Decision
+
+Use `--tag unhealthy` when the selected worker is being removed because its
+GPU, RDMA fabric, network links, or other host hardware is unhealthy:
+
+```bash
+mgmt-oke nodes terminate <node-name-or-ip> \
+  --tag unhealthy --keep-size --wait
+```
+
+Use `--tag none` when the removal is not a customer-reported host failure:
+
+```bash
+mgmt-oke nodes terminate <node-name-or-ip> --tag none --wait
+```
+
+If `--tag` is omitted, the CLI asks the following question for each selected
+node before showing or executing the plan:
+
+```text
+Is gpu-node-1 unhealthy and should it be tagged before termination? [y/N]:
+```
+
+For multi-node selection, `--tag unhealthy` applies to every selected node and
+`--tag none` skips every node. Omit the option to answer independently per
+node. `--yes` controls the later OCI mutation confirmation and never answers
+the host health question.
 
 ### Step 3: Remove and Decrement Pool Size
 
@@ -121,7 +163,8 @@ Use the default operation when the selected node and one unit of desired
 capacity should both be removed:
 
 ```bash
-mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> --wait
+mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> \
+  --tag none --wait
 ```
 
 The CLI asks for the exact node name before submitting the mutation. The final
@@ -136,7 +179,7 @@ Use `--keep-size` when the selected worker should be replaced:
 
 ```bash
 mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> \
-  --keep-size --wait
+  --tag unhealthy --keep-size --wait
 ```
 
 For a managed pool, OKE deletes the node with `is_decrement_size=false`. For a
@@ -167,7 +210,7 @@ Override it when workloads need more time:
 
 ```bash
 mgmt-oke --auth instance_principal nodes terminate <node-name> \
-  --keep-size --eviction-grace PT20M --wait
+  --tag none --keep-size --eviction-grace PT20M --wait
 ```
 
 `--force-after-grace` allows OKE to force compute deletion after the override
@@ -175,7 +218,7 @@ grace period:
 
 ```bash
 mgmt-oke --auth instance_principal nodes terminate <node-name> \
-  --keep-size --eviction-grace PT20M --force-after-grace --wait
+  --tag none --keep-size --eviction-grace PT20M --force-after-grace --wait
 ```
 
 These options apply only to managed OKE node pools. They are rejected for
@@ -192,7 +235,7 @@ Pod-local `emptyDir` data requires explicit acknowledgement:
 
 ```bash
 mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> \
-  --delete-emptydir-data --wait
+  --tag none --delete-emptydir-data --wait
 ```
 
 Example refusal without that acknowledgement:
@@ -211,7 +254,7 @@ recreate them:
 
 ```bash
 mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> \
-  --force --wait
+  --tag none --force --wait
 ```
 
 Use `--no-drain` only when the worker has already been drained by an external
@@ -220,7 +263,7 @@ required:
 
 ```bash
 mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> \
-  --no-drain --allow-workloads --wait
+  --tag none --no-drain --allow-workloads --wait
 ```
 
 Standalone node maintenance uses the same selection and eviction engine:
@@ -258,8 +301,11 @@ pool, autoscaler, and Slinky state:
 
 ```bash
 mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> \
-  --keep-size --wait --yes
+  --tag none --keep-size --wait --yes
 ```
+
+Noninteractive execution must provide either `--tag unhealthy` or
+`--tag none`; `--yes` does not infer host health.
 
 ## Refused Operations
 
@@ -273,6 +319,7 @@ The CLI refuses node removal when:
 - drain would delete `emptyDir` data without acknowledgement
 - drain would evict a pod without a controller and `--force` is absent
 - managed-only eviction options are supplied for a self-managed pool
+- the requested unhealthy tag cannot be authorized, applied, or verified
 - OCI target discovery fails
 - another mutation holds the Kubernetes Lease
 

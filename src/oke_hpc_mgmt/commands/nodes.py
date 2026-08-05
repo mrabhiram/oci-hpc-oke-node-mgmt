@@ -23,9 +23,11 @@ from oke_hpc_mgmt.commands.common import (
     selected_identifiers,
     wait_options,
 )
+from oke_hpc_mgmt.models import CustomerReportedHostStatus, HOST_TAG_OPTIONS
 from oke_hpc_mgmt.render import NODE_COLUMNS, node_rows, parse_columns, print_records, sort_records
 from oke_hpc_mgmt.selection import select_nodes
 from oke_hpc_mgmt.workflows.lifecycle import (
+    apply_node_removal_host_tags,
     execute_node_boot_volume_replace,
     execute_node_removal,
     prepare_node_boot_volume_replace,
@@ -127,6 +129,16 @@ def get_nodes(
 
 def removal_options(function: Callable[..., Any]) -> Callable[..., Any]:
     function = click.option(
+        "--tag",
+        "host_tag",
+        type=click.Choice(HOST_TAG_OPTIONS, case_sensitive=False),
+        help=(
+            "Set 'unhealthy' to apply the OCI customer-reported host tag before "
+            "termination, or 'none' to skip it. Omission prompts for each node, "
+            "including with --yes."
+        ),
+    )(function)
+    function = click.option(
         "--force-after-grace",
         is_flag=True,
         help="Force managed OKE compute deletion after its eviction grace period.",
@@ -203,6 +215,7 @@ def terminate_nodes(
     drain_timeout: int,
     eviction_grace: str,
     force_after_grace: bool,
+    host_tag: str | None,
     wait: bool,
     timeout: int,
     poll_interval: int,
@@ -226,6 +239,22 @@ def terminate_nodes(
         force_after_grace=force_after_grace,
         drain_grace_period_seconds=grace_period,
     )
+    host_tags: dict[str, CustomerReportedHostStatus] = {}
+    if host_tag == CustomerReportedHostStatus.UNHEALTHY.value:
+        host_tags = {
+            node.k8s_name: CustomerReportedHostStatus.UNHEALTHY
+            for node in prepared.nodes
+        }
+    elif host_tag is None:
+        for node in prepared.nodes:
+            should_tag = click.confirm(
+                f"Is {node.k8s_name} unhealthy and should it be tagged before termination?",
+                default=False,
+                err=True,
+            )
+            if should_tag:
+                host_tags[node.k8s_name] = CustomerReportedHostStatus.UNHEALTHY
+    prepared = apply_node_removal_host_tags(prepared, host_tags)
     if dry_run:
         emit_plans(state, output_override, prepared.plans)
         print_discovery_warnings(prepared.snapshot.warnings)

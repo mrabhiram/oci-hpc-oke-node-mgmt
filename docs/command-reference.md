@@ -476,26 +476,29 @@ node-boot-volume-replace          gpu-node-1  oke-gpu  oke    1             1   
 Terminate selected workers and decrement desired pool capacity:
 
 ```bash
-mgmt-oke nodes terminate <node-name-or-ip> --dry-run
-mgmt-oke nodes terminate <node-name-or-ip> --wait
+mgmt-oke nodes terminate <node-name-or-ip> --tag none --dry-run
+mgmt-oke nodes terminate <node-name-or-ip> --tag none --wait
 ```
 
-Terminate and replace workers while preserving desired capacity:
+Report an unhealthy host, then terminate and replace it while preserving
+desired capacity:
 
 ```bash
-mgmt-oke nodes terminate <node-name-or-ip> --keep-size --wait
+mgmt-oke nodes terminate <node-name-or-ip> \
+  --tag unhealthy --keep-size --wait
 ```
 
 Terminate several selected workers:
 
 ```bash
-mgmt-oke nodes terminate --nodes <node-a>,<node-b> --dry-run
+mgmt-oke nodes terminate --nodes <node-a>,<node-b> --tag none --dry-run
 ```
 
 Example replacement dry-run output:
 
 ```bash
-mgmt-oke nodes terminate gpu-node-1 --keep-size --dry-run --format json
+mgmt-oke nodes terminate gpu-node-1 \
+  --tag unhealthy --keep-size --dry-run --format json
 ```
 
 ```json
@@ -503,6 +506,9 @@ mgmt-oke nodes terminate gpu-node-1 --keep-size --dry-run --format json
   {
     "current_size": 1,
     "decrement_size": false,
+    "details": {
+      "customer_reported_host_status": "unhealthy"
+    },
     "operation": "node-remove",
     "owner": "oke",
     "pool": "oke-gpu",
@@ -510,6 +516,8 @@ mgmt-oke nodes terminate gpu-node-1 --keep-size --dry-run --format json
     "steps": [
       "cordon Kubernetes node",
       "evict non-DaemonSet pods through the Eviction API",
+      "tag OCI instance as customer-reported unhealthy",
+      "verify OCI instance unhealthy tag",
       "delete the selected worker through OKE DeleteNode"
     ],
     "target": "gpu-node-1",
@@ -526,6 +534,7 @@ Termination drains by default. The safety options are:
 
 | Option | Purpose |
 | --- | --- |
+| `--tag unhealthy\|none` | Apply and verify `ComputeInstanceHostActions.CustomerReportedHostStatus=unhealthy`, or explicitly skip host tagging. If omitted, prompt for each selected node. |
 | `--keep-size` | Preserve desired capacity and allow replacement. |
 | `--drain` / `--no-drain` | Enable or bypass Kubernetes drain. Drain is the default. |
 | `--allow-workloads` | Permit `--no-drain` when workload pods are present. |
@@ -538,10 +547,15 @@ Termination drains by default. The safety options are:
 | `--wait` | Monitor OCI work requests and wait for node absence and complete pool/resource convergence. |
 | `--dry-run` | Validate selection, drain admission, ownership, and target capacity. |
 | `--lock` / `--no-lock` | Enable or bypass the Kubernetes mutation Lease. |
-| `--yes` | Skip interactive typed confirmation. |
+| `--yes` | Skip interactive typed mutation confirmation; it does not answer an omitted `--tag` question. |
 
 Managed OKE pools use OKE `DeleteNode`. Legacy Cluster Network and standalone
 Instance Pool workers use instance-pool detach with automatic termination.
+Requested unhealthy tags are merged with existing defined tags under the
+instance ETag and read back before any selected worker is submitted for
+termination. A tag update or verification failure stops the entire termination
+submission. `--tag unhealthy` applies to every selected worker; omit `--tag`
+for a per-node question or use `--tag none` in noninteractive workflows.
 
 ## Kubernetes Upgrades
 

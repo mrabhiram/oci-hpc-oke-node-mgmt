@@ -81,7 +81,7 @@ target:
 
 ```bash
 mgmt-oke --auth instance_principal pools resize <pool-name> --delta 1
-mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip>
+mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> --tag none
 mgmt-oke --auth instance_principal nodes boot-volume-replace <node-name-or-ip>
 mgmt-oke --auth instance_principal pools boot-volume-replace <pool-name> --image-id <image-ocid>
 ```
@@ -125,8 +125,8 @@ The CLI refuses:
 
 ```bash
 mgmt-oke --auth instance_principal pools resize <slinky-pool> --delta -1
-mgmt-oke --auth instance_principal nodes terminate <slinky-node>
-mgmt-oke --auth instance_principal nodes terminate <slinky-node> --keep-size
+mgmt-oke --auth instance_principal nodes terminate <slinky-node> --tag none
+mgmt-oke --auth instance_principal nodes terminate <slinky-node> --tag none --keep-size
 mgmt-oke --auth instance_principal nodes boot-volume-replace <slinky-node>
 mgmt-oke --auth instance_principal pools boot-volume-replace <slinky-pool> --image-id <image-ocid>
 ```

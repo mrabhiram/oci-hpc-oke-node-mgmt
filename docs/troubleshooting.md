@@ -197,7 +197,8 @@ kubectl get pods -A --field-selector spec.nodeName=<node-name>
 Run a dry-run plan to identify the exact refusal:
 
 ```bash
-mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> --dry-run
+mgmt-oke --auth instance_principal nodes terminate <node-name-or-ip> \
+  --tag none --dry-run
 ```
 
 Example safety refusal:
@@ -218,6 +219,30 @@ drain keeps retrying eviction until its timeout.
 
 `--no-drain` is intended for nodes drained by an external workflow. It requires
 `--allow-workloads` when ordinary workload pods remain.
+
+## Unhealthy Host Tagging Fails
+
+`--tag unhealthy` requires permission to read and update the selected Compute
+instance and use this exact defined tag:
+
+```text
+ComputeInstanceHostActions.CustomerReportedHostStatus=unhealthy
+```
+
+Typical failures report a missing tag namespace or key, insufficient IAM
+permission, a missing instance ETag, a concurrent-update conflict, or a failed
+read-back verification. The command applies and verifies all requested tags
+before submitting any node termination, so these failures leave every selected
+worker in place.
+
+Confirm that the namespace and key are available to the tenancy and that the
+operator instance principal can update the target Compute instances. Then
+retry the same command. A prior successful tag is detected as
+`already-tagged`, making the retry idempotent.
+
+Use `--tag none` only when the removal is not reporting an unhealthy host. In
+noninteractive use, provide either `--tag unhealthy` or `--tag none`; `--yes`
+does not answer the health question.
 
 ## Mutation Lease Is Held
 

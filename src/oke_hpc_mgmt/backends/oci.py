@@ -18,6 +18,7 @@ from oke_hpc_mgmt.models import (
     ClusterInfo,
     ClusterNetworkCreateResult,
     ComputeClusterInfo,
+    CustomerReportedHostStatus,
     ManagedNodePoolCreateResult,
     PoolBootVolumeReplaceSpec,
     PoolCreateSpec,
@@ -55,6 +56,9 @@ _CLUSTER_IDENTITY_METADATA_KEYS = (
     "apiserver_host",
     "cluster_ca_cert",
 )
+CUSTOMER_HOST_TAG_NAMESPACE = "ComputeInstanceHostActions"
+CUSTOMER_HOST_TAG_KEY = "CustomerReportedHostStatus"
+CUSTOMER_HOST_UNHEALTHY_VALUE = CustomerReportedHostStatus.UNHEALTHY.value
 
 
 class OciBackend:
@@ -1986,6 +1990,62 @@ class OciBackend:
             **kwargs,
         )
         return response.headers.get("opc-work-request-id")
+
+    def tag_instance_customer_reported_unhealthy(self, instance_id: str) -> str:
+        response = self._call(
+            "Compute instance lookup for unhealthy tagging",
+            self.compute.get_instance,
+            instance_id,
+        )
+        instance = response.data
+        defined_tags = deepcopy(getattr(instance, "defined_tags", None) or {})
+        namespace_tags = defined_tags.get(CUSTOMER_HOST_TAG_NAMESPACE, {})
+        if not isinstance(namespace_tags, dict):
+            raise OciDiscoveryError(
+                f"Defined tag namespace {CUSTOMER_HOST_TAG_NAMESPACE} has an "
+                "unexpected value on the Compute instance."
+            )
+        if (
+            namespace_tags.get(CUSTOMER_HOST_TAG_KEY)
+            == CUSTOMER_HOST_UNHEALTHY_VALUE
+        ):
+            return "already-tagged"
+
+        etag = (getattr(response, "headers", None) or {}).get("etag")
+        if not etag:
+            raise OciDiscoveryError(
+                f"Compute instance {instance_id} lookup returned no ETag."
+            )
+        namespace_tags = dict(namespace_tags)
+        namespace_tags[CUSTOMER_HOST_TAG_KEY] = CUSTOMER_HOST_UNHEALTHY_VALUE
+        defined_tags[CUSTOMER_HOST_TAG_NAMESPACE] = namespace_tags
+        details = self.oci.core.models.UpdateInstanceDetails(
+            defined_tags=defined_tags
+        )
+        self._call(
+            "Customer-reported unhealthy host tagging",
+            self.compute.update_instance,
+            instance_id,
+            details,
+            if_match=etag,
+        )
+
+        verified = self._call(
+            "Compute instance unhealthy tag verification",
+            self.compute.get_instance,
+            instance_id,
+        ).data
+        verified_tags = getattr(verified, "defined_tags", None) or {}
+        verified_namespace = verified_tags.get(CUSTOMER_HOST_TAG_NAMESPACE, {})
+        if not isinstance(verified_namespace, dict) or (
+            verified_namespace.get(CUSTOMER_HOST_TAG_KEY)
+            != CUSTOMER_HOST_UNHEALTHY_VALUE
+        ):
+            raise OciDiscoveryError(
+                "OCI did not return the expected defined tag after the update; "
+                "node termination was not submitted."
+            )
+        return "tagged"
 
     def get_instance_boot_volume_id(self, instance_id: str) -> str:
         instance = self._call(

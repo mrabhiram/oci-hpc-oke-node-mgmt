@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 RDMA_LABEL_KEYS = (
@@ -43,6 +44,13 @@ CLUSTER_NETWORK_PLACEMENT_CONSTRAINTS = (
 )
 NODE_POOL_CNI_TYPES = ("OCI_VCN_IP_NATIVE", "FLANNEL_OVERLAY")
 NODE_CYCLING_MODES = ("INSTANCE_REPLACE", "BOOT_VOLUME_REPLACE")
+
+
+class CustomerReportedHostStatus(str, Enum):
+    UNHEALTHY = "unhealthy"
+
+
+HOST_TAG_OPTIONS = (CustomerReportedHostStatus.UNHEALTHY.value, "none")
 UPGRADE_STRATEGIES = (
     "auto",
     "boot-volume-replace",

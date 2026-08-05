@@ -64,6 +64,10 @@ Management Tool.
 - wait for allocatable GPU, RDMA topology, and applicable RDMA VF readiness
 - guarded specific managed OKE node removal/termination through OKE `delete_node`
 - guarded specific self-managed node removal/replacement through instance-pool detach and automatic termination
+- optional ETag-protected, read-back-verified
+  `ComputeInstanceHostActions.CustomerReportedHostStatus=unhealthy` tagging
+  before managed or self-managed node termination, with per-node prompts and
+  an explicit `--tag none` automation path
 - guarded individual boot volume replacement for managed and self-managed
   workers through OKE `ReplaceBootVolumeClusterNode`, preserving the compute
   instance, network address, image, and existing node configuration
@@ -126,6 +130,7 @@ Management Tool.
 - [`creating-worker-pools.md`](creating-worker-pools.md)
 - [`live-pool-creation-validation.md`](live-pool-creation-validation.md)
 - [`live-pool-deletion-validation.md`](live-pool-deletion-validation.md)
+- [`live-unhealthy-host-termination-validation.md`](live-unhealthy-host-termination-validation.md)
 - [`replacing-worker-boot-volumes.md`](replacing-worker-boot-volumes.md)
 - [`kubernetes-upgrades.md`](kubernetes-upgrades.md)
 

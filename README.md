@@ -48,6 +48,9 @@ management for OCI HPC OKE clusters:
 - serialize concurrent mutations with a Kubernetes Lease `[Implemented]`
 - cordon, drain, and uncordon selected Kubernetes workers `[Implemented]`
 - remove, replace, or terminate one or more managed or self-managed workers `[Implemented]`
+- optionally mark selected Compute instances with the OCI customer-reported
+  unhealthy-host defined tag before termination, with per-node prompting when
+  no tag decision is supplied `[Implemented]`
 - replace the boot volume of a specific managed or self-managed worker while
   preserving its instance identity and existing node configuration `[Implemented]`
 - roll every worker in a managed OKE pool through boot volume replacement while
@@ -67,6 +70,8 @@ mutate Kubernetes. Upgrade commands never cordon, drain, evict, or uncordon
 workers; operators prepare workloads externally and provide a separate safety
 attestation. Every mutation supports `--dry-run`, uses a Kubernetes Lease by
 default, and requires either `--yes` or an interactive confirmation.
+For node termination, `--yes` confirms the OCI mutation but does not answer the
+separate unhealthy-host question.
 
 ## Install
 
@@ -153,7 +158,7 @@ Command groups:
 | `pools upgrade <pool> --to <version> --strategy <strategy>` | Upgrade one externally prepared worker pool and wait for complete convergence. |
 | `nodes list` | List and filter Kubernetes nodes. |
 | `nodes get <identifier...>` | Get nodes by Kubernetes name, Slurm name, internal IP, provider ID, or instance OCID. |
-| `nodes terminate <identifier...>` | Drain and terminate selected managed or self-managed workers. |
+| `nodes terminate <identifier...>` | Drain and terminate selected managed or self-managed workers, with an optional verified unhealthy-host tag. |
 | `nodes remove <identifier...>` | Compatibility alias for `nodes terminate`. |
 | `nodes boot-volume-replace <identifier...>` | Replace selected managed or self-managed worker boot volumes while preserving the current image and configuration. |
 | `nodes cordon <identifier...>` | Mark selected workers unschedulable. |
@@ -220,6 +225,7 @@ Node removal options:
 
 | Option | Description |
 | --- | --- |
+| `--tag unhealthy\|none` | Apply and verify `ComputeInstanceHostActions.CustomerReportedHostStatus=unhealthy` before termination, or explicitly skip it. If omitted, the CLI asks for each selected node. |
 | `--keep-size` | Delete the node but keep the pool size so the backing pool replaces it. |
 | `--drain` / `--no-drain` | Cordon and evict pods before termination. Drain is enabled by default. |
 | `--allow-workloads` | Allow `--no-drain` termination when workload pods are present. |
@@ -234,7 +240,7 @@ Node removal options:
 | `--poll-interval <seconds>` | Wait polling interval. Default: `30`. |
 | `--dry-run` | Validate selection, ownership, drain constraints, and eviction admission without mutation. |
 | `--lock` / `--no-lock` | Use or bypass the Kubernetes mutation Lease. Locking is enabled by default. |
-| `--yes` | Do not prompt for confirmation. |
+| `--yes` | Do not prompt for mutation confirmation. It does not answer an omitted `--tag` decision. |
 
 Boot volume replacement commands require an enhanced OKE cluster. Individual
 node BVR preserves the current image and node configuration. Managed-pool BVR
@@ -556,8 +562,8 @@ mgmt-oke nodes list --rdma-only
 mgmt-oke nodes get 10.0.127.32
 mgmt-oke nodes get ocid1.instance.oc1.iad.example
 mgmt-oke nodes get <slurm-node-name>
-mgmt-oke nodes terminate 10.0.127.32 --wait --yes
-mgmt-oke nodes terminate 10.0.127.32 --keep-size --wait --yes
+mgmt-oke nodes terminate 10.0.127.32 --tag none --wait --yes
+mgmt-oke nodes terminate 10.0.127.32 --tag unhealthy --keep-size --wait --yes
 mgmt-oke nodes boot-volume-replace 10.0.127.32 --dry-run
 mgmt-oke nodes boot-volume-replace 10.0.127.32 --wait
 ```
@@ -572,10 +578,17 @@ execution path cordons the node and uses the Kubernetes Eviction API before
 calling the owning OCI service. Use `--no-drain` only for an intentionally
 pre-drained node.
 
+When `--tag` is omitted, the CLI asks for every selected node whether it is an
+unhealthy host that should be reported to OCI. `--tag unhealthy` applies and
+reads back the defined tag
+`ComputeInstanceHostActions.CustomerReportedHostStatus=unhealthy` before any
+selected node is terminated. `--tag none` records an explicit decision to skip
+the tag. Existing defined tags are preserved.
+
 Preview a replacement plan:
 
 ```bash
-mgmt-oke nodes terminate <node-name> --keep-size --dry-run
+mgmt-oke nodes terminate <node-name> --tag unhealthy --keep-size --dry-run
 ```
 
 Operate on several explicitly selected nodes or an exact field selection:
@@ -599,7 +612,7 @@ mgmt-oke nodes list --pool oke-gpu --one-line
 Replace a specific RDMA worker while keeping the pool at its current size:
 
 ```bash
-mgmt-oke nodes terminate <rdma-node-name> --keep-size --wait --yes
+mgmt-oke nodes terminate <rdma-node-name> --tag unhealthy --keep-size --wait --yes
 ```
 
 Replace the boot volume of a specific managed or self-managed worker without
@@ -788,6 +801,9 @@ CI runs pytest on Python 3.9, 3.10, 3.11, and 3.12, followed by Ruff and mypy.
   self-managed RDMA creation validation
 - [`docs/live-pool-deletion-validation.md`](docs/live-pool-deletion-validation.md):
   sanitized output from live managed GPU deletion and RDMA deletion planning
+- [`docs/live-unhealthy-host-termination-validation.md`](docs/live-unhealthy-host-termination-validation.md):
+  sanitized managed A10 and A100 RDMA unhealthy-tag termination plans,
+  explicitly distinguished from an unperformed tag or node mutation
 - [`docs/scope.md`](docs/scope.md): implemented features and planned items
 
 ## Cluster Validation

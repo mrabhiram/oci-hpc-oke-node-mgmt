@@ -231,7 +231,7 @@ Choose a specific worker and decrement desired size:
 
 ```bash
 mgmt-oke --auth instance_principal nodes terminate rdma-node-1 \
-  --dry-run --format json
+  --tag unhealthy --dry-run --format json
 ```
 
 Example dry-run output:
@@ -241,6 +241,9 @@ Example dry-run output:
   {
     "current_size": 2,
     "decrement_size": true,
+    "details": {
+      "customer_reported_host_status": "unhealthy"
+    },
     "operation": "node-remove",
     "owner": "compute-management",
     "pool": "oke-rdma",
@@ -248,6 +251,8 @@ Example dry-run output:
     "steps": [
       "cordon Kubernetes node",
       "evict non-DaemonSet pods through the Eviction API",
+      "tag OCI instance as customer-reported unhealthy",
+      "verify OCI instance unhealthy tag",
       "detach and automatically terminate the selected Instance Pool member"
     ],
     "target": "rdma-node-1",
@@ -263,7 +268,8 @@ Example dry-run output:
 Apply after reviewing the selected worker:
 
 ```bash
-mgmt-oke --auth instance_principal nodes terminate <rdma-node-name-or-ip> --wait
+mgmt-oke --auth instance_principal nodes terminate <rdma-node-name-or-ip> \
+  --tag unhealthy --wait
 ```
 
 For predictable maintenance, selecting a node is preferable when one worker is
@@ -273,7 +279,7 @@ known to be unhealthy. Review workload and topology data before removal.
 
 ```bash
 mgmt-oke --auth instance_principal nodes terminate <rdma-node-name-or-ip> \
-  --keep-size --wait
+  --tag unhealthy --keep-size --wait
 ```
 
 Managed pools use OKE `DeleteNode`. Legacy pools detach and automatically
@@ -284,6 +290,9 @@ For the legacy model, default removal sends `is_decrement_size=true` to the
 embedded Instance Pool. Replacement sends `is_decrement_size=false` together
 with automatic termination, so the selected instance is terminated and the
 pool launches another instance from its existing Instance Configuration.
+The unhealthy-host tag is applied to the selected Compute instance before
+either removal path. Existing defined tags are preserved and OCI read-back is
+required before detach is submitted.
 
 ## Understand RDMA Convergence
 

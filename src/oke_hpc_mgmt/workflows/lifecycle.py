@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from oke_hpc_mgmt.backends.oci import (
     BootVolumeAttachmentPending,
@@ -17,6 +17,7 @@ from oke_hpc_mgmt.bootstrap import (
 from oke_hpc_mgmt.discovery import DiscoveryService
 from oke_hpc_mgmt.models import (
     ClusterNetworkCreateResult,
+    CustomerReportedHostStatus,
     DiscoverySnapshot,
     DrainPod,
     ManagedNodePoolCreateResult,
@@ -114,6 +115,7 @@ class PreparedNodeRemoval:
     drain_pods: dict[str, tuple[DrainPod, ...]]
     target_sizes: dict[str, int]
     decrement_size: bool
+    host_tags: dict[str, CustomerReportedHostStatus] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1082,6 +1084,44 @@ def prepare_node_removal(
     )
 
 
+def apply_node_removal_host_tags(
+    prepared: PreparedNodeRemoval,
+    host_tags: Mapping[str, CustomerReportedHostStatus],
+) -> PreparedNodeRemoval:
+    selected_names = {node.k8s_name for node in prepared.nodes}
+    unknown_names = sorted(set(host_tags) - selected_names)
+    if unknown_names:
+        raise WorkflowError(
+            "Host tag decisions reference unselected nodes: "
+            + ", ".join(unknown_names)
+        )
+
+    decisions = dict(host_tags)
+    plans: list[OperationPlan] = []
+    for plan in prepared.plans:
+        status = decisions.get(plan.target)
+        details = dict(plan.details)
+        details["customer_reported_host_status"] = (
+            status.value if status is not None else "not-requested"
+        )
+        steps = list(plan.steps)
+        if status is CustomerReportedHostStatus.UNHEALTHY:
+            tag_steps = (
+                "tag OCI instance as customer-reported unhealthy",
+                "verify OCI instance unhealthy tag",
+            )
+            insertion_index = max(len(steps) - 1, 0)
+            steps[insertion_index:insertion_index] = tag_steps
+        plans.append(
+            replace(
+                plan,
+                details=details,
+                steps=tuple(steps),
+            )
+        )
+    return replace(prepared, plans=tuple(plans), host_tags=decisions)
+
+
 def execute_node_removal(
     service: DiscoveryService,
     prepared: PreparedNodeRemoval,
@@ -1097,6 +1137,9 @@ def execute_node_removal(
     progress: Callable[[str], None] | None = None,
 ) -> list[dict[str, object]]:
     work_requests: dict[str, str | None] = {}
+    host_tag_statuses: dict[str, str] = {
+        node.k8s_name: "not-requested" for node in prepared.nodes
+    }
     cordoned: list[str] = []
     submitted: set[str] = set()
     kubernetes = service.kubernetes_backend() if drain or lock else None
@@ -1123,6 +1166,22 @@ def execute_node_removal(
                     )
 
             backend = service.oci_backend()
+            for node in prepared.nodes:
+                host_status = prepared.host_tags.get(node.k8s_name)
+                if host_status is None:
+                    continue
+                instance_ocid = node.instance_ocid
+                if instance_ocid is None:
+                    raise WorkflowError(
+                        f"Node has no OCI instance OCID: {node.k8s_name}"
+                    )
+                if host_status is CustomerReportedHostStatus.UNHEALTHY:
+                    host_tag_statuses[node.k8s_name] = (
+                        backend.tag_instance_customer_reported_unhealthy(
+                            instance_ocid
+                        )
+                    )
+
             for node in prepared.nodes:
                 pool = _pool_for_prepared_node(prepared, node)
                 instance_ocid = node.instance_ocid
@@ -1186,6 +1245,8 @@ def execute_node_removal(
             prepared.decrement_size,
             work_requests.get(node.k8s_name),
             status,
+            prepared.host_tags.get(node.k8s_name),
+            host_tag_statuses[node.k8s_name],
         )
         for node in prepared.nodes
         for pool in [_pool_for_prepared_node(prepared, node)]
@@ -2358,6 +2419,8 @@ def node_remove_result_row(
     decrement_size: bool,
     work_request_id: str | None,
     status: str,
+    host_tag: CustomerReportedHostStatus | None = None,
+    host_tag_status: str = "not-requested",
 ) -> dict[str, object]:
     return {
         "node": node.k8s_name,
@@ -2370,6 +2433,8 @@ def node_remove_result_row(
         "oci_active": pool.active_oci_instances,
         "k8s_ready": pool.ready_k8s_nodes,
         "status": status,
+        "host_tag": host_tag.value if host_tag is not None else None,
+        "host_tag_status": host_tag_status,
         "work_request_id": work_request_id,
     }
 
