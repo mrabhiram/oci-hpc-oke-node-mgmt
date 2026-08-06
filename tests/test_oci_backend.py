@@ -1153,6 +1153,58 @@ class OciBackendMutationTests(unittest.TestCase):
                 bootstrap_metadata=legacy_metadata,
             )
 
+    def test_managed_rdma_pool_does_not_backfill_legacy_identity_metadata(self):
+        source = _managed_node_pool("VM.GPU.A10.1")
+        source.node_metadata.pop("cluster_ca_cert", None)
+        backend = _backend(node_pools=[source])
+        backend._compute.compute_clusters["compute-cluster-target"] = (
+            SimpleNamespace(
+                id="compute-cluster-target",
+                display_name="target-cc",
+                availability_domain="AD-1",
+                compartment_id="compartment-1",
+                lifecycle_state="ACTIVE",
+            )
+        )
+        legacy_metadata = {
+            "apiserver_host": source.node_metadata["apiserver_host"],
+            "cluster_ca_cert": "legacy-certificate" * 128,
+            "oke-initial-node-labels": "legacy-labels" * 32,
+            "user_data": "legacy-rdma-cloud-init",
+            "legacy-custom": "preserved",
+        }
+        spec = PoolCreateSpec(
+            pool_type="rdma",
+            rdma_mode="compute-cluster",
+            compute_cluster_id="compute-cluster-target",
+            shape="BM.GPU4.8",
+        )
+
+        backend.create_managed_node_pool(
+            source.id,
+            "cluster-1",
+            "compartment-1",
+            "rdma-batch",
+            2,
+            spec,
+            bootstrap_metadata=legacy_metadata,
+        )
+
+        call = next(
+            item
+            for item in backend._container_engine.calls
+            if item[0] == "create_node_pool"
+        )
+        metadata = call[1].node_metadata
+        self.assertEqual(
+            source.node_metadata["apiserver_host"],
+            metadata["apiserver_host"],
+        )
+        self.assertNotIn("cluster_ca_cert", metadata)
+        self.assertNotIn("oke-initial-node-labels", metadata)
+        self.assertEqual("legacy-rdma-cloud-init", metadata["user_data"])
+        self.assertEqual("preserved", metadata["legacy-custom"])
+
     def test_managed_rdma_preview_plans_dedicated_compute_cluster(self):
         source = _managed_node_pool("BM.GPU4.8")
         source.name = "oke-rdma"
