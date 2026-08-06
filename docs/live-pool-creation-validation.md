@@ -847,6 +847,11 @@ count of three must not be treated as durable capacity.
 
 ## Self-Managed RDMA Pool
 
+End-to-end Cluster Network creation and Kubernetes convergence were
+subsequently confirmed on a live OKE deployment. The transcript below preserves
+the earlier capacity-blocked lab attempt; deployment-specific output from the
+successful acceptance is not published.
+
 ### Preview Inherited Configuration
 
 For a legacy RDMA pool, `--from-pool` reads the source Cluster Network's
