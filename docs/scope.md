@@ -58,7 +58,7 @@ Management Tool.
 - Slurm-style `clusters list`, `clusters create`, `clusters delete`, and
   `clusters add node` worker-pool aliases
 - explicit `pools add` and `pools remove` capacity commands
-- validated dry-run plans for every mutation
+- validated dry-run plans for lifecycle mutations and initial upgrade execution
 - Kubernetes Lease serialization for concurrent mutations
 - wait for OCI active count and Kubernetes Ready count after resize
 - wait for allocatable GPU, RDMA topology, and applicable RDMA VF readiness
@@ -145,6 +145,16 @@ Management Tool.
 - automatic Terraform or OCI Resource Manager source updates after a live
   upgrade
 - automatic deletion of source pools after a blue-green migration
+- creation of standalone Instance Pools outside a Cluster Network
+- creation of Compute Host Groups or attachment of hosts to a Host Group
+- automatic deletion of a dedicated Compute Cluster when its managed OKE node
+  pool is deleted
+- image changes during individual-node BVR; managed pool-wide BVR provides the
+  image-update workflow
+- provisioning of FSS or Lustre services; worker bootstrap mounts existing
+  storage endpoints
+- creation or deletion of the OKE control plane; `clusters` compatibility
+  commands operate on worker pools
 
 GPU Memory Cluster mutation paths are implemented and unit-tested with OCI SDK
 models. Live GMC mutation validation remains pending an available GMC test

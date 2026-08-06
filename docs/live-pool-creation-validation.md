@@ -346,8 +346,9 @@ examples; no workers were created and no mounts were attempted by either
 ```
 
 The legacy source remained healthy at desired, active, and Ready capacity
-`1/1/1`. A two-worker mutation, runtime storage verification, and restoration
-of that source to its normal size of two remain pending sufficient capacity.
+`1/1/1`. At that time, a two-worker mutation, runtime storage verification, and
+restoration of that source to its normal size of two remained pending sufficient
+capacity. The later two-worker acceptance below completes those tests.
 
 ### Initial Capacity Failure
 
@@ -624,6 +625,225 @@ The empty dedicated Compute Cluster was deleted separately and reached
 `DELETED`. Compute Host Group placement is covered by request-model,
 validation, discovery, CLI, and workflow tests; the live compartment contained
 no Compute Host Group for a placement mutation.
+
+### Two-Worker Dual-Source Acceptance
+
+On 2026-08-06, a fresh OCI Compute Capacity Report in the target availability
+domain returned:
+
+```json
+[
+  {
+    "available_count": 3,
+    "shape": "BM.GPU4.8",
+    "status": "AVAILABLE"
+  }
+]
+```
+
+Capacity Reports are point-in-time signals, not reservations. The reviewed
+two-worker command was therefore submitted immediately:
+
+```bash
+mgmt-oke pools create rdma-managed-dual-source-validation \
+  --type rdma \
+  --rdma-mode compute-cluster \
+  --count 2 \
+  --from-pool oke-gpu \
+  --bootstrap-from-pool oke-rdma \
+  --availability-domain UK-LONDON-1-AD-3 \
+  --shape BM.GPU4.8 \
+  --compute-cluster-name rdma-managed-dual-source-validation-cc \
+  --wait \
+  --timeout 7200 \
+  --poll-interval 15 \
+  --yes \
+  --format json
+```
+
+#### Acceptance Finding And Correction
+
+The first submission created an empty dedicated Compute Cluster, then OKE
+rejected the node-pool request because the dual-source merge had backfilled a
+legacy cluster identity value that exceeded the managed node metadata limit.
+The managed source did not contain that field and did not require it. The merge
+was corrected so that:
+
+- managed OKE metadata remains authoritative and missing managed identity
+  fields are not backfilled from the legacy source
+- the complete legacy `user_data` payload and permitted non-reserved custom
+  metadata are still inherited
+- mismatched identity values are still rejected when both sources expose them
+
+A regression test reproduces the long legacy identity value. The full suite
+then passed with 340 tests before the retry. The retained empty Compute Cluster
+was deleted, and the same requested infrastructure command was submitted again.
+
+#### Creation Result
+
+Sanitized progress and final output:
+
+```text
+Waiting: rdma-managed-dual-source-validation-cc: compute_cluster=ACTIVE
+Waiting: rdma-managed-dual-source-validation: desired=2 oci_active=2 k8s_ready=0 gpu_ready=0 rdma_ready=0
+Waiting: rdma-managed-dual-source-validation: desired=2 oci_active=2 k8s_ready=2 gpu_ready=0 rdma_ready=2
+```
+
+```json
+[
+  {
+    "compute_cluster_created": true,
+    "compute_cluster_id": "<compute-cluster-ocid>",
+    "k8s_ready": 2,
+    "kind": "node-pool",
+    "name": "rdma-managed-dual-source-validation",
+    "node_pool_id": "<managed-node-pool-ocid>",
+    "oci_active": 2,
+    "placement": "compute-cluster",
+    "shape": "BM.GPU4.8",
+    "source_pool": "oke-gpu",
+    "status": "ready",
+    "target_size": 2,
+    "type": "rdma",
+    "work_request_id": "<oke-work-request-ocid>"
+  }
+]
+```
+
+The final discovery cycle completed only after the resource checks matched.
+Both workers subsequently appeared as follows:
+
+```json
+[
+  {
+    "gpu": {"nvidia.com/gpu": "8"},
+    "name": "rdma-managed-node-1",
+    "pool": "rdma-managed-dual-source-validation",
+    "rdma": true,
+    "ready": true,
+    "schedulable": true,
+    "shape": "BM.GPU4.8",
+    "status": "Ready",
+    "workload_pods": 0
+  },
+  {
+    "gpu": {"nvidia.com/gpu": "8"},
+    "name": "rdma-managed-node-2",
+    "pool": "rdma-managed-dual-source-validation",
+    "rdma": true,
+    "ready": true,
+    "schedulable": true,
+    "shape": "BM.GPU4.8",
+    "status": "Ready",
+    "workload_pods": 0
+  }
+]
+```
+
+Topology discovery placed both workers in the same HPC island and network
+block, with one Ready worker in each reported local block. GPU and RDMA health
+checks passed for both workers. Add-on validation reported:
+
+| Check | Result |
+| --- | --- |
+| NVIDIA GPU Operator | `PASS`, active |
+| Node Feature Discovery | `PASS`, active |
+| `nvidia.com/gpu` | `PASS`, 8 per worker |
+| OCI RDMA topology labels | `PASS` on both workers |
+| NVIDIA Network Operator | `INFO`, optional add-on not enabled |
+
+With the Network Operator inactive, the RDMA validator correctly retained the
+host-network RDMA model and did not require `nvidia.com/rdma-vf`.
+
+#### Host Bootstrap And NVMe Evidence
+
+The existing privileged GPU/RDMA detector DaemonSet provided read-only access
+to each host. No validation pod or workload was created. Both workers returned:
+
+| Check | Worker 1 | Worker 2 |
+| --- | --- | --- |
+| `cloud-init status` | `done`, no errors | `done`, no errors |
+| NVIDIA GPUs | 8 | 8 |
+| Infiniband sysfs devices | 18 | 18 |
+| Infiniband device nodes | 37 | 37 |
+| RAID device | `/dev/md0`, RAID10 | `/dev/md0`, RAID10 |
+| RAID members | 4/4, `[UUUU]` | 4/4, `[UUUU]` |
+
+`/dev/md0` was mounted on `/mnt/nvme` on both workers. The inherited bootstrap
+also placed `/var/lib/containers`, `/var/lib/kubelet`, and `/var/log/pods` on
+that filesystem through the expected bind mounts. This is live runtime evidence
+that the legacy `oke-nvme-raid.sh` payload was inherited and executed on both
+managed Compute Cluster workers. The source did not contain FSS or Lustre
+mounts, so those remain composition and dry-run evidence only.
+
+#### Source Restoration And Cleanup
+
+Before removing the temporary pool, the legacy source was restored from one to
+two workers:
+
+```bash
+mgmt-oke pools resize oke-rdma \
+  --size 2 \
+  --wait \
+  --timeout 7200 \
+  --poll-interval 15 \
+  --yes \
+  --format json
+```
+
+```json
+[
+  {
+    "k8s_ready": 2,
+    "kind": "cluster-network",
+    "name": "oke-rdma",
+    "oci_active": 2,
+    "old_size": 1,
+    "shape": "BM.GPU4.8",
+    "status": "ready",
+    "target_size": 2,
+    "work_request_id": null
+  }
+]
+```
+
+The waiter observed `2/2` OCI and Kubernetes convergence, two GPU-ready
+workers, and two RDMA-ready workers. The temporary managed pool remained
+workload-free and was then deleted:
+
+```bash
+mgmt-oke pools delete rdma-managed-dual-source-validation \
+  --wait \
+  --timeout 3600 \
+  --poll-interval 15 \
+  --yes \
+  --format json
+```
+
+```json
+[
+  {
+    "kind": "node-pool",
+    "name": "rdma-managed-dual-source-validation",
+    "old_size": 2,
+    "placement": "compute-cluster",
+    "status": "deleted",
+    "target_size": 0,
+    "work_request_id": "<oke-work-request-ocid>"
+  }
+]
+```
+
+The empty dedicated Compute Cluster was deleted separately and reached
+`DELETED`. Final inventory contained only the original stack pools. The legacy
+`oke-rdma` source remained at desired, active, and Ready capacity `2/2/2`; the
+managed CPU, GPU, and system pools also matched their pre-test sizes.
+
+At `2026-08-06T23:09:21Z`, immediately after deleting the two temporary
+bare-metal workers, a fresh Capacity Report returned
+`OUT_OF_HOST_CAPACITY` with `available_count=0`. This post-cleanup result is
+consistent with bare-metal recycling and demonstrates why the launch-window
+count of three must not be treated as durable capacity.
 
 ## Self-Managed RDMA Pool
 
