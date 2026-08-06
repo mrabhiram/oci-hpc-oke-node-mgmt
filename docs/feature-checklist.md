@@ -77,7 +77,7 @@ live test.
   source plus worker bootstrap from a legacy Cluster Network source.
   `LIVE-MUTATION`
 - [x] Legacy self-managed RDMA Cluster Network creation from an existing stack
-  pool. `LIVE-PLAN`
+  pool. `LIVE-MUTATION`
 - [x] Custom pool name, size, AD, shape, image, subnet, NSG, boot volume, Flex
   shape, CNI, tag, metadata, and Kubernetes settings. `LIVE-PLAN`
 - [x] Managed node cycling and eviction-setting overrides. `AUTOMATED`
@@ -220,8 +220,8 @@ live test.
   temporary managed-pool and Compute Cluster resources. `LIVE-MUTATION`
 - [ ] Verify composed FSS and Lustre mounts on disposable workers connected to
   test storage endpoints. `PENDING`
-- [ ] Complete successful legacy self-managed Cluster Network creation and
-  Kubernetes convergence. `PENDING`
+- [x] Successful legacy self-managed Cluster Network creation and Kubernetes
+  convergence confirmed on a live OKE deployment. `LIVE-MUTATION`
 - [ ] Complete a Compute Host Group placement mutation. `PENDING`
 - [ ] Complete a GPU Memory Cluster mutation. `PENDING`
 - [ ] Complete a control-plane and worker Kubernetes version upgrade during an
