@@ -4065,10 +4065,9 @@ def _merge_legacy_bootstrap_metadata(
                 f"{key} differs from the managed source pool."
             )
 
+    # Compare legacy identity fields, but preserve the managed source's exact
+    # present-or-absent metadata contract for OKE CreateNodePool.
     merged = dict(current)
-    for key in _CLUSTER_IDENTITY_METADATA_KEYS:
-        if not merged.get(key) and legacy.get(key):
-            merged[key] = legacy[key]
     merged.update(
         {
             key: value

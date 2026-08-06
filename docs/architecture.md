@@ -650,9 +650,12 @@ also refuses unsafe operations when:
 - a scale-down or node removal targets a detected Slinky-managed worker
 - required OCI target information cannot be resolved
 
-Every mutation is represented by an `OperationPlan`. `--dry-run` prints that
-validated plan and stops before acquiring the Lease or changing Kubernetes or
-OCI. Actual mutations require `--yes` or an interactive typed confirmation.
+Lifecycle mutations and initial upgrade execution are represented by an
+`OperationPlan`. `--dry-run` prints that validated plan and stops before
+acquiring the Lease or changing Kubernetes or OCI. Upgrade recovery commands
+operate on an existing checkpoint. New mutations require `--yes` or an
+interactive typed confirmation; `upgrades resume` continues the previously
+approved checkpoint.
 
 Actual mutations acquire the `kube-system/mgmt-oke-mutation` Lease by default.
 An active holder causes the second operation to fail before mutation. The Lease

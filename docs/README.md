@@ -21,6 +21,8 @@ capacity naturally vary by deployment.
   cluster without changing any resources.
 - [Command Reference](./command-reference.md): Review every command, selector,
   output control, mutation option, and exit status.
+- [Feature Checklist](./feature-checklist.md): Review implemented capabilities,
+  validation depth, outstanding live acceptance, and proposed work.
 - [Kubernetes Upgrades](./kubernetes-upgrades.md): Inspect version readiness,
   plan and execute control-plane and worker upgrades, and recover checkpointed
   operations without mutating Kubernetes scheduling state.

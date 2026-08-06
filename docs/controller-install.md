@@ -258,8 +258,10 @@ Safety behavior:
 
 - Discovery commands are read-only.
 - Pool mutations, node termination, and BVR require OCI auth.
-- Every mutation supports a validated `--dry-run` plan.
-- Every mutation requires either `--yes` or an interactive typed confirmation.
+- Lifecycle mutations and initial upgrade execution support a validated
+  `--dry-run` plan. Upgrade recovery commands operate on an existing checkpoint.
+- New lifecycle and upgrade operations require either `--yes` or an interactive
+  typed confirmation. `upgrades resume` continues the approved checkpoint.
 - Mutations acquire a Kubernetes Lease by default to prevent concurrent tool operations.
 - Pool creation inherits cluster bootstrap from a matching source and validates
   custom image, shape, placement, and network compatibility before submission.

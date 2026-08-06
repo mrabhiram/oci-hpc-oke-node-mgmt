@@ -44,7 +44,8 @@ management for OCI HPC OKE clusters:
 - drain and delete complete managed OKE, Cluster Network, or standalone Instance
   Pool worker pools `[Implemented]`
 - add or remove pool capacity with explicit `pools add` and `pools remove` commands `[Implemented]`
-- preview every mutation as a validated operation plan with `--dry-run` `[Implemented]`
+- preview lifecycle mutations and initial upgrade execution as validated
+  operation plans with `--dry-run` `[Implemented]`
 - serialize concurrent mutations with a Kubernetes Lease `[Implemented]`
 - cordon, drain, and uncordon selected Kubernetes workers `[Implemented]`
 - remove, replace, or terminate one or more managed or self-managed workers `[Implemented]`
@@ -68,8 +69,11 @@ creation, deletion, capacity, boot volume replacement, node termination, and
 upgrade execution commands mutate OCI resources. Node maintenance commands
 mutate Kubernetes. Upgrade commands never cordon, drain, evict, or uncordon
 workers; operators prepare workloads externally and provide a separate safety
-attestation. Every mutation supports `--dry-run`, uses a Kubernetes Lease by
-default, and requires either `--yes` or an interactive confirmation.
+attestation. Lifecycle mutations and initial upgrade execution support
+`--dry-run`. Mutations use a Kubernetes Lease by default. New lifecycle and
+upgrade operations require either `--yes` or an interactive confirmation;
+`upgrades resume` continues the previously approved checkpoint. Other recovery
+commands document their own confirmation behavior.
 For node termination, `--yes` confirms the OCI mutation but does not answer the
 separate unhealthy-host question.
 
@@ -790,6 +794,8 @@ CI runs pytest on Python 3.9, 3.10, 3.11, and 3.12, followed by Ruff and mypy.
   prerequisites, installation, authentication, validation, and troubleshooting
 - [`docs/command-reference.md`](docs/command-reference.md): complete command,
   selector, mutation-option, output, and exit-status reference
+- [`docs/feature-checklist.md`](docs/feature-checklist.md): implementation,
+  validation, live-acceptance, and proposed-feature review checklist
 - [`docs/kubernetes-upgrades.md`](docs/kubernetes-upgrades.md): Kubernetes
   target selection, planning, workload gates, strategies, orchestration, and
   recovery
