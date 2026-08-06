@@ -189,7 +189,7 @@ live-plan validated but does not yet have a publishable live mutation record.
 - [x] Terraform and OCI Resource Manager drift warnings without editing source
   configuration. `LIVE-PLAN`
 
-## Proposed Or Intentionally Unimplemented
+## Proposed
 
 - [ ] Synchronize Kueue ClusterQueue quotas after pool capacity changes.
   `NOT-IMPLEMENTED`
