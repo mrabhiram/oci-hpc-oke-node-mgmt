@@ -779,7 +779,7 @@ uv run ruff check src tests
 uv run mypy src tests
 ```
 
-CI runs pytest on Python 3.12, followed by Ruff and mypy.
+CI runs pytest on Python 3.9, 3.10, 3.11, and 3.12, followed by Ruff and mypy.
 
 ## Documentation
 
