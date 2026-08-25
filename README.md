@@ -82,13 +82,10 @@ separate unhealthy-host question.
 For controller/operator node installation, use
 [`docs/controller-install.md`](docs/controller-install.md).
 
-From the project directory:
+From the project directory, using [`uv`](https://docs.astral.sh/uv/):
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -U pip setuptools wheel
-python -m pip install .
+uv sync
 ```
 
 Python 3.9 or newer is supported.
@@ -100,8 +97,8 @@ Cluster Network worker pools.
 This installs two entrypoints backed by the same code:
 
 ```bash
-mgmt-oke --help
-kubectl-oke --help
+uv run mgmt-oke --help
+uv run kubectl-oke --help
 ```
 
 For kubectl plugin usage, make sure `kubectl-oke` is on `PATH`, then run:
@@ -772,15 +769,14 @@ changes that break automation require a new schema version.
 After installing the package, run the unit-test suite from the project root:
 
 ```bash
-python -m pytest
+uv run pytest
 ```
 
-For lint and type checks, install the development tools and run:
+For lint and type checks, run:
 
 ```bash
-python -m pip install ".[dev]"
-ruff check src tests
-mypy src tests
+uv run ruff check src tests
+uv run mypy src tests
 ```
 
 CI runs pytest on Python 3.9, 3.10, 3.11, and 3.12, followed by Ruff and mypy.
