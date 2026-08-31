@@ -22,6 +22,8 @@ entrypoint is on `PATH`.
 The controller/operator node must have:
 
 - Python 3.9 or newer
+- [`uv`](https://docs.astral.sh/uv/) 0.5 or newer; see the
+  [uv installation guide](https://docs.astral.sh/uv/getting-started/installation/)
 - OCI Python SDK 2.181.1 or newer; package installation installs this dependency
 - `kubectl` configured for the target OKE cluster
 - OCI CLI on `PATH` and able to use instance principal auth
@@ -56,6 +58,7 @@ Validate the controller environment before installing:
 
 ```bash
 python3 --version
+uv --version
 kubectl get nodes -o wide
 oci iam region list --auth instance_principal
 ```
@@ -75,18 +78,15 @@ On the controller/operator node:
 
 ```bash
 cd /home/ubuntu/oci-hpc-oke-node-mgmt
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install .
+uv sync
 ```
 
 Verify the package entrypoints:
 
 ```bash
-.venv/bin/mgmt-oke --version
-.venv/bin/mgmt-oke --help
-.venv/bin/kubectl-oke --help
+uv run mgmt-oke --version
+uv run mgmt-oke --help
+uv run kubectl-oke --help
 ```
 
 Example version output:
@@ -97,16 +97,16 @@ mgmt-oke, version 0.10.0
 
 ## Upgrade An Existing Installation
 
-Update the checkout and reinstall the package in its existing virtual
-environment:
+Update the checkout and resynchronize the environment in the project
+directory:
 
 ```bash
 cd /home/ubuntu/oci-hpc-oke-node-mgmt
 git pull --ff-only
-.venv/bin/python -m pip install --upgrade --force-reinstall .
+uv sync
 ```
 
-Reinstalling refreshes both `mgmt-oke` and `kubectl-oke` entrypoints.
+Resynchronizing refreshes both `mgmt-oke` and `kubectl-oke` entrypoints.
 
 ## Put The Commands On PATH
 
