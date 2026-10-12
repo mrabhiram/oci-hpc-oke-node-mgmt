@@ -8,7 +8,7 @@ from oke_hpc_mgmt.benchmarks.manifests import ExecutionOptions
 from oke_hpc_mgmt.benchmarks.models import BenchmarkError, HealthcheckRequest
 from oke_hpc_mgmt.benchmarks.planning import plan_healthchecks
 from oke_hpc_mgmt.benchmarks.records import (
-    RunRecord, decode_record, mark_cancelling, next_cases, payload_digest,
+    RunRecord, assert_no_overlap, decode_record, mark_cancelling, next_cases, payload_digest,
 )
 from test_benchmark_planning import inventory, request
 
@@ -22,6 +22,22 @@ def record() -> RunRecord:
 
 
 class BenchmarkRecordTests(unittest.TestCase):
+    def test_overlaps_reserve_planned_and_active_nodes_across_namespaces_by_uid(self) -> None:
+        current = record()
+        other = replace(current, uid="other-uid", plan=replace(current.plan, request=replace(current.plan.request, namespace="other")))
+        with self.assertRaisesRegex(BenchmarkError, "overlap unfinished healthcheck other/"):
+            assert_no_overlap(current.plan, (other,))
+        assert_no_overlap(current.plan, (other,), exclude_uid="other-uid")
+        with self.assertRaises(BenchmarkError):
+            assert_no_overlap(current.plan, (other,), exclude_uid="different-uid")
+        for case in other.cases:
+            other = other.update_case(case.case_id, "CANCELLED")
+        assert_no_overlap(current.plan, (other,))
+        replaced_nodes = replace(current.plan, cases=tuple(replace(case, nodes=tuple(
+            replace(node, uid="replacement-" + node.uid) for node in case.nodes
+        )) for case in current.plan.cases))
+        assert_no_overlap(replaced_nodes, (current,))
+
     def test_roundtrip_preserves_typed_plan_without_embedding_object_identity(self) -> None:
         original = replace(record(), uid="object-uid", resource_version="1")
         decoded = decode_record(original.payload(), uid="object-uid", resource_version="2")

@@ -249,12 +249,25 @@ class CapabilityTests(unittest.TestCase):
         self.cluster["spec"]["resourceGroups"][0]["flavors"].append({
             "name": "other", "resources": [{"name": "nvidia.com/gpu"}],
         })
-        other = {"metadata": metadata("other"), "spec": {"nodeLabels": {}}}
+        other = {"metadata": metadata("other"), "spec": {"nodeLabels": {}, "topologyName": "another-topology"}}
         self.backend.custom.get_cluster_custom_object.side_effect = lambda *args, **kwargs: (
             other if args[3] == "other" else self.cluster_object(*args, **kwargs)
         )
         with self.assertRaisesRegex(BenchmarkError, "incompatible topologies"):
             self.check()
+
+    def test_upstream_launcher_flavor_is_not_mistaken_for_worker_topology(self) -> None:
+        self.queue(topology=True)
+        self.cluster["spec"]["resourceGroups"][0]["flavors"].append({
+            "name": "launcher", "resources": [{"name": "nvidia.com/gpu", "nominalQuota": 0}],
+        })
+        launcher = {"metadata": metadata("launcher"), "spec": {}}
+        self.backend.custom.get_cluster_custom_object.side_effect = lambda *args, **kwargs: (
+            launcher if args[3] == "launcher" else self.cluster_object(*args, **kwargs)
+        )
+        result = self.check()
+        self.assertEqual((("case-0001", ("gpu-flavor",)),), result.compatible_flavors)
+        self.assertEqual(1, len(result.execution_options.placements))
 
     def test_namespace_terminating_restricted_or_identity_missing_refuses(self) -> None:
         original = copy.deepcopy(self.namespace)

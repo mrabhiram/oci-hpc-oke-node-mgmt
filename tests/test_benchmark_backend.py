@@ -5,7 +5,7 @@ import json
 import unittest
 from dataclasses import replace
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from kubernetes.client import ApiClient
 from kubernetes.client.exceptions import ApiException
@@ -81,6 +81,37 @@ class BenchmarkBackendTests(unittest.TestCase):
             self.backend.list_runs("default")
         with self.assertRaisesRegex(BenchmarkError, "unexpected"):
             self.backend._object([])
+
+    def test_history_reads_all_namespaces_and_all_pages_for_overlap_detection(self) -> None:
+        other = replace(self.checkpoint, run_id="hc-" + "f" * 20, uid="other-uid")
+        other = replace(other, cases=tuple(replace(case, job_name=f"{other.run_id}-{case.case_id}") for case in other.cases),
+                        plan=replace(other.plan, request=replace(other.plan.request, namespace="other")))
+        self.core.list_config_map_for_all_namespaces.side_effect = [
+            {"metadata": {"continue": "next-page"}, "items": [configmap(self.checkpoint)]},
+            {"items": [configmap(other)]},
+        ]
+        result = self.backend.list_runs(None)
+        self.assertEqual({"default", "other"}, {run.plan.request.namespace for run in result})
+        self.assertEqual("next-page", self.core.list_config_map_for_all_namespaces.call_args.kwargs["_continue"])
+        self.core.list_namespaced_config_map.assert_not_called()
+
+    def test_pagination_limits_and_duplicates_fail_instead_of_partial_overlap_inventory(self) -> None:
+        body = configmap(self.checkpoint)
+        self.core.list_config_map_for_all_namespaces.return_value = {"items": [body, body]}
+        with self.assertRaisesRegex(BenchmarkError, "duplicate run UIDs"):
+            self.backend.list_runs(None)
+        self.core.list_config_map_for_all_namespaces.return_value = {"metadata": {"continue": "same"}, "items": []}
+        with self.assertRaisesRegex(BenchmarkError, "pagination repeated"):
+            self.backend.list_runs(None)
+        self.core.list_config_map_for_all_namespaces.return_value = {"items": [body]}
+        for setting in ("MAX_RUNS", "MAX_HISTORY_BYTES"):
+            with patch("oke_hpc_mgmt.benchmarks.backend." + setting, 0):
+                with self.assertRaisesRegex(BenchmarkError, "inventory limits"):
+                    self.backend.list_runs(None)
+        self.core.read_node.side_effect = raw_inventory()
+        self.core.list_pod_for_all_namespaces.return_value = {"metadata": {"continue": "next"}, "items": []}
+        with self.assertRaisesRegex(BenchmarkError, "incomplete"):
+            self.backend.runtime_preflight(self.case)
 
     def test_creation_does_not_overwrite_colliding_checkpoint(self) -> None:
         initial = record()

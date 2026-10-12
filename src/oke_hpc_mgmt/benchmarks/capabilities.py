@@ -266,6 +266,7 @@ class CapabilityPreflight:
         for case in plan.cases:
             needed = {GPU_RESOURCE} | ({VF_RESOURCE} if case.network == "vf" else set())
             eligible: set[str] = set()
+            flavor_resources: dict[str, set[str]] = {}
             matched_resources: set[str] = set()
             for group in spec.get("resourceGroups") or []:
                 covered = set(group.get("coveredResources") or [])
@@ -287,14 +288,24 @@ class CapabilityPreflight:
                     if all(all((nodes[target.name]["metadata"].get("labels") or {}).get(key) == value
                                for key, value in labels.items()) for target in case.nodes):
                         eligible.add(flavor_name)
+                        flavor_resources.setdefault(flavor_name, set()).update(required)
                         matched_resources.update(required)
             if matched_resources != needed:
                 raise BenchmarkError(f"No ClusterQueue GPU/RDMA flavor matches every selected node in {case.case_id}.")
             topology_names = {(flavor_cache[flavor].get("spec") or {}).get("topologyName") for flavor in eligible}
-            if len(topology_names) != 1:
+            topology_names.discard(None)
+            topology_names.discard("")
+            if len(topology_names) > 1:
                 raise BenchmarkError("Matching queue flavors have incompatible topologies; select an unambiguous queue.")
-            topology_name = next(iter(topology_names))
+            topology_name = next(iter(topology_names), None)
             if topology_name:
+                # Upstream queues also contain a non-TAS, zero-GPU flavor for
+                # the launcher. A TAS worker request must not treat it as an
+                # incompatible worker topology or remove it from the queue.
+                eligible = {flavor for flavor in eligible
+                            if (flavor_cache[flavor].get("spec") or {}).get("topologyName") == topology_name}
+                if set().union(*(flavor_resources[flavor] for flavor in eligible)) != needed:
+                    raise BenchmarkError("Topology-aware flavors do not cover all required GPU/RDMA resources.")
                 if not isinstance(topology_name, str):
                     raise BenchmarkError("ResourceFlavor has an invalid Topology reference.")
                 if topology_name not in topology_cache:

@@ -209,3 +209,15 @@ def mark_cancelling(record: RunRecord) -> RunRecord:
     if all(case.state in TERMINAL_CASE_STATES for case in record.cases):
         return record
     return replace(record, state=cast(RunState, "CANCELLING"), revision=record.revision + 1)
+
+
+def assert_no_overlap(plan: HealthcheckPlan, existing: tuple[RunRecord, ...], *, exclude_uid: str | None = None) -> None:
+    selected = {node.uid for case in plan.cases for node in case.nodes}
+    for run in existing:
+        if run.state == "CLEANED" or (exclude_uid is not None and run.uid == exclude_uid):
+            continue
+        states = {item.case_id: item.state for item in run.cases}
+        occupied = {node.uid for case in run.plan.cases if states[case.case_id] not in TERMINAL_CASE_STATES
+                    for node in case.nodes}
+        if selected & occupied:
+            raise BenchmarkError(f"Selected nodes overlap unfinished healthcheck {run.plan.request.namespace}/{run.run_id}.")

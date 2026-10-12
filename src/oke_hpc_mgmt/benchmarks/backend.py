@@ -16,6 +16,8 @@ from oke_hpc_mgmt.benchmarks.records import RunRecord, decode_record, payload_di
 
 
 REQUEST_TIMEOUT = (10, 30)
+MAX_RUNS = 1000
+MAX_HISTORY_BYTES = 32 * 1024 * 1024
 
 
 class BenchmarkBackend:
@@ -40,6 +42,8 @@ class BenchmarkBackend:
             pods = self._object(self.core.list_pod_for_all_namespaces(_request_timeout=REQUEST_TIMEOUT))
         except ApiException as exc:
             raise BenchmarkError(f"Cannot verify current node/GPU allocations (Kubernetes HTTP {exc.status}).") from exc
+        if (pods.get("metadata") or {}).get("continue"):
+            raise BenchmarkError("GPU allocation inventory is incomplete; refusing submission.")
         return validate_runtime_nodes(case, nodes, pods.get("items", []))
 
     def _record(self, value: Any) -> RunRecord:
@@ -73,15 +77,36 @@ class BenchmarkBackend:
             raise BenchmarkError(f"Cannot read run {run_id} (Kubernetes HTTP {exc.status}).") from exc
         return self._record(value)
 
-    def list_runs(self, namespace: str) -> tuple[RunRecord, ...]:
+    def list_runs(self, namespace: str | None) -> tuple[RunRecord, ...]:
+        records: list[RunRecord] = []
+        continuation: str | None = None
+        seen: set[str] = set()
+        size = 0
         try:
-            values = self._object(self.core.list_namespaced_config_map(
-                namespace, label_selector=f"app.kubernetes.io/managed-by={MANAGED_BY}",
-                _request_timeout=REQUEST_TIMEOUT,
-            ))
+            while True:
+                options: dict[str, Any] = {"label_selector": f"app.kubernetes.io/managed-by={MANAGED_BY}",
+                                           "limit": 100, "_request_timeout": REQUEST_TIMEOUT}
+                if continuation:
+                    options["_continue"] = continuation
+                values = self._object(self.core.list_config_map_for_all_namespaces(**options) if namespace is None
+                                      else self.core.list_namespaced_config_map(namespace, **options))
+                for item in values.get("items") or []:
+                    record = self._record(item)
+                    size += len(record.payload().encode("utf-8"))
+                    if len(records) >= MAX_RUNS or size > MAX_HISTORY_BYTES:
+                        raise BenchmarkError("Benchmark history exceeds safe inventory limits; archive completed runs before submission.")
+                    if any(previous.uid == record.uid for previous in records):
+                        raise BenchmarkError("Benchmark history contains duplicate run UIDs; inventory is unverified.")
+                    records.append(record)
+                continuation = (values.get("metadata") or {}).get("continue")
+                if not continuation:
+                    break
+                if continuation in seen:
+                    raise BenchmarkError("Benchmark history pagination repeated; inventory is incomplete.")
+                seen.add(continuation)
         except ApiException as exc:
             raise BenchmarkError(f"Cannot list benchmark runs (Kubernetes HTTP {exc.status}).") from exc
-        return tuple(sorted((self._record(item) for item in values.get("items", [])), key=lambda item: item.created_at))
+        return tuple(sorted(records, key=lambda item: item.created_at))
 
     def create_run(self, record: RunRecord) -> RunRecord:
         if record.uid or record.resource_version or record.revision != 1 or record.state != "PLANNED":
