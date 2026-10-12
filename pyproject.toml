@@ -8,6 +8,7 @@ version = "0.10.0"
 description = "Node and worker-pool management CLI for OCI HPC OKE clusters."
 requires-python = ">=3.9"
 dependencies = [
+  "ClusterShell>=1.9.3,<2",
   "click>=8.1,<8.2",
   "kubernetes>=29.0.0",
   "oci>=2.181.1",

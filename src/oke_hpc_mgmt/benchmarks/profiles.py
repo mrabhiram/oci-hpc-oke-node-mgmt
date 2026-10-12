@@ -1,0 +1,121 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Literal
+
+from oke_hpc_mgmt.benchmarks.models import BenchmarkError, REPORT_BYTES, SOURCE_REVISION
+
+
+DEFAULT_IMAGE = (
+    "iad.ocir.io/idxzjcdglx2s/nccl-tests:"
+    "cuda-13.4.1-ubuntu-24.04-nccl-2.32.3-100526.0"
+)
+
+
+@dataclass(frozen=True)
+class NcclProfile:
+    shape: str
+    gpu_count: int
+    host_hcas: str | None
+    max_bytes: int
+    family: Literal["ampere", "hopper-blackwell", "local"]
+    source_revision: str = SOURCE_REVISION
+    image: str = DEFAULT_IMAGE
+
+    @property
+    def vf_count(self) -> int:
+        if self.host_hcas is None:
+            return 0
+        return len(self.host_hcas.removeprefix("=").split(","))
+
+
+# Device names are shape facts from the pinned upstream MPIJob profiles, not
+# interchangeable GPU-generation defaults. GB-family DRA profiles are separate.
+PROFILES = (
+    NcclProfile("BM.GPU4.8", 8,
+                "=mlx5_0,mlx5_2,mlx5_6,mlx5_8,mlx5_10,mlx5_12,mlx5_14,mlx5_16,"
+                "mlx5_1,mlx5_3,mlx5_7,mlx5_9,mlx5_11,mlx5_13,mlx5_15,mlx5_17",
+                REPORT_BYTES, "ampere"),
+    NcclProfile("BM.GPU.A100-v2.8", 8,
+                "=mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,"
+                "mlx5_14,mlx5_15,mlx5_16,mlx5_17,mlx5_9,mlx5_10,mlx5_11,mlx5_12",
+                2 * REPORT_BYTES, "ampere"),
+    NcclProfile("BM.GPU.B4.8", 8,
+                "=mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,"
+                "mlx5_14,mlx5_15,mlx5_16,mlx5_17,mlx5_9,mlx5_10,mlx5_11,mlx5_12",
+                2 * REPORT_BYTES, "ampere"),
+    NcclProfile("BM.GPU.H100.8", 8,
+                "=mlx5_0,mlx5_1,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,"
+                "mlx5_9,mlx5_10,mlx5_12,mlx5_13,mlx5_14,mlx5_15,mlx5_16,mlx5_17",
+                2 * REPORT_BYTES, "hopper-blackwell"),
+    NcclProfile("BM.GPU.H200.8", 8,
+                "=mlx5_0,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_9,mlx5_10,mlx5_11",
+                2 * REPORT_BYTES, "hopper-blackwell"),
+    NcclProfile("BM.GPU.B200.8", 8,
+                "=mlx5_0,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_9,mlx5_10,mlx5_11",
+                2 * REPORT_BYTES, "hopper-blackwell"),
+    NcclProfile("BM.GPU.B300.8", 8,
+                "=mlx5_0,mlx5_1,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11,mlx5_12,"
+                "mlx5_13,mlx5_14,mlx5_16,mlx5_17,mlx5_18,mlx5_19,mlx5_20,mlx5_21",
+                2 * REPORT_BYTES, "hopper-blackwell"),
+    # A10 profiles are local-only additions; no upstream RDMA profile is implied.
+    NcclProfile("VM.GPU.A10.1", 1, None, REPORT_BYTES, "local"),
+    NcclProfile("VM.GPU.A10.2", 2, None, REPORT_BYTES, "local"),
+)
+
+
+def get_profile(shape: str) -> NcclProfile:
+    for profile in PROFILES:
+        if profile.shape == shape:
+            return profile
+    raise BenchmarkError(f"No reviewed execution profile for shape {shape}; refusing substitution.")
+
+
+def profile_environment(
+    profile: NcclProfile,
+    network: str,
+    overrides: tuple[str, ...] = (),
+) -> dict[str, str]:
+    if network not in {"local", "host", "vf"}:
+        raise BenchmarkError(f"Unsupported NCCL network profile: {network}.")
+    environment = {"NCCL_DEBUG": "INFO", "NCCL_DEBUG_SUBSYS": "INIT,NET,GRAPH"}
+    if network == "local":
+        environment["NCCL_IB_DISABLE"] = "1"
+    else:
+        if profile.host_hcas is None:
+            raise BenchmarkError(f"{profile.shape} has no RDMA execution profile.")
+        environment.update({
+            "NCCL_IB_SPLIT_DATA_ON_QPS": "0",
+            "NCCL_IB_GID_INDEX": "3",
+            "NCCL_IB_HCA": profile.host_hcas if network == "host" else "mlx5",
+            "NCCL_IB_TC": "41", "NCCL_IB_SL": "0", "NCCL_IB_TIMEOUT": "22",
+            "HCOLL_ENABLE_MCAST_ALL": "0", "UCX_TLS": "tcp", "UCX_NET_DEVICES": "eth0",
+        })
+        if profile.family == "ampere":
+            environment["NCCL_IB_QPS_PER_CONNECTION"] = "4"
+        else:
+            environment.update({
+                "NCCL_CUMEM_ENABLE": "0", "RX_QUEUE_LEN": "8192", "IB_RX_QUEUE_LEN": "8192",
+                "NCCL_SOCKET_IFNAME": "eth0", "NCCL_IGNORE_CPU_AFFINITY": "1",
+            })
+    seen: set[str] = set()
+    for item in overrides:
+        key, separator, value = item.partition("=")
+        if not separator or not value or not re.fullmatch(r"(?:NCCL|UCX|HCOLL)_[A-Z0-9_]+", key):
+            raise BenchmarkError("Environment overrides must be nonempty NCCL_/UCX_/HCOLL_ KEY=VALUE.")
+        if key in seen or any(character in value for character in "\x00\n\r"):
+            raise BenchmarkError(f"Duplicate or invalid environment override: {key}.")
+        if key in {"NCCL_DEBUG", "NCCL_DEBUG_SUBSYS", "NCCL_DEBUG_FILE"}:
+            raise BenchmarkError(f"{key} is reserved for evidence collection.")
+        if key.startswith("NCCL_IB_") and network == "local":
+            raise BenchmarkError("RDMA overrides cannot be used with the local profile.")
+        if key == "NCCL_IB_DISABLE" and value != "0" and network != "local":
+            raise BenchmarkError("RDMA tests cannot disable InfiniBand.")
+        if key == "NCCL_NET" and value.lower() != "ib" and network != "local":
+            raise BenchmarkError("RDMA tests cannot force a non-IB transport.")
+        if key == "NCCL_IB_HCA" and network == "vf" and value != "mlx5":
+            raise BenchmarkError("VF device names are dynamic; NCCL_IB_HCA must remain mlx5.")
+        seen.add(key)
+        environment[key] = value
+    return environment

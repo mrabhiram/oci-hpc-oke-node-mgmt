@@ -96,6 +96,7 @@ class NodeInfo:
     slinky_workload_pods: int = 0
     boot_id: str | None = None
     kubelet_version: str | None = None
+    kubernetes_uid: str | None = None
 
     @property
     def rdma_labels(self) -> dict[str, str]:

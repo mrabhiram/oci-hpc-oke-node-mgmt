@@ -81,3 +81,8 @@ capacity naturally vary by deployment.
 - [Troubleshooting](./troubleshooting.md): Diagnose authentication, kubeconfig,
   inventory, readiness, timeout, and mutation refusal errors.
 - [Current Scope](./scope.md): Review implemented features and planned work.
+
+## Feature designs
+
+- [Slurm-Compatible NCCL Healthchecks](./nccl-healthchecks-design.md): Review
+  the proposed command interface, diagnostic coverage, and acceptance criteria.

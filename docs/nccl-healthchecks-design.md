@@ -1,8 +1,10 @@
 # Slurm-Compatible NCCL Healthchecks
 
-Status: proposed. The commands and capabilities described in this document are
-not implemented by this change. Existing `mgmt-oke health run` behavior is
-unchanged.
+Status: implementation in progress. The planning, manifest, preflight,
+checkpoint, and result-validation components have initial implementations and
+unit tests. The proposed public commands below are not yet available; execution
+workflows and live validation remain incomplete. Existing `mgmt-oke health run`
+behavior is unchanged.
 
 ## Objective
 
@@ -71,7 +73,7 @@ use the existing interactive confirmation or `--yes` convention.
 The following extensions remain on `nodes healthchecks` and are not presented as
 options available in upstream Slurm mgmt.
 
-```bash
+```text
 # Preview one NCCL collective over the complete selected pool.
 mgmt-oke nodes healthchecks --pool <pool-name> \
   --type multi-node --mode all-nodes --checks nccl --dry-run
@@ -128,7 +130,7 @@ names. A singleton group cannot pass an inter-node RDMA test.
 
 Add these helpers under the existing `health` group:
 
-```bash
+```text
 mgmt-oke health profiles
 mgmt-oke health list --pool <pool-name>
 mgmt-oke health get <run-id>
@@ -216,7 +218,8 @@ The benchmark subsystem will not:
 
 ## Delivery and Acceptance
 
-All items below are planned and remain unchecked until implemented and verified.
+Items remain unchecked until their complete acceptance criterion is implemented
+and verified. Passing component tests alone do not establish end-to-end support.
 
 ### Command Compatibility and NCCL Execution
 

@@ -234,6 +234,7 @@ class KubernetesBackend:
             nodes.append(
                 NodeInfo(
                     k8s_name=node.metadata.name,
+                    kubernetes_uid=getattr(node.metadata, "uid", None),
                     internal_ip=_internal_ip(node),
                     provider_id=provider_id,
                     instance_ocid=parse_instance_ocid(provider_id),
