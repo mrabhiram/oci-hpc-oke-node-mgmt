@@ -1,9 +1,9 @@
 # Slurm-Compatible NCCL Healthchecks
 
 Status: implementation in progress. The planning, manifest, preflight,
-checkpoint, and result-validation components have initial implementations and
-unit tests. The proposed public commands below are not yet available; execution
-workflows and live validation remain incomplete. Existing `mgmt-oke health run`
+checkpoint, workload-evidence, and result-validation components have initial
+implementations and unit tests. The proposed public commands below are not yet
+available; execution workflows and live validation remain incomplete. Existing `mgmt-oke health run`
 behavior is unchanged.
 
 ## Objective
@@ -167,6 +167,13 @@ deleting their only copy. Reconnect using recorded object identities, preserve
 attempt boundaries after requeue/retry, and protect shared resources during
 idempotent cleanup.
 
+Workload evidence collection verifies the MPIJob UID and the controller ownership
+chain for each worker and launcher Pod. It checks Pod/container identity before
+and after bounded log reads and records resolved image digests, node UIDs, and
+exit codes. Missing logs, changed identities, incomplete coverage, and conflicting
+completion conditions cannot establish a successful benchmark. Evidence export
+and the execution workflow remain in development.
+
 ## Execution Architecture
 
 - Reuse the existing discovery, node selection, Kubernetes client, output
@@ -273,3 +280,4 @@ The design was reviewed against these source revisions:
 - [OKE NCCL/RCCL testing](https://github.com/oracle-quickstart/oci-hpc-oke/blob/6c94a4201d9ec6887f37eceeca325ec18b03b703/docs/running-nccl-rccl-tests.md)
 - [OKE NCCL manifests](https://github.com/oracle-quickstart/oci-hpc-oke/tree/6c94a4201d9ec6887f37eceeca325ec18b03b703/manifests/nccl-tests)
 - [OKE RCCL manifests](https://github.com/oracle-quickstart/oci-hpc-oke/tree/6c94a4201d9ec6887f37eceeca325ec18b03b703/manifests/rccl-tests)
+- [MPI Operator v0.8.2 resource ownership](https://github.com/kubeflow/mpi-operator/blob/v0.8.2/pkg/controller/mpi_job_controller.go)
