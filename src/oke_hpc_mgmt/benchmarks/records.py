@@ -17,6 +17,40 @@ CaseState = Literal["PLANNED", "SUBMITTING", "QUEUED", "RUNNING", "SUCCEEDED", "
 RunState = Literal["PLANNED", "RUNNING", "SUCCEEDED", "FAILED", "INCOMPLETE", "CANCELLING", "CANCELLED", "CLEANED"]
 TERMINAL_CASE_STATES = frozenset({"SUCCEEDED", "FAILED", "INCOMPLETE", "CANCELLED"})
 MAX_RECORD_BYTES = 700_000
+MAX_SNAPSHOTS = 128
+SnapshotPhase = Literal["QUEUED", "STARTING", "RUNNING", "TERMINAL", "CANCELLING"]
+
+
+@dataclass(frozen=True)
+class EvidenceSnapshot:
+    observed_at: str
+    phase: SnapshotPhase
+    pod_identities: tuple[tuple[str, str, str | None, int], ...]
+    sha256: str
+
+    def validate(self) -> None:
+        if self.phase not in {"QUEUED", "STARTING", "RUNNING", "TERMINAL", "CANCELLING"} or not (
+            isinstance(self.sha256, str) and re.fullmatch(r"[a-f0-9]{64}", self.sha256)
+        ):
+            raise BenchmarkError("Invalid evidence snapshot phase or digest.")
+        timestamp(self.observed_at)
+        names: set[str] = set()
+        for name, uid, container_id, restarts in self.pod_identities:
+            if not isinstance(name, str) or not name or name in names or not isinstance(uid, str) or not uid or (
+                container_id is not None and not isinstance(container_id, str)
+            ) or type(restarts) is not int or restarts < 0:
+                raise BenchmarkError("Invalid or duplicate Pod identity in evidence snapshot.")
+            names.add(name)
+
+
+def timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.utcoffset() is None:
+            raise ValueError("Missing timezone")
+        return parsed
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise BenchmarkError("Checkpoint timestamps must be timezone-aware ISO timestamps.") from exc
 
 
 @dataclass(frozen=True)
@@ -31,6 +65,9 @@ class CaseRecord:
     result: dict[str, Any] | None = None
     error: str | None = None
     evidence_sha256: str | None = None
+    submitted_at: str | None = None
+    admitted_at: str | None = None
+    snapshots: tuple[EvidenceSnapshot, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -45,6 +82,7 @@ class RunRecord:
     schema_version: int = 1
     uid: str | None = field(default=None, compare=False)
     resource_version: str | None = field(default=None, compare=False)
+    stop_reason: str | None = None
 
     @classmethod
     def create(cls, run_id: str, plan: HealthcheckPlan, options: ExecutionOptions) -> RunRecord:
@@ -65,19 +103,26 @@ class RunRecord:
             "PLANNED": {"PLANNED", "SUBMITTING", "CANCELLED"},
             "SUBMITTING": {"SUBMITTING", "QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "INCOMPLETE", "CANCELLED"},
             "QUEUED": {"QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "INCOMPLETE", "CANCELLED"},
-            "RUNNING": {"RUNNING", "SUCCEEDED", "FAILED", "INCOMPLETE", "CANCELLED"},
+            "RUNNING": {"RUNNING", "QUEUED", "SUCCEEDED", "FAILED", "INCOMPLETE", "CANCELLED"},
         }
         if self.state == "CLEANED" or state not in transitions.get(current.state, {current.state}):
             raise BenchmarkError(f"Invalid case transition {current.state} -> {state}.")
-        if any(name not in {"job_uid", "created_at", "started_at", "completed_at", "result", "error", "evidence_sha256"}
+        if any(name not in {"job_uid", "created_at", "started_at", "completed_at", "result", "error", "evidence_sha256",
+                            "submitted_at", "admitted_at", "snapshots"}
                for name in changes):
             raise BenchmarkError("A checkpoint update cannot change case identity or its plan.")
         if current.job_uid and changes.get("job_uid", current.job_uid) != current.job_uid:
             raise BenchmarkError("A replacement MPIJob must be recorded as a new attempt, not adopted.")
         updated = replace(current, state=state, **changes)
+        if updated.snapshots[:len(current.snapshots)] != current.snapshots:
+            raise BenchmarkError("Previously exported evidence snapshots are append-only.")
+        if current.state == "RUNNING" and state == "QUEUED" and (
+            len(updated.snapshots) <= len(current.snapshots) or updated.snapshots[-1].phase != "QUEUED"
+        ):
+            raise BenchmarkError("A requeue requires a new exported observation; do not combine attempts.")
         if state in {"QUEUED", "RUNNING", "SUCCEEDED"} and not updated.job_uid:
             raise BenchmarkError("An observed workload state requires its MPIJob UID.")
-        _validate_success(updated)
+        _validate_case(updated)
         cases = tuple(updated if item.case_id == case_id else item for item in self.cases)
         overall: RunState = "RUNNING"
         if all(item.state in TERMINAL_CASE_STATES for item in cases):
@@ -145,7 +190,16 @@ def decode_record(payload: str, *, uid: str, resource_version: str) -> RunRecord
             placements.append(TopologyPlacement(**placement))
         options = ExecutionOptions(**option_values, placements=tuple(placements))
         options.validate()
-        records = tuple(CaseRecord(**_keys(item, CaseRecord)) for item in value.pop("cases"))
+        records_list: list[CaseRecord] = []
+        for item in value.pop("cases"):
+            case_record_values = _keys(item, CaseRecord)
+            snapshots: list[EvidenceSnapshot] = []
+            for snapshot_value in case_record_values.pop("snapshots", []):
+                snapshot = _keys(snapshot_value, EvidenceSnapshot)
+                snapshot["pod_identities"] = tuple(tuple(identity) for identity in snapshot["pod_identities"])
+                snapshots.append(EvidenceSnapshot(**snapshot))
+            records_list.append(CaseRecord(**case_record_values, snapshots=tuple(snapshots)))
+        records = tuple(records_list)
         record = RunRecord(plan=typed_plan, options=options, cases=records, uid=uid,
                            resource_version=resource_version, **value)
         validate_run_id(record.run_id)
@@ -162,7 +216,10 @@ def decode_record(payload: str, *, uid: str, resource_version: str) -> RunRecord
         for case_record in records:
             if case_record.state in {"QUEUED", "RUNNING", "SUCCEEDED"} and not case_record.job_uid:
                 raise BenchmarkError("An observed workload state requires its MPIJob UID.")
-            _validate_success(case_record)
+            _validate_case(case_record)
+        timestamp(record.created_at)
+        if record.stop_reason is not None and (not isinstance(record.stop_reason, str) or not record.stop_reason):
+            raise BenchmarkError("Invalid recorded cancellation reason.")
         if record.state == "SUCCEEDED" and any(item.state != "SUCCEEDED" for item in records):
             raise BenchmarkError("Run success requires success evidence for every case.")
         return record
@@ -184,6 +241,17 @@ def _validate_success(case: CaseRecord) -> None:
         raise BenchmarkError("Successful cases require a passing assessment and exported evidence digest.")
 
 
+def _validate_case(case: CaseRecord) -> None:
+    _validate_success(case)
+    for value in (case.submitted_at, case.created_at, case.admitted_at, case.started_at, case.completed_at):
+        if value is not None:
+            timestamp(value)
+    if len(case.snapshots) > MAX_SNAPSHOTS:
+        raise BenchmarkError("Evidence snapshot limit reached; retain workloads and inspect run history.")
+    for snapshot in case.snapshots:
+        snapshot.validate()
+
+
 def next_cases(record: RunRecord) -> tuple[BenchmarkCase, ...]:
     if record.state in {"CANCELLING", "CANCELLED", "FAILED", "INCOMPLETE", "SUCCEEDED", "CLEANED"}:
         return ()
@@ -203,12 +271,13 @@ def next_cases(record: RunRecord) -> tuple[BenchmarkCase, ...]:
     return tuple(selected)
 
 
-def mark_cancelling(record: RunRecord) -> RunRecord:
+def mark_cancelling(record: RunRecord, *, reason: str | None = None) -> RunRecord:
     if record.state == "CLEANED":
         raise BenchmarkError("A cleaned run cannot be cancelled.")
     if all(case.state in TERMINAL_CASE_STATES for case in record.cases):
         return record
-    return replace(record, state=cast(RunState, "CANCELLING"), revision=record.revision + 1)
+    return replace(record, state=cast(RunState, "CANCELLING"), stop_reason=record.stop_reason or reason,
+                   revision=record.revision + 1)
 
 
 def assert_no_overlap(plan: HealthcheckPlan, existing: tuple[RunRecord, ...], *, exclude_uid: str | None = None) -> None:

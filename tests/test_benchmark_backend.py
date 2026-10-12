@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 from kubernetes.client import ApiClient
 from kubernetes.client.exceptions import ApiException
+from urllib3.exceptions import HTTPError
 
 from oke_hpc_mgmt.benchmarks.backend import BenchmarkBackend
 from oke_hpc_mgmt.benchmarks.manifests import owned_labels, render_mpijob
@@ -253,3 +254,71 @@ class BenchmarkBackendTests(unittest.TestCase):
         self.custom.create_namespaced_custom_object.assert_not_called()
         self.custom.patch_namespaced_custom_object.assert_not_called()
         self.custom.delete_namespaced_custom_object.assert_not_called()
+
+    def test_resource_version_changes_after_export_block_cancel_and_delete(self) -> None:
+        submitting = self.checkpoint.update_case(self.case.case_id, "SUBMITTING")
+        running = submitting.update_case(self.case.case_id, "RUNNING", job_uid="job-uid")
+        cancelling = mark_cancelling(running)
+        self.core.read_namespaced_config_map.return_value = configmap(cancelling)
+        self.custom.get_namespaced_custom_object.return_value = self.job()
+        with self.assertRaisesRegex(BenchmarkError, "changed after evidence"):
+            self.backend.cancel_job(cancelling, self.case, evidence_resource_version="stale")
+        terminal = running.update_case(self.case.case_id, "CANCELLED", evidence_sha256="a" * 64)
+        self.core.read_namespaced_config_map.return_value = configmap(terminal)
+        with self.assertRaisesRegex(BenchmarkError, "changed after evidence"):
+            self.backend.delete_job(terminal, self.case, evidence_resource_version="stale")
+        self.custom.patch_namespaced_custom_object.assert_not_called()
+        self.custom.delete_namespaced_custom_object.assert_not_called()
+
+    def test_pod_release_requires_a_complete_empty_inventory(self) -> None:
+        for response in ({"items": [{"metadata": {"uid": "still-running"}}]},
+                         {"items": [], "metadata": {"continue": "next"}}):
+            self.core.list_namespaced_pod.return_value = response
+            self.assertFalse(self.backend.case_pods_absent(self.checkpoint, self.case))
+        self.core.list_namespaced_pod.return_value = {"items": []}
+        self.assertTrue(self.backend.case_pods_absent(self.checkpoint, self.case))
+        self.assertEqual(1, self.core.list_namespaced_pod.call_args.kwargs["limit"])
+        self.core.list_namespaced_pod.side_effect = ApiException(status=403)
+        with self.assertRaisesRegex(BenchmarkError, "not confirmed released"):
+            self.backend.case_pods_absent(self.checkpoint, self.case)
+        with self.assertRaisesRegex(BenchmarkError, "immutable plan"):
+            self.backend.case_pods_absent(self.checkpoint, replace(self.case, case_id="case-9999"))
+
+    def test_transport_failures_remain_unconfirmed_without_automatic_retries(self) -> None:
+        submitting = self.checkpoint.update_case(self.case.case_id, "SUBMITTING")
+        self.core.read_namespaced_config_map.return_value = configmap(submitting)
+        self.custom.create_namespaced_custom_object.side_effect = HTTPError("response lost")
+        with self.assertRaisesRegex(BenchmarkError, "submission was not confirmed"):
+            self.backend.create_job(submitting, self.case)
+        self.assertEqual(1, self.custom.create_namespaced_custom_object.call_count)
+        self.custom.get_namespaced_custom_object.side_effect = OSError("connection reset")
+        with self.assertRaisesRegex(BenchmarkError, "do not create a replacement"):
+            self.backend.get_job(submitting, self.case)
+        self.core.create_namespaced_config_map.side_effect = OSError("connection reset")
+        with self.assertRaisesRegex(BenchmarkError, "inspect run"):
+            self.backend.create_run(record())
+        self.core.patch_namespaced_config_map.side_effect = HTTPError("response lost")
+        with self.assertRaisesRegex(BenchmarkError, "same run"):
+            self.backend.save_run(submitting.update_case(self.case.case_id, "SUBMITTING"))
+        self.core.read_namespaced_config_map.side_effect = OSError("connection reset")
+        with self.assertRaisesRegex(BenchmarkError, "state is unverified"):
+            self.backend.get_run("default", self.checkpoint.run_id)
+        self.core.list_config_map_for_all_namespaces.side_effect = HTTPError("response lost")
+        with self.assertRaisesRegex(BenchmarkError, "overlap inventory is unverified"):
+            self.backend.list_runs(None)
+
+    def test_cancel_cleanup_and_pod_inventory_transport_errors_are_not_success(self) -> None:
+        cancelling = mark_cancelling(self.checkpoint)
+        self.core.read_namespaced_config_map.return_value = configmap(cancelling)
+        self.custom.get_namespaced_custom_object.return_value = self.job()
+        self.custom.patch_namespaced_custom_object.side_effect = OSError("connection reset")
+        with self.assertRaisesRegex(BenchmarkError, "Cancellation could not reach"):
+            self.backend.cancel_job(cancelling, self.case)
+        terminal = self.checkpoint.update_case(self.case.case_id, "CANCELLED", evidence_sha256="a" * 64)
+        self.core.read_namespaced_config_map.return_value = configmap(terminal)
+        self.custom.delete_namespaced_custom_object.side_effect = HTTPError("response lost")
+        with self.assertRaisesRegex(BenchmarkError, "resource removal is unverified"):
+            self.backend.delete_job(terminal, self.case)
+        self.core.list_namespaced_pod.side_effect = HTTPError("response lost")
+        with self.assertRaisesRegex(BenchmarkError, "not confirmed released"):
+            self.backend.case_pods_absent(terminal, self.case)

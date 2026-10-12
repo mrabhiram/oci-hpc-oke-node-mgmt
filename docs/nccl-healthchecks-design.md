@@ -1,9 +1,10 @@
 # Slurm-Compatible NCCL Healthchecks
 
 Status: implementation in progress. The planning, manifest, preflight,
-checkpoint, workload-evidence, and result-validation components have initial
-implementations and unit tests. The proposed public commands below are not yet
-available; execution workflows and live validation remain incomplete. Existing `mgmt-oke health run`
+checkpoint, workload-evidence, result-validation, and execution-workflow components
+have initial implementations and unit tests. The proposed public commands below
+are not yet available; CLI integration, additional adapters, and live benchmark
+validation remain incomplete. Existing `mgmt-oke health run`
 behavior is unchanged.
 
 ## Objective
@@ -175,8 +176,36 @@ completion conditions cannot establish a successful benchmark. Private evidence
 snapshots now include the immutable request, execution options, selected case,
 Pod identities, and raw logs. Export uses content-addressed files, atomic
 publication, and checksum read-back; verification rejects missing, modified,
-publicly readable, or identity-mismatched files. Execution and cleanup integration
-remain in development.
+publicly readable, or identity-mismatched files. The execution workflow exports
+these snapshots before cancellation and cleanup, and verifies every recorded
+snapshot before deleting the workload.
+
+The workflow now connects preparation, checkpoint creation, bounded submission,
+observation, waiting, cancellation, and cleanup. It records intent before a job
+POST and recovers an accepted job by its recorded name and verified ownership
+when the response was lost. Submission is revalidated under the dedicated Lease;
+waiting releases the Lease between bounded passes. A checkpoint conflict or
+unverified API response stops that pass without claiming success.
+
+Observed requeues and changes to Pod/container identities receive separate,
+append-only evidence snapshots. Assessments use one current snapshot, never
+concatenated logs from different observations. This is observed history, not a
+claim to capture transitions that occurred entirely between polls. Requeue does
+not reset an already recorded startup or execution deadline. A total deadline
+also bounds the combined queue/startup/execution interval.
+
+Cancellation records intent before suspension and requires readable logs for
+started containers. It waits for the case's Pods to disappear before recording
+cancellation. Cleanup uses UID/resource-version preconditions, refuses changed
+execution attempts, and waits for observed MPIJob and Pod removal. A completed
+case's assessment remains tied to its original evidence digest even when later
+cleanup snapshots are exported.
+
+These workflow methods do not install a background controller. Advancement and
+client-enforced queue deadlines currently require an active caller; stopping a
+wait does not restart or automatically cancel the run. Retaining resources can
+prevent later overlapping cases from starting until those resources are released.
+Public command integration and service-driven advancement remain delivery items.
 
 ## Execution Architecture
 

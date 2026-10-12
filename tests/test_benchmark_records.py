@@ -8,7 +8,7 @@ from oke_hpc_mgmt.benchmarks.manifests import ExecutionOptions
 from oke_hpc_mgmt.benchmarks.models import BenchmarkError, HealthcheckRequest
 from oke_hpc_mgmt.benchmarks.planning import plan_healthchecks
 from oke_hpc_mgmt.benchmarks.records import (
-    RunRecord, assert_no_overlap, decode_record, mark_cancelling, next_cases, payload_digest,
+    EvidenceSnapshot, RunRecord, assert_no_overlap, decode_record, mark_cancelling, next_cases, payload_digest, timestamp,
 )
 from test_benchmark_planning import inventory, request
 
@@ -66,7 +66,7 @@ class BenchmarkRecordTests(unittest.TestCase):
         running = queued.update_case(case_id, "RUNNING")
         with self.assertRaisesRegex(BenchmarkError, "replacement MPIJob"):
             running.update_case(case_id, "RUNNING", job_uid="new-job-uid")
-        with self.assertRaisesRegex(BenchmarkError, "Invalid case transition"):
+        with self.assertRaisesRegex(BenchmarkError, "new exported observation"):
             running.update_case(case_id, "QUEUED")
         with self.assertRaisesRegex(BenchmarkError, "passing assessment"):
             running.update_case(case_id, "SUCCEEDED")
@@ -157,3 +157,28 @@ class BenchmarkRecordTests(unittest.TestCase):
         oversized = replace(record(), cases=(replace(record().cases[0], error="x" * 700001),))
         with self.assertRaisesRegex(BenchmarkError, "limit"):
             oversized.payload()
+
+    def test_requeues_require_append_only_exported_observations(self) -> None:
+        initial = record()
+        case = initial.cases[0]
+        running = initial.update_case(case.case_id, "SUBMITTING").update_case(case.case_id, "RUNNING", job_uid="uid")
+        snapshot = EvidenceSnapshot("2026-01-01T00:00:00Z", "QUEUED", (), "a" * 64)
+        queued = running.update_case(case.case_id, "QUEUED", snapshots=(snapshot,))
+        self.assertEqual((snapshot,), queued.cases[0].snapshots)
+        self.assertEqual(queued, decode_record(queued.payload(), uid="uid", resource_version="1"))
+        with self.assertRaisesRegex(BenchmarkError, "append-only"):
+            queued.update_case(case.case_id, "QUEUED", snapshots=())
+        with self.assertRaisesRegex(BenchmarkError, "limit"):
+            queued.update_case(case.case_id, "QUEUED", snapshots=(snapshot,) * 129)
+
+    def test_snapshot_identity_time_and_state_validation(self) -> None:
+        good = EvidenceSnapshot("2026-01-01T00:00:00Z", "RUNNING", (("pod", "uid", "container", 0),), "a" * 64)
+        good.validate()
+        for invalid in (replace(good, phase="other"), replace(good, sha256="bad"),  # type: ignore[arg-type]
+                        replace(good, observed_at="yesterday"), replace(good, pod_identities=good.pod_identities * 2),
+                        replace(good, pod_identities=(("pod", "uid", None, -1),))):
+            with self.subTest(invalid=invalid), self.assertRaises(BenchmarkError):
+                invalid.validate()
+        for value in ("2026-01-01T00:00:00", "invalid", None):
+            with self.assertRaises(BenchmarkError):
+                timestamp(value)  # type: ignore[arg-type]

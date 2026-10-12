@@ -4,10 +4,11 @@ from dataclasses import replace
 from typing import Any
 
 from kubernetes.client.exceptions import ApiException
+from urllib3.exceptions import HTTPError
 
 from oke_hpc_mgmt.backends.kubernetes import KubernetesBackend
 from oke_hpc_mgmt.benchmarks.manifests import (
-    MANAGED_BY, MPI_GROUP, MPI_PLURAL, MPI_VERSION, case_name, owned_labels,
+    CASE_LABEL, MANAGED_BY, MPI_GROUP, MPI_PLURAL, MPI_VERSION, RUN_LABEL, case_name, owned_labels,
     render_mpijob, validate_run_id,
 )
 from oke_hpc_mgmt.benchmarks.models import BenchmarkCase, BenchmarkError
@@ -40,8 +41,8 @@ class BenchmarkBackend:
             nodes = [self._object(self.core.read_node(node.name, _request_timeout=REQUEST_TIMEOUT))
                      for node in case.nodes]
             pods = self._object(self.core.list_pod_for_all_namespaces(_request_timeout=REQUEST_TIMEOUT))
-        except ApiException as exc:
-            raise BenchmarkError(f"Cannot verify current node/GPU allocations (Kubernetes HTTP {exc.status}).") from exc
+        except (ApiException, HTTPError, OSError) as exc:
+            raise BenchmarkError("Cannot verify current node/GPU allocations; inventory is unavailable.") from exc
         if (pods.get("metadata") or {}).get("continue"):
             raise BenchmarkError("GPU allocation inventory is incomplete; refusing submission.")
         return validate_runtime_nodes(case, nodes, pods.get("items", []))
@@ -75,6 +76,8 @@ class BenchmarkBackend:
             value = self.core.read_namespaced_config_map(run_id, namespace, _request_timeout=REQUEST_TIMEOUT)
         except ApiException as exc:
             raise BenchmarkError(f"Cannot read run {run_id} (Kubernetes HTTP {exc.status}).") from exc
+        except (HTTPError, OSError) as exc:
+            raise BenchmarkError(f"Cannot reach the API to read run {run_id}; its state is unverified.") from exc
         return self._record(value)
 
     def list_runs(self, namespace: str | None) -> tuple[RunRecord, ...]:
@@ -106,6 +109,8 @@ class BenchmarkBackend:
                 seen.add(continuation)
         except ApiException as exc:
             raise BenchmarkError(f"Cannot list benchmark runs (Kubernetes HTTP {exc.status}).") from exc
+        except (HTTPError, OSError) as exc:
+            raise BenchmarkError("Cannot reach benchmark history; overlap inventory is unverified.") from exc
         return tuple(sorted(records, key=lambda item: item.created_at))
 
     def create_run(self, record: RunRecord) -> RunRecord:
@@ -130,6 +135,8 @@ class BenchmarkBackend:
                 f"Checkpoint creation was not confirmed (Kubernetes HTTP {exc.status}); "
                 f"inspect run {record.run_id} before retrying."
             ) from exc
+        except (HTTPError, OSError) as exc:
+            raise BenchmarkError(f"Checkpoint creation was not confirmed; inspect run {record.run_id} before retrying.") from exc
         return self._record(value)
 
     def save_run(self, record: RunRecord) -> RunRecord:
@@ -151,6 +158,8 @@ class BenchmarkBackend:
             )
         except ApiException as exc:
             raise BenchmarkError(f"Checkpoint update was not confirmed (Kubernetes HTTP {exc.status}); reread the run.") from exc
+        except (HTTPError, OSError) as exc:
+            raise BenchmarkError("Checkpoint update could not reach the API; reread the same run before retrying.") from exc
         return self._record(value)
 
     def _verify_job(self, obj: dict[str, Any], run: RunRecord, case: BenchmarkCase) -> dict[str, Any]:
@@ -192,7 +201,22 @@ class BenchmarkBackend:
             if exc.status == 404:
                 return None
             raise BenchmarkError(f"Cannot inspect MPIJob (Kubernetes HTTP {exc.status}).") from exc
+        except (HTTPError, OSError) as exc:
+            raise BenchmarkError("Cannot reach the API to inspect MPIJob; do not create a replacement.") from exc
         return self._verify_job(self._object(value), run, case)
+
+    def case_pods_absent(self, run: RunRecord, case: BenchmarkCase) -> bool:
+        if case not in run.plan.cases:
+            raise BenchmarkError("Case does not match the checkpoint's immutable plan.")
+        try:
+            pods = self._object(self.core.list_namespaced_pod(
+                run.plan.request.namespace,
+                label_selector=f"{RUN_LABEL}={run.run_id},{CASE_LABEL}={case.case_id}",
+                limit=1, _request_timeout=REQUEST_TIMEOUT,
+            ))
+        except (ApiException, HTTPError, OSError) as exc:
+            raise BenchmarkError("Cannot verify benchmark Pod removal; resources are not confirmed released.") from exc
+        return not (pods.get("items") or (pods.get("metadata") or {}).get("continue"))
 
     def create_job(self, run: RunRecord, case: BenchmarkCase) -> dict[str, Any]:
         saved = next((item for item in run.cases if item.case_id == case.case_id), None)
@@ -210,9 +234,11 @@ class BenchmarkBackend:
                 f"MPIJob submission was not confirmed (Kubernetes HTTP {exc.status}); "
                 "reread the existing case before retrying."
             ) from exc
+        except (HTTPError, OSError) as exc:
+            raise BenchmarkError("MPIJob submission was not confirmed; reread the existing case before retrying.") from exc
         return self._verify_job(self._object(value), run, case)
 
-    def cancel_job(self, run: RunRecord, case: BenchmarkCase) -> None:
+    def cancel_job(self, run: RunRecord, case: BenchmarkCase, *, evidence_resource_version: str | None = None) -> None:
         if run.state != "CANCELLING":
             raise BenchmarkError("Persist cancellation intent before suspending a benchmark.")
         self._require_current(run, case)
@@ -220,6 +246,8 @@ class BenchmarkBackend:
         if job is None:
             return
         metadata = job["metadata"]
+        if evidence_resource_version is not None and metadata["resourceVersion"] != evidence_resource_version:
+            raise BenchmarkError("MPIJob changed after evidence export; collect again before cancellation.")
         body = {"metadata": {"uid": metadata["uid"], "resourceVersion": metadata["resourceVersion"]},
                 "spec": {"runPolicy": {"suspend": True}}}
         try:
@@ -229,8 +257,10 @@ class BenchmarkBackend:
             )
         except ApiException as exc:
             raise BenchmarkError(f"Cancellation was not confirmed (Kubernetes HTTP {exc.status}); reread before retrying.") from exc
+        except (HTTPError, OSError) as exc:
+            raise BenchmarkError("Cancellation could not reach the API; reread before retrying.") from exc
 
-    def delete_job(self, run: RunRecord, case: BenchmarkCase) -> None:
+    def delete_job(self, run: RunRecord, case: BenchmarkCase, *, evidence_resource_version: str | None = None) -> None:
         saved = next((item for item in run.cases if item.case_id == case.case_id), None)
         if not saved or not saved.evidence_sha256 or saved.state not in {"SUCCEEDED", "FAILED", "INCOMPLETE", "CANCELLED"}:
             raise BenchmarkError("Export terminal-case evidence before deleting its only in-cluster copy.")
@@ -239,6 +269,8 @@ class BenchmarkBackend:
         if job is None:
             return
         metadata = job["metadata"]
+        if evidence_resource_version is not None and metadata["resourceVersion"] != evidence_resource_version:
+            raise BenchmarkError("MPIJob changed after evidence export; collect again before cleanup.")
         body = {"apiVersion": "v1", "kind": "DeleteOptions", "propagationPolicy": "Foreground",
                 "preconditions": {"uid": metadata["uid"], "resourceVersion": metadata["resourceVersion"]}}
         try:
@@ -249,6 +281,8 @@ class BenchmarkBackend:
         except ApiException as exc:
             if exc.status != 404:
                 raise BenchmarkError(f"Cleanup was not confirmed (Kubernetes HTTP {exc.status}); reread the case.") from exc
+        except (HTTPError, OSError) as exc:
+            raise BenchmarkError("Cleanup could not reach the API; resource removal is unverified.") from exc
 
     def record_job_uid(self, run: RunRecord, case: BenchmarkCase, job: dict[str, Any]) -> RunRecord:
         verified = self._verify_job(job, run, case)
