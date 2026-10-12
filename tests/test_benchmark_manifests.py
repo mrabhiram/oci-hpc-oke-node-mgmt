@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import subprocess
+import tempfile
 import unittest
 from dataclasses import replace
+from pathlib import Path
 
 from oke_hpc_mgmt.benchmarks.manifests import (
     CASE_LABEL, ExecutionOptions, ROLE_LABEL, RUN_LABEL, case_name, launcher_script,
-    nccl_argv, owned_labels, render_mpijob, validate_run_id, worker_script,
+    gpu_preflight_script, nccl_argv, owned_labels, render_mpijob, validate_run_id, worker_script,
 )
 from oke_hpc_mgmt.benchmarks.models import BenchmarkError
 from oke_hpc_mgmt.benchmarks.planning import plan_healthchecks
@@ -55,8 +58,8 @@ class BenchmarkManifestTests(unittest.TestCase):
         self.assertFalse(spec["runLauncherAsWorker"])
         self.assertNotIn("nodeName", pod)
         terms = pod["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]
-        self.assertEqual([{"key": "metadata.name", "operator": "In", "values": ["gpu-01", "gpu-02"]}],
-                         terms[0]["matchFields"])
+        self.assertEqual([{"matchFields": [{"key": "metadata.name", "operator": "In", "values": [name]}]}
+                          for name in ("gpu-01", "gpu-02")], terms)
         anti = pod["affinity"]["podAntiAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"][0]
         self.assertEqual("kubernetes.io/hostname", anti["topologyKey"])
         self.assertEqual(RUN, anti["labelSelector"]["matchLabels"][RUN_LABEL])
@@ -177,3 +180,30 @@ class BenchmarkManifestTests(unittest.TestCase):
         self.assertEqual(RUN, second["metadata"]["labels"][RUN_LABEL])
         worker_labels = first["spec"]["mpiReplicaSpecs"]["Worker"]["template"]["metadata"]["labels"]
         self.assertEqual(RUN, worker_labels[RUN_LABEL])
+
+    def test_runtime_gpu_validation_rejects_mig_duplicate_missing_or_unknown_devices(self) -> None:
+        uuid = "GPU-00000000-0000-0000-0000-000000000001"
+        second = "GPU-00000000-0000-0000-0000-000000000002"
+        with tempfile.TemporaryDirectory() as directory:
+            tool = Path(directory) / "nvidia-smi"
+            tool.write_text("#!/bin/sh\ncase \"$1\" in\n--query-gpu=uuid) printf '%s\\n' \"$GPU_UUIDS\";;\n"
+                            "--query-gpu=mig.mode.current) printf '%s\\n' \"$MIG_MODES\";;\n*) exit 1;;\nesac\n")
+            tool.chmod(0o700)
+            for uuids, modes, expected, success in (
+                (uuid, "Disabled", 1, True), (uuid, "[N/A]", 1, True),
+                (uuid + "\n" + second, "Disabled\nDisabled", 2, True),
+                (uuid, "Enabled", 1, False), (uuid, "Unknown", 1, False),
+                (uuid, "", 1, False), ("MIG-" + uuid, "Disabled", 1, False),
+                (uuid + "\n" + uuid, "Disabled\nDisabled", 2, False),
+                (uuid, "Disabled", 2, False), ("", "Disabled", 1, False),
+            ):
+                result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + gpu_preflight_script(expected)],
+                                        env={**os.environ, "PATH": directory + os.pathsep + os.environ["PATH"],
+                                             "GPU_UUIDS": uuids, "MIG_MODES": modes},
+                                        text=True, capture_output=True, check=False)
+                with self.subTest(uuids=uuids, modes=modes, expected=expected):
+                    self.assertEqual(success, result.returncode == 0, result.stderr)
+                    self.assertEqual(success, "MGMT_GPU_MODE_VERIFIED" in result.stdout)
+        for count in (0, True, 7, 16):
+            with self.assertRaises(BenchmarkError):
+                gpu_preflight_script(count)

@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 from typing import Any, Literal, cast
 
-from oke_hpc_mgmt.benchmarks.manifests import ExecutionOptions, case_name, validate_run_id
+from oke_hpc_mgmt.benchmarks.manifests import ExecutionOptions, TopologyPlacement, case_name, validate_run_id
 from oke_hpc_mgmt.benchmarks.models import (
     BenchmarkCase, BenchmarkError, BenchmarkParameters, HealthcheckPlan, HealthcheckRequest, NodeTarget,
 )
@@ -137,7 +137,13 @@ def decode_record(payload: str, *, uid: str, resource_version: str) -> RunRecord
         for key in ("selected_nodes", "passive_nodes", "warnings"):
             plan[key] = tuple(plan.get(key, []))
         typed_plan = HealthcheckPlan(request=typed_request, cases=tuple(cases), **plan)
-        options = ExecutionOptions(**_keys(value.pop("options"), ExecutionOptions))
+        option_values = _keys(value.pop("options"), ExecutionOptions)
+        placements: list[TopologyPlacement] = []
+        for placement_value in option_values.pop("placements", []):
+            placement = _keys(placement_value, TopologyPlacement)
+            placement["hostnames"] = tuple(placement["hostnames"])
+            placements.append(TopologyPlacement(**placement))
+        options = ExecutionOptions(**option_values, placements=tuple(placements))
         options.validate()
         records = tuple(CaseRecord(**_keys(item, CaseRecord)) for item in value.pop("cases"))
         record = RunRecord(plan=typed_plan, options=options, cases=records, uid=uid,

@@ -11,7 +11,7 @@ from oke_hpc_mgmt.benchmarks.models import (
     MAX_CASES, MAX_SELECTED_NODES, BenchmarkCase, BenchmarkError,
     HealthcheckPlan, HealthcheckRequest, NodeTarget,
 )
-from oke_hpc_mgmt.benchmarks.profiles import get_profile, profile_environment
+from oke_hpc_mgmt.benchmarks.profiles import get_profile, profile_environment, validate_exclusive_gpu_labels
 from oke_hpc_mgmt.models import DiscoverySnapshot, NodeInfo, RDMA_REQUIRED_TOPOLOGY_LABEL_KEYS
 from oke_hpc_mgmt.selection import select_nodes
 
@@ -133,10 +133,7 @@ def node_target(node: NodeInfo) -> NodeTarget:
         raise BenchmarkError(f"Invalid GPU count on {node.k8s_name}.") from exc
     if count != profile.gpu_count:
         raise BenchmarkError(f"{node.k8s_name} requires {profile.gpu_count} exclusive GPUs; found {count}.")
-    if node.labels.get("nvidia.com/gpu.replicas", "1") != "1" or node.labels.get(
-        "nvidia.com/mig.strategy", "none"
-    ) != "none":
-        raise BenchmarkError(f"{node.k8s_name} uses GPU sharing or MIG; a dedicated profile is required.")
+    validate_exclusive_gpu_labels(node.labels, profile.gpu_count)
     for taint in node.taints:
         key = taint.split("=", 1)[0].split(":", 1)[0]
         if taint.endswith((":NoSchedule", ":NoExecute")) and key != "nvidia.com/gpu":

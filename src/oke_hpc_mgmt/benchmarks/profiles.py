@@ -72,6 +72,26 @@ def get_profile(shape: str) -> NcclProfile:
     raise BenchmarkError(f"No reviewed execution profile for shape {shape}; refusing substitution.")
 
 
+def validate_exclusive_gpu_labels(labels: dict[str, str], gpu_count: int) -> None:
+    if labels.get("nvidia.com/gpu.replicas", "1") != "1" or labels.get("nvidia.com/gpu.sharing-strategy", "none") != "none":
+        raise BenchmarkError("Exclusive physical GPUs are required; GPU sharing is configured.")
+    strategy = labels.get("nvidia.com/mig.strategy", "none")
+    product = labels.get("nvidia.com/gpu.product", "")
+    if strategy not in {"none", "single", "mixed"} or "MIG" in product.upper() or "SHARED" in product.upper():
+        raise BenchmarkError("GPU sharing or active MIG devices require a dedicated execution profile.")
+    if labels.get("nvidia.com/mig.config.state", "success") != "success":
+        raise BenchmarkError("MIG configuration is not stable; runtime availability is unverified.")
+    # mig.strategy describes how the device plugin advertises devices, not
+    # whether MIG is enabled. GFD can report 'single' for full physical GPUs.
+    # A configured strategy needs positive full-GPU labels; runtime still checks
+    # current MIG mode and physical UUID coverage before opening worker SSH.
+    if strategy != "none" and (
+        not product or labels.get("nvidia.com/gpu.count") != str(gpu_count)
+        or labels.get("nvidia.com/gpu.mode") != "compute"
+    ):
+        raise BenchmarkError("MIG strategy is configured but full physical GPU discovery is unverified.")
+
+
 def profile_environment(
     profile: NcclProfile,
     network: str,

@@ -7,7 +7,7 @@ from typing import Any
 from kubernetes.utils.quantity import parse_quantity
 
 from oke_hpc_mgmt.benchmarks.models import BenchmarkCase, BenchmarkError
-from oke_hpc_mgmt.benchmarks.profiles import get_profile
+from oke_hpc_mgmt.benchmarks.profiles import get_profile, validate_exclusive_gpu_labels
 from oke_hpc_mgmt.models import RDMA_REQUIRED_TOPOLOGY_LABEL_KEYS
 
 
@@ -120,10 +120,7 @@ def validate_runtime_nodes(
         hostnames.add(hostname)
         if labels.get("node.kubernetes.io/instance-type") != target.shape:
             raise BenchmarkError(f"Shape changed or is unverified on {target.name}.")
-        if labels.get("nvidia.com/mig.strategy", "none") != "none" or (
-            labels.get("nvidia.com/gpu.replicas", "1") != "1"
-        ) or labels.get("nvidia.com/gpu.sharing-strategy", "none") != "none":
-            raise BenchmarkError(f"Exclusive physical GPUs are required on {target.name}.")
+        validate_exclusive_gpu_labels(labels, target.gpu_count)
         if case.network != "local" and tuple(labels.get(key) for key in RDMA_REQUIRED_TOPOLOGY_LABEL_KEYS) != target.topology:
             raise BenchmarkError(f"RDMA topology changed on {target.name}; replan the test.")
         observed_taints = set()

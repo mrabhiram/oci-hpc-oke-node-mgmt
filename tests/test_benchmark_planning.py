@@ -11,7 +11,7 @@ from oke_hpc_mgmt.benchmarks.planning import (
     expand_nodes, node_target, pair_allowed, plan_healthchecks, resolve_identifier,
     select_healthcheck_nodes, topology,
 )
-from oke_hpc_mgmt.benchmarks.profiles import PROFILES, get_profile, profile_environment
+from oke_hpc_mgmt.benchmarks.profiles import PROFILES, get_profile, profile_environment, validate_exclusive_gpu_labels
 from oke_hpc_mgmt.models import DiscoverySnapshot, NodeInfo, RDMA_REQUIRED_TOPOLOGY_LABEL_KEYS, WorkerPoolInfo
 
 
@@ -133,6 +133,19 @@ class BenchmarkSelectionTests(unittest.TestCase):
         ):
             with self.subTest(changes=changes), self.assertRaises(BenchmarkError):
                 node_target(replace(valid, **changes))
+
+    def test_mig_advertisement_policy_does_not_mean_partitioning_is_active(self) -> None:
+        for strategy in ("single", "mixed"):
+            labels = {"nvidia.com/mig.strategy": strategy, "nvidia.com/gpu.product": "NVIDIA-A100-SXM4-40GB",
+                      "nvidia.com/gpu.count": "8", "nvidia.com/gpu.mode": "compute"}
+            validate_exclusive_gpu_labels(labels, 8)
+            self.assertEqual(8, node_target(replace(gpu_node(1), labels=labels)).gpu_count)
+            for change in ({"nvidia.com/gpu.product": "NVIDIA-A100-SXM4-40GB-MIG-1g.5gb"},
+                           {"nvidia.com/gpu.product": "NVIDIA-A100-SHARED"}, {"nvidia.com/gpu.count": "56"},
+                           {"nvidia.com/gpu.mode": "mig"}, {"nvidia.com/gpu.sharing-strategy": "mps"},
+                           {"nvidia.com/mig.config.state": "pending"}, {"nvidia.com/mig.strategy": "unknown"}):
+                with self.subTest(strategy=strategy, change=change), self.assertRaises(BenchmarkError):
+                    validate_exclusive_gpu_labels({**labels, **change}, 8)
 
 
 class BenchmarkPlanningTests(unittest.TestCase):

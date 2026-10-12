@@ -28,12 +28,32 @@ RANK_SCRIPT = "\n".join([
 
 
 @dataclass(frozen=True)
+class TopologyPlacement:
+    case_id: str
+    key: str
+    required: bool
+    hostnames: tuple[str, ...]
+
+    def validate(self) -> None:
+        if not re.fullmatch(r"case-[0-9]{4}", self.case_id) or self.key not in {
+            "oci.oraclecloud.com/rdma.local_block_id", "kubernetes.io/hostname",
+        } or type(self.required) is not bool:
+            raise BenchmarkError("Invalid topology placement policy.")
+        if not self.hostnames or len(set(self.hostnames)) != len(self.hostnames) or any(
+            not isinstance(value, str) or not re.fullmatch(r"[a-zA-Z0-9](?:[-a-zA-Z0-9_.]{0,61}[a-zA-Z0-9])?", value)
+            for value in self.hostnames
+        ):
+            raise BenchmarkError("Topology placement requires unique verified hostname labels.")
+
+
+@dataclass(frozen=True)
 class ExecutionOptions:
     concurrency: int = 1
     queue_timeout: int = 900
     startup_timeout: int = 600
     timeout: int = 1800
     network_attachment: str = "rdma-vf"
+    placements: tuple[TopologyPlacement, ...] = ()
 
     def validate(self) -> None:
         for name, value, maximum in (
@@ -46,6 +66,10 @@ class ExecutionOptions:
                 raise BenchmarkError(f"{name} must be an integer in 1..{maximum}.")
         if not re.fullmatch(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?", self.network_attachment):
             raise BenchmarkError("network-attachment must be a name in the benchmark namespace.")
+        for placement in self.placements:
+            placement.validate()
+        if len({item.case_id for item in self.placements}) != len(self.placements):
+            raise BenchmarkError("Topology placement has duplicate case identities.")
 
 
 def validate_run_id(run_id: str) -> None:
@@ -76,7 +100,26 @@ def nccl_argv(request: HealthcheckRequest) -> list[str]:
     ]
 
 
-def worker_script(port: int, rdma: bool) -> str:
+def gpu_preflight_script(gpu_count: int) -> str:
+    if type(gpu_count) is not int or gpu_count not in {1, 2, 8}:
+        raise BenchmarkError("GPU startup validation requires a reviewed physical GPU count.")
+    return "\n".join([
+        "gpu_uuids=$(nvidia-smi --query-gpu=uuid --format=csv,noheader,nounits)",
+        f'test "$(printf \'%s\\n\' "$gpu_uuids" | wc -l)" -eq {gpu_count}',
+        f'test "$(printf \'%s\\n\' "$gpu_uuids" | sort -u | wc -l)" -eq {gpu_count}',
+        'while IFS= read -r uuid; do',
+        '  [[ "$uuid" =~ ^GPU-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || exit 1',
+        'done <<< "$gpu_uuids"',
+        "mig_modes=$(nvidia-smi --query-gpu=mig.mode.current --format=csv,noheader,nounits)",
+        f'test "$(printf \'%s\\n\' "$mig_modes" | wc -l)" -eq {gpu_count}',
+        'while IFS= read -r mode; do',
+        '  case "$mode" in Disabled|"[N/A]") ;; *) echo "MIG is enabled or unverifiable" >&2; exit 1 ;; esac',
+        'done <<< "$mig_modes"',
+        'printf "MGMT_GPU_MODE_VERIFIED\\t%s\\n" "' + str(gpu_count) + '"',
+    ])
+
+
+def worker_script(port: int, rdma: bool, gpu_count: int = 8) -> str:
     if port not in {22, 2222}:
         raise BenchmarkError("Unsupported worker SSH port.")
     # Only run-owned container files are written. Node identity comes from the
@@ -90,6 +133,7 @@ def worker_script(port: int, rdma: bool) -> str:
         "echo MGMT_GPU_INVENTORY_BEGIN",
         "nvidia-smi --query-gpu=index,uuid,pci.bus_id,name,driver_version --format=csv,noheader",
         "echo MGMT_GPU_INVENTORY_END",
+        gpu_preflight_script(gpu_count),
         "test -x /workspace/nccl-tests/build/all_reduce_perf",
         "command -v mpirun >/dev/null",
         "ibv_devinfo" if rdma else ":",
@@ -187,19 +231,26 @@ def render_mpijob(
     environment = profile_environment(profile, case.network, request.environment)
     # A required field affinity selects node object names without changing node
     # labels or bypassing the scheduler. Anti-affinity prevents duplicate workers.
-    affinity = {
+    affinity: dict[str, Any] = {
         "nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [
             {"matchFields": [{"key": "metadata.name", "operator": "In",
-                               "values": [node.name for node in case.nodes]}]},
+                               "values": [node.name]}]} for node in case.nodes
         ]}},
         "podAntiAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [{
             "labelSelector": {"matchLabels": {**labels, ROLE_LABEL: "worker"}},
             "topologyKey": "kubernetes.io/hostname",
         }]},
     }
+    placement = next((item for item in options.placements if item.case_id == case.case_id), None)
+    if placement:
+        if not request.queue or len(placement.hostnames) != len(case.nodes):
+            raise BenchmarkError("Topology placement requires a queue and every selected node's hostname label.")
+        terms = affinity["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]
+        for term, hostname in zip(terms, placement.hostnames):
+            term["matchExpressions"] = [{"key": "kubernetes.io/hostname", "operator": "In", "values": [hostname]}]
     worker_container: dict[str, Any] = {
         "name": "mpi-worker", "image": image, "imagePullPolicy": "IfNotPresent",
-        "command": ["/bin/bash", "-c", worker_script(port, case.network != "local")],
+        "command": ["/bin/bash", "-c", worker_script(port, case.network != "local", profile.gpu_count)],
         "env": [{"name": key, "value": value} for key, value in sorted(environment.items())] + [
             {"name": "MGMT_NODE_NAME", "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}},
             {"name": "MGMT_POD_UID", "valueFrom": {"fieldRef": {"fieldPath": "metadata.uid"}}},
@@ -227,10 +278,13 @@ def render_mpijob(
             "containers": [worker_container], "volumes": volumes,
         },
     }
+    if placement:
+        policy = "required" if placement.required else "preferred"
+        worker["metadata"]["annotations"] = {f"kueue.x-k8s.io/podset-{policy}-topology": placement.key}
     if case.network == "vf":
-        worker["metadata"]["annotations"] = {"k8s.v1.cni.cncf.io/networks": json.dumps([
+        worker["metadata"].setdefault("annotations", {})["k8s.v1.cni.cncf.io/networks"] = json.dumps([
             {"name": options.network_attachment} for _ in range(profile.vf_count)
-        ])}
+        ])
         for section in ("requests", "limits"):
             worker_container["resources"][section]["nvidia.com/rdma-vf"] = profile.vf_count
     launcher: dict[str, Any] = {

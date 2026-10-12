@@ -171,8 +171,12 @@ Workload evidence collection verifies the MPIJob UID and the controller ownershi
 chain for each worker and launcher Pod. It checks Pod/container identity before
 and after bounded log reads and records resolved image digests, node UIDs, and
 exit codes. Missing logs, changed identities, incomplete coverage, and conflicting
-completion conditions cannot establish a successful benchmark. Evidence export
-and the execution workflow remain in development.
+completion conditions cannot establish a successful benchmark. Private evidence
+snapshots now include the immutable request, execution options, selected case,
+Pod identities, and raw logs. Export uses content-addressed files, atomic
+publication, and checksum read-back; verification rejects missing, modified,
+publicly readable, or identity-mismatched files. Execution and cleanup integration
+remain in development.
 
 ## Execution Architecture
 
@@ -196,6 +200,27 @@ and the execution workflow remain in development.
   duration of a benchmark.
 - Never silently substitute a smaller ready subset for a requested full-pool
   test. Node replacement or incomplete participation invalidates coverage.
+
+Capability preflight checks the selected namespace, required permissions, served
+MPI/Kueue APIs, MPI controller readiness, queue holds and namespace selection,
+GPU/RDMA ResourceFlavors, and the existing SR-IOV network attachment when used.
+Server-side dry runs validate the MPIJob and both Pod templates without creating
+workloads. Kueue admission must suspend the queued MPIJob probe; the tool does
+not fall back to direct execution when queue verification fails.
+
+For topology-aware queues, preflight requires a hostname leaf and all topology
+labels on every selected worker. Generated affinity uses one OR term per node
+name, with a matching hostname constraint. Local-block cases require their
+complete parent domain; other collective cases prefer local-block placement
+without shrinking the requested node set. Queue compatibility does not reserve
+capacity or prove that a workload has been admitted.
+
+GPU Operator MIG advertisement policy is checked separately from active GPU
+partitioning. Full-GPU discovery can coexist with `mig.strategy=single` or
+`mixed`; shared/MIG products, incomplete discovery, and transitional MIG
+configuration are rejected. Before starting worker SSH, runtime validation
+requires the expected unique physical GPU UUIDs and disabled or unsupported MIG
+mode. Image tags and driver labels remain compatibility hints, not runtime proof.
 
 ## Healthcheck Parity and Safety
 
