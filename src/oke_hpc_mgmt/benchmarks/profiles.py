@@ -21,15 +21,21 @@ class NcclProfile:
     gpu_count: int
     host_hcas: str | None
     max_bytes: int
-    family: Literal["ampere", "hopper-blackwell", "local"]
+    family: Literal["ampere", "hopper-blackwell", "rtxpro", "local"]
     source_revision: str = SOURCE_REVISION
     image: str = DEFAULT_IMAGE
 
     @property
     def vf_count(self) -> int:
-        if self.host_hcas is None:
+        if self.host_hcas is None or self.family == "rtxpro":
             return 0
         return len(self.host_hcas.removeprefix("=").split(","))
+
+    @property
+    def networks(self) -> tuple[str, ...]:
+        if self.host_hcas is None:
+            return ("local",)
+        return ("local", "host", "vf") if self.vf_count else ("local", "host")
 
 
 # Device names are shape facts from the pinned upstream MPIJob profiles, not
@@ -61,6 +67,10 @@ PROFILES = (
                 "=mlx5_0,mlx5_1,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11,mlx5_12,"
                 "mlx5_13,mlx5_14,mlx5_16,mlx5_17,mlx5_18,mlx5_19,mlx5_20,mlx5_21",
                 2 * REPORT_BYTES, "hopper-blackwell"),
+    # The pinned RTXPRO source has host-network examples, not a VF profile.
+    NcclProfile("BM.GPU.RTXPRO.8", 8,
+                "=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_6,mlx5_7,mlx5_8,mlx5_9",
+                2 * REPORT_BYTES, "rtxpro"),
     # A10 profiles are local-only additions; no upstream RDMA profile is implied.
     NcclProfile("VM.GPU.A10.1", 1, None, REPORT_BYTES, "local"),
     NcclProfile("VM.GPU.A10.2", 2, None, REPORT_BYTES, "local"),
@@ -110,6 +120,8 @@ def profile_environment(
 ) -> dict[str, str]:
     if network not in {"local", "host", "vf"}:
         raise BenchmarkError(f"Unsupported NCCL network profile: {network}.")
+    if network not in profile.networks:
+        raise BenchmarkError(f"{profile.shape} has no reviewed {network} execution profile.")
     environment = {"NCCL_DEBUG": "INFO", "NCCL_DEBUG_SUBSYS": "INIT,NET,GRAPH"}
     if network == "local":
         environment["NCCL_IB_DISABLE"] = "1"
@@ -129,6 +141,11 @@ def profile_environment(
             environment.update({
                 "NCCL_CUMEM_ENABLE": "0", "RX_QUEUE_LEN": "8192", "IB_RX_QUEUE_LEN": "8192",
                 "NCCL_SOCKET_IFNAME": "eth0", "NCCL_IGNORE_CPU_AFFINITY": "1",
+            })
+        if profile.family == "rtxpro":
+            environment.update({
+                "NCCL_ALGO": "Tree", "NCCL_MIN_NCHANNELS": "8",
+                "NCCL_IB_QPS_PER_CONNECTION": "1", "NCCL_NET_PLUGIN": "none",
             })
     seen: set[str] = set()
     for item in overrides:

@@ -12,11 +12,13 @@ from kubernetes.client.exceptions import ApiException
 from urllib3.exceptions import HTTPError
 
 from oke_hpc_mgmt.benchmarks.backend import BenchmarkBackend
+from oke_hpc_mgmt.benchmarks.diagnostics import JOB_UID_LABEL
 from oke_hpc_mgmt.benchmarks.manifests import owned_labels, render_mpijob
 from oke_hpc_mgmt.benchmarks.models import BenchmarkError
 from oke_hpc_mgmt.benchmarks.records import RunRecord, mark_cancelling, payload_digest
 from test_benchmark_preflight import gpu_pod, raw_inventory
 from test_benchmark_records import record
+from test_benchmark_capabilities import crd
 
 
 def configmap(run: RunRecord) -> dict:
@@ -217,6 +219,111 @@ class BenchmarkBackendTests(unittest.TestCase):
         self.core.read_namespaced_config_map.return_value = configmap(cancelling)
         self.backend.cancel_job(cancelling, self.case)
         self.assertEqual(1, self.custom.delete_namespaced_custom_object.call_count)
+
+    def queued_cancellation(self, *, inactive: bool = False, suspended: bool = False) -> RunRecord:
+        self.checkpoint = replace(self.checkpoint, plan=replace(self.checkpoint.plan,
+            request=replace(self.checkpoint.plan.request, queue="gpu-queue")))
+        run = mark_cancelling(self.checkpoint.update_case(self.case.case_id, "SUBMITTING").update_case(
+            self.case.case_id, "RUNNING", job_uid="job-uid", evidence_sha256="a" * 64))
+        self.core.read_namespaced_config_map.return_value = configmap(run)
+        job = self.job()
+        job["spec"]["runPolicy"]["suspend"] = suspended
+        self.custom.get_namespaced_custom_object.return_value = job
+        self.workload: dict[str, Any] = {"apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "Workload", "metadata": {
+            "name": "owned-workload", "namespace": "default", "uid": "workload-uid", "resourceVersion": "3",
+            "labels": {JOB_UID_LABEL: "job-uid"}, "ownerReferences": [{"apiVersion": "kubeflow.org/v2beta1",
+                "kind": "MPIJob", "name": job["metadata"]["name"], "uid": "job-uid", "controller": True}]},
+            "spec": {"queueName": "gpu-queue", "active": not inactive}, "status": {}}
+        self.kubernetes.client.ApiextensionsV1Api().read_custom_resource_definition.return_value = crd("workloads.kueue.x-k8s.io")
+        self.custom.list_namespaced_custom_object.return_value = {"items": [self.workload]}
+        self.custom.patch_namespaced_custom_object.return_value = {"metadata": {"uid": "workload-uid"}, "spec": {"active": False}}
+        return run
+
+    def test_kueue_cancel_deactivates_owned_workload_before_suspending_job(self) -> None:
+        run = self.queued_cancellation()
+        self.assertTrue(self.backend.cancel_job(run, self.case, evidence_resource_version="2"))
+        calls = self.custom.patch_namespaced_custom_object.call_args_list
+        self.assertEqual(["workloads", "mpijobs"], [item.args[3] for item in calls])
+        self.assertEqual({"metadata": {"uid": "workload-uid", "resourceVersion": "3"}, "spec": {"active": False}}, calls[0].args[5])
+        self.assertEqual({"metadata": {"uid": "job-uid", "resourceVersion": "2"}, "spec": {"runPolicy": {"suspend": True}}}, calls[1].args[5])
+        self.assertEqual("v1beta2", calls[0].args[1])
+
+    def test_kueue_cancel_is_idempotent_and_handles_already_suspended_jobs(self) -> None:
+        run = self.queued_cancellation(inactive=True, suspended=True)
+        self.assertFalse(self.backend.cancel_job(run, self.case))
+        self.custom.patch_namespaced_custom_object.assert_not_called()
+        self.workload["spec"]["active"] = True
+        self.assertTrue(self.backend.cancel_job(run, self.case))
+        self.assertEqual("workloads", self.custom.patch_namespaced_custom_object.call_args.args[3])
+        self.assertEqual(1, self.custom.patch_namespaced_custom_object.call_count)
+
+    def test_kueue_cancel_refuses_missing_foreign_or_unconfirmed_workloads(self) -> None:
+        run = self.queued_cancellation()
+        self.custom.list_namespaced_custom_object.return_value = {"items": []}
+        with self.assertRaisesRegex(BenchmarkError, "not yet observed"):
+            self.backend.cancel_job(run, self.case)
+        self.custom.patch_namespaced_custom_object.assert_not_called()
+        self.custom.list_namespaced_custom_object.return_value = {"items": [self.workload]}
+        self.workload["metadata"]["ownerReferences"][0]["uid"] = "foreign-job"
+        with self.assertRaisesRegex(BenchmarkError, "ownership"):
+            self.backend.cancel_job(run, self.case)
+        self.custom.patch_namespaced_custom_object.assert_not_called()
+        self.workload["metadata"]["ownerReferences"][0]["uid"] = "job-uid"
+        for response in ({"metadata": {"uid": "replacement"}, "spec": {"active": False}},
+                         {"metadata": {"uid": "workload-uid"}, "spec": {"active": True}}):
+            self.custom.patch_namespaced_custom_object.return_value = response
+            with self.assertRaisesRegex(BenchmarkError, "does not confirm"):
+                self.backend.cancel_job(run, self.case)
+        self.assertTrue(all(item.args[3] == "workloads" for item in self.custom.patch_namespaced_custom_object.call_args_list))
+
+    def test_kueue_deactivation_errors_never_fall_back_to_job_only_suspension(self) -> None:
+        run = self.queued_cancellation()
+        for error in (ApiException(status=403), ApiException(status=409), OSError("response lost")):
+            self.custom.patch_namespaced_custom_object.side_effect = error
+            with self.subTest(error=error), self.assertRaisesRegex(BenchmarkError, "deactivation was not confirmed"):
+                self.backend.cancel_job(run, self.case)
+        self.assertTrue(all(item.args[3] == "workloads" for item in self.custom.patch_namespaced_custom_object.call_args_list))
+        self.custom.patch_namespaced_custom_object.reset_mock()
+        self.custom.list_namespaced_custom_object.side_effect = ApiException(status=403)
+        with self.assertRaisesRegex(BenchmarkError, "Cannot verify owned Kueue"):
+            self.backend.cancel_job(run, self.case)
+        self.custom.patch_namespaced_custom_object.assert_not_called()
+
+    def test_kueue_deactivation_uses_supported_served_version(self) -> None:
+        run = self.queued_cancellation(suspended=True)
+        definition = crd("workloads.kueue.x-k8s.io")
+        definition["spec"]["versions"] = [{"name": "v1beta1", "served": True}]
+        self.kubernetes.client.ApiextensionsV1Api().read_custom_resource_definition.return_value = definition
+        self.backend.cancel_job(run, self.case)
+        self.assertEqual("v1beta1", self.custom.patch_namespaced_custom_object.call_args.args[1])
+
+    def test_cancellation_deletion_requires_persisted_intent_suspension_and_inactive_workloads(self) -> None:
+        run = self.queued_cancellation(inactive=True, suspended=True)
+        with self.assertRaisesRegex(BenchmarkError, "deletion intent"):
+            self.backend.delete_job(run, self.case, cancelling=True)
+        run = run.update_case(self.case.case_id, "RUNNING", cancellation_delete_requested=True)
+        self.core.read_namespaced_config_map.return_value = configmap(run)
+        self.custom.get_namespaced_custom_object.return_value["spec"]["runPolicy"]["suspend"] = False
+        with self.assertRaisesRegex(BenchmarkError, "observed MPIJob suspension"):
+            self.backend.delete_job(run, self.case, cancelling=True)
+        self.custom.get_namespaced_custom_object.return_value["spec"]["runPolicy"]["suspend"] = True
+        self.workload["spec"]["active"] = True
+        with self.assertRaisesRegex(BenchmarkError, "inactive owned Kueue"):
+            self.backend.delete_job(run, self.case, cancelling=True)
+        self.custom.delete_namespaced_custom_object.assert_not_called()
+        self.workload["spec"]["active"] = False
+        self.backend.delete_job(run, self.case, cancelling=True, evidence_resource_version="2")
+        body = self.custom.delete_namespaced_custom_object.call_args.kwargs["body"]
+        self.assertEqual({"uid": "job-uid", "resourceVersion": "2"}, body["preconditions"])
+        self.assertEqual("Foreground", body["propagationPolicy"])
+
+    def test_cancellation_deletion_waits_for_existing_gc_without_repeating_delete(self) -> None:
+        run = self.queued_cancellation(inactive=True, suspended=True).update_case(
+            self.case.case_id, "RUNNING", cancellation_delete_requested=True)
+        self.core.read_namespaced_config_map.return_value = configmap(run)
+        self.custom.get_namespaced_custom_object.return_value["metadata"]["deletionTimestamp"] = run.created_at
+        self.backend.delete_job(run, self.case, cancelling=True, evidence_resource_version="2")
+        self.custom.delete_namespaced_custom_object.assert_not_called()
 
     def test_api_errors_are_not_treated_as_confirmed_cancel_or_cleanup(self) -> None:
         cancelling = mark_cancelling(self.checkpoint)

@@ -162,6 +162,16 @@ class CapabilityTests(unittest.TestCase):
         with self.assertRaisesRegex(BenchmarkError, "did not suspend"):
             self.check()
 
+    def test_kueue_patch_permission_is_required_for_reliable_cancellation(self) -> None:
+        self.queue()
+        def authorize(body, **kwargs):
+            attributes = body["spec"]["resourceAttributes"]
+            return {"status": {"allowed": not (attributes["resource"] == "workloads" and attributes["verb"] == "patch")}}
+        self.checker.authorization.create_self_subject_access_review.side_effect = authorize
+        with self.assertRaisesRegex(BenchmarkError, "workloads"):
+            self.check()
+        self.backend.custom.create_namespaced_custom_object.assert_not_called()
+
     def test_topology_queue_resolves_exact_affinity_and_persists_typed_options(self) -> None:
         self.queue(topology=True)
         result = self.check()

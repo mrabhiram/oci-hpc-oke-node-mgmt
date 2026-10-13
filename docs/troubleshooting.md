@@ -20,6 +20,10 @@
 - Service `INELIGIBLE` decisions can reflect application Pods, an unfinished run,
   missing boot identity, node pressure, or insufficient Ready stability. Resolve
   the reported condition externally; service passes never evict workloads.
+- Kueue cancellation requires patch access to the run's owned Workload. The tool
+  deactivates that Workload before suspending its MPIJob. A resource-version
+  conflict during controller convergence requires rereading the same cancelled
+  run; it does not justify submitting a replacement benchmark.
 - `NEEDS_ACTIVE` requires matching passing local evidence and its cooldown;
   a different image, iteration count, node boot, or profile does not qualify.
   `NO_PARTNER` retains a suspect pair for investigation instead of repeating it

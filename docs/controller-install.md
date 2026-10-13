@@ -54,6 +54,12 @@ The controller/operator node must have:
 - an enhanced OKE cluster for managed Compute Cluster RDMA pools
 - Network access to the Kubernetes API and OCI regional APIs
 
+The [NCCL healthchecks preview](nccl-healthchecks.md) additionally requires an
+existing MPI Operator, the selected queue/network resources, and benchmark
+RBAC described in its [permissions section](nccl-healthchecks.md#kubernetes-permissions).
+Kueue execution requires patch access to namespaced Workloads for cancellation.
+Benchmark handlers do not install operators or change shared queue policies.
+
 Validate the controller environment before installing:
 
 ```bash
@@ -69,7 +75,7 @@ Clone the public repository on the controller/operator node:
 
 ```bash
 cd /home/ubuntu
-git clone https://github.com/mrabhiram/oci-hpc-oke-node-mgmt.git
+git clone https://github.com/oci-hpc/oci-hpc-oke-node-mgmt.git
 ```
 
 ## Install

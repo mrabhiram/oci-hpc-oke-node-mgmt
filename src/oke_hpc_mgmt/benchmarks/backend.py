@@ -7,6 +7,8 @@ from kubernetes.client.exceptions import ApiException
 from urllib3.exceptions import HTTPError
 
 from oke_hpc_mgmt.backends.kubernetes import KubernetesBackend
+from oke_hpc_mgmt.benchmarks.capabilities import KUEUE_GROUP
+from oke_hpc_mgmt.benchmarks.diagnostics import SchedulingCollector
 from oke_hpc_mgmt.benchmarks.manifests import (
     CASE_LABEL, MANAGED_BY, MPI_GROUP, MPI_PLURAL, MPI_VERSION, RUN_LABEL, case_name, owned_labels,
     render_mpijob, validate_run_id,
@@ -245,16 +247,49 @@ class BenchmarkBackend:
             raise BenchmarkError("MPIJob submission was not confirmed; reread the existing case before retrying.") from exc
         return self._verify_job(self._object(value), run, case)
 
-    def cancel_job(self, run: RunRecord, case: BenchmarkCase, *, evidence_resource_version: str | None = None) -> None:
+    def _deactivate_workloads(self, run: RunRecord, case: BenchmarkCase, job_uid: str) -> bool:
+        try:
+            workloads = SchedulingCollector(self).owned_workloads(run, case, job_uid)
+        except (ApiException, HTTPError, OSError) as exc:
+            raise BenchmarkError("Cannot verify owned Kueue Workloads; cancellation remains unconfirmed.") from exc
+        if not workloads:
+            raise BenchmarkError("Owned Kueue Workload is not yet observed; retry cancellation of the same recorded run.")
+        changed = False
+        for workload in workloads:
+            if not workload["active"]:
+                continue
+            self._require_current(run, case)
+            metadata = workload["metadata"]
+            body = {"metadata": {"uid": metadata["uid"], "resourceVersion": metadata["resourceVersion"]},
+                    "spec": {"active": False}}
+            version = workload["apiVersion"].split("/", 1)[1]
+            try:
+                response = self._object(self.custom.patch_namespaced_custom_object(
+                    KUEUE_GROUP, version, run.plan.request.namespace, "workloads", metadata["name"], body,
+                    _request_timeout=REQUEST_TIMEOUT,
+                ))
+            except (ApiException, HTTPError, OSError) as exc:
+                raise BenchmarkError("Kueue deactivation was not confirmed; reread this cancellation before retrying.") from exc
+            if (response.get("metadata") or {}).get("uid") != metadata["uid"] or (
+                (response.get("spec") or {}).get("active") is not False
+            ):
+                raise BenchmarkError("Kueue deactivation response does not confirm the owned Workload identity and inactive state.")
+            changed = True
+        return changed
+
+    def cancel_job(self, run: RunRecord, case: BenchmarkCase, *, evidence_resource_version: str | None = None) -> bool:
         if run.state != "CANCELLING":
             raise BenchmarkError("Persist cancellation intent before suspending a benchmark.")
         self._require_current(run, case)
         job = self.get_job(run, case)
         if job is None:
-            return
+            return False
         metadata = job["metadata"]
         if evidence_resource_version is not None and metadata["resourceVersion"] != evidence_resource_version:
             raise BenchmarkError("MPIJob changed after evidence export; collect again before cancellation.")
+        changed = self._deactivate_workloads(run, case, metadata["uid"]) if run.plan.request.queue else False
+        if (job.get("spec") or {}).get("runPolicy", {}).get("suspend") is True:
+            return changed
         body = {"metadata": {"uid": metadata["uid"], "resourceVersion": metadata["resourceVersion"]},
                 "spec": {"runPolicy": {"suspend": True}}}
         try:
@@ -266,10 +301,14 @@ class BenchmarkBackend:
             raise BenchmarkError(f"Cancellation was not confirmed (Kubernetes HTTP {exc.status}); reread before retrying.") from exc
         except (HTTPError, OSError) as exc:
             raise BenchmarkError("Cancellation could not reach the API; reread before retrying.") from exc
+        return True
 
-    def delete_job(self, run: RunRecord, case: BenchmarkCase, *, evidence_resource_version: str | None = None) -> None:
+    def delete_job(self, run: RunRecord, case: BenchmarkCase, *, evidence_resource_version: str | None = None,
+                   cancelling: bool = False) -> None:
         saved = next((item for item in run.cases if item.case_id == case.case_id), None)
-        if not saved or not saved.evidence_sha256 or saved.state not in {"SUCCEEDED", "FAILED", "INCOMPLETE", "CANCELLED"}:
+        if cancelling and (run.state != "CANCELLING" or not saved or not saved.cancellation_delete_requested):
+            raise BenchmarkError("Persist cancellation deletion intent before removing a suspended MPIJob.")
+        if not saved or not saved.evidence_sha256 or not cancelling and saved.state not in {"SUCCEEDED", "FAILED", "INCOMPLETE", "CANCELLED"}:
             raise BenchmarkError("Export terminal-case evidence before deleting its only in-cluster copy.")
         self._require_current(run, case)
         job = self.get_job(run, case)
@@ -278,6 +317,18 @@ class BenchmarkBackend:
         metadata = job["metadata"]
         if evidence_resource_version is not None and metadata["resourceVersion"] != evidence_resource_version:
             raise BenchmarkError("MPIJob changed after evidence export; collect again before cleanup.")
+        if metadata.get("deletionTimestamp"):
+            return
+        if cancelling:
+            if (job.get("spec") or {}).get("runPolicy", {}).get("suspend") is not True:
+                raise BenchmarkError("Cancellation deletion requires observed MPIJob suspension.")
+            if run.plan.request.queue:
+                try:
+                    workloads = SchedulingCollector(self).owned_workloads(run, case, metadata["uid"])
+                except (ApiException, HTTPError, OSError) as exc:
+                    raise BenchmarkError("Cannot verify inactive owned Kueue Workloads before cancellation deletion.") from exc
+                if not workloads or any(item["active"] for item in workloads):
+                    raise BenchmarkError("Cancellation deletion requires inactive owned Kueue Workloads.")
         body = {"apiVersion": "v1", "kind": "DeleteOptions", "propagationPolicy": "Foreground",
                 "preconditions": {"uid": metadata["uid"], "resourceVersion": metadata["resourceVersion"]}}
         try:

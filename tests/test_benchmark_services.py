@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from click.testing import CliRunner
 
@@ -15,7 +15,7 @@ from oke_hpc_mgmt.benchmarks.service_policy import ServiceDecision, ServiceSelec
 from oke_hpc_mgmt.benchmarks.workflow import PreparedRun
 from oke_hpc_mgmt.benchmarks.workflow import BenchmarkWorkflow
 from oke_hpc_mgmt.commands import cli
-from oke_hpc_mgmt.commands.services import select_refresh_runs
+from oke_hpc_mgmt.commands.services import ordered_service_handlers, select_refresh_runs
 from test_benchmark_records import RUN, record
 from test_benchmark_planning import inventory
 
@@ -26,20 +26,20 @@ MODULE = "oke_hpc_mgmt.commands.services."
 class MetadataServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.backend = Mock(spec=BenchmarkBackend)
-        self.run = replace(record(), uid="run-uid", resource_version="1")
-        self.backend.list_runs.return_value = (self.run,)
-        self.backend.get_run.return_value = self.run
+        self.checkpoint = replace(record(), uid="run-uid", resource_version="1")
+        self.backend.list_runs.return_value = (self.checkpoint,)
+        self.backend.get_run.return_value = self.checkpoint
 
     def test_selection_is_namespace_and_pool_scoped_without_truncation(self) -> None:
-        self.assertEqual((self.run,), select_refresh_runs(self.backend, "default", (), "gpu-pool", 1))
+        self.assertEqual((self.checkpoint,), select_refresh_runs(self.backend, "default", (), "gpu-pool", 1))
         self.backend.list_runs.assert_called_once_with("default")
         self.assertEqual((), select_refresh_runs(self.backend, "default", (), "other-pool", 1))
-        self.backend.list_runs.return_value = (self.run, self.run)
+        self.backend.list_runs.return_value = (self.checkpoint, self.checkpoint)
         with self.assertRaisesRegex(BenchmarkError, "Too many"):
             select_refresh_runs(self.backend, "default", (), None, 1)
 
     def test_explicit_selection_validates_all_ids_before_reading_and_never_lists(self) -> None:
-        self.assertEqual((self.run,), select_refresh_runs(self.backend, "default", (RUN,), None, 1))
+        self.assertEqual((self.checkpoint,), select_refresh_runs(self.backend, "default", (RUN,), None, 1))
         self.backend.get_run.assert_called_once_with("default", RUN)
         self.backend.list_runs.assert_not_called()
         self.backend.get_run.reset_mock()
@@ -51,26 +51,26 @@ class MetadataServiceTests(unittest.TestCase):
         self.backend.get_run.assert_not_called()
 
     def test_default_skips_terminal_and_cancelling_but_explicit_id_can_report_them(self) -> None:
-        terminal = self.run
+        terminal = self.checkpoint
         for case in terminal.cases:
             terminal = terminal.update_case(case.case_id, "CANCELLED")
-        cancelling = replace(self.run, state="CANCELLING")
+        cancelling = replace(self.checkpoint, state="CANCELLING")
         self.backend.list_runs.return_value = (terminal, cancelling)
         self.assertEqual((), select_refresh_runs(self.backend, "default", (), None, 32))
         self.backend.get_run.return_value = terminal
         self.assertEqual((terminal,), select_refresh_runs(self.backend, "default", (RUN,), None, 32))
 
     def test_missing_uid_and_wrong_namespace_are_rejected(self) -> None:
-        for run in (replace(self.run, uid=None), replace(self.run, plan=replace(
-            self.run.plan, request=replace(self.run.plan.request, namespace="other"),
+        for run in (replace(self.checkpoint, uid=None), replace(self.checkpoint, plan=replace(
+            self.checkpoint.plan, request=replace(self.checkpoint.plan.request, namespace="other"),
         ))):
             self.backend.get_run.return_value = run
             with self.assertRaisesRegex(BenchmarkError, "identity or namespace"):
                 select_refresh_runs(self.backend, "default", (RUN,), None, 32)
 
     def test_sorting_is_deterministic(self) -> None:
-        older = replace(self.run, created_at="2020-01-01T00:00:00+00:00")
-        newer = replace(self.run, created_at="2021-01-01T00:00:00+00:00")
+        older = replace(self.checkpoint, created_at="2020-01-01T00:00:00+00:00")
+        newer = replace(self.checkpoint, created_at="2021-01-01T00:00:00+00:00")
         self.backend.list_runs.return_value = (newer, older)
         self.assertEqual((older, newer), select_refresh_runs(self.backend, "default", (), None, 2))
 
@@ -90,7 +90,7 @@ class MetadataServiceTests(unittest.TestCase):
 
     def test_cli_confirmation_and_yes_only_refresh_selected_checkpoint_uids(self) -> None:
         workflow = Mock(spec=BenchmarkWorkflow)
-        workflow.refresh.return_value = self.run
+        workflow.refresh.return_value = self.checkpoint
         with patch(MODULE + "CliState.service"), patch(MODULE + "BenchmarkBackend", return_value=self.backend), \
                 patch(MODULE + "BenchmarkWorkflow", return_value=workflow), \
                 patch(MODULE + "confirm_plans") as confirm:
@@ -131,14 +131,14 @@ class HealthcheckServiceCliTests(unittest.TestCase):
         self.backend = Mock(spec=BenchmarkBackend)
         self.backend.read_allocation_inventory.return_value = ([], [])
         self.backend.list_runs.return_value = ()
-        self.run = replace(record(), uid="run-uid", resource_version="1")
-        self.selection = ServiceSelection((ServiceDecision("gpu-01", "SELECTED", "Initial validation"),), self.run.plan)
+        self.checkpoint = replace(record(), uid="run-uid", resource_version="1")
+        self.selection = ServiceSelection((ServiceDecision("gpu-01", "SELECTED", "Initial validation"),), self.checkpoint.plan)
         self.workflow = Mock(spec=BenchmarkWorkflow)
         capabilities = Mock()
         capabilities.warnings = ()
-        self.workflow.prepare.return_value = PreparedRun(self.run, capabilities)
-        self.workflow.submit.return_value = self.run
-        self.workflow.wait.return_value = self.run
+        self.workflow.prepare.return_value = PreparedRun(self.checkpoint, capabilities)
+        self.workflow.submit.return_value = self.checkpoint
+        self.workflow.wait.return_value = self.checkpoint
 
     def invoke(self, category="active-hc", options=()):
         with patch(MODULE + "CliState.service") as service, patch(MODULE + "BenchmarkBackend", return_value=self.backend), \
@@ -194,3 +194,81 @@ class HealthcheckServiceCliTests(unittest.TestCase):
         result, _ = self.invoke()
         self.assertNotEqual(0, result.exit_code)
         self.workflow.submit.assert_not_called()
+
+    def test_all_orders_only_enabled_handlers_and_reads_fresh_inventory(self) -> None:
+        result, select = self.invoke("all", ("--enable", "multi-node-hc", "--enable", "active-hc",
+                                             "--enable", "update-metadata", "--network", "host", "--dry-run"))
+        self.assertEqual(0, result.return_value, result.exception)
+        rows = json.loads(result.stdout)
+        self.assertEqual(["update-metadata", "active-hc", "multi-node-hc"], list(dict.fromkeys(row["service"] for row in rows)))
+        self.assertEqual("NO_MATCHES", rows[0]["state"])
+        self.assertEqual(["active", "multi-node"], [item.args[1].check_type for item in select.call_args_list])
+        self.assertEqual(["local", "host"], [item.args[1].network for item in select.call_args_list])
+        self.assertEqual(2, self.backend.read_allocation_inventory.call_count)
+        self.assertEqual([call("default"), call(None), call(None)], self.backend.list_runs.call_args_list)
+        self.workflow.submit.assert_not_called()
+        self.workflow.refresh.assert_not_called()
+
+    def test_all_metadata_only_needs_no_nccl_component_and_never_discovers_nodes(self) -> None:
+        with patch(MODULE + "CliState.service") as service, patch(MODULE + "BenchmarkBackend", return_value=self.backend), \
+                patch(MODULE + "run_healthcheck_pass") as gpu:
+            result = CliRunner(mix_stderr=False).invoke(cli, ["services", "all", "--enable", "update-metadata",
+                "--pool", "gpu-pool", "--dry-run", "--format", "json"], standalone_mode=False)
+            self.assertEqual(0, result.return_value, result.exception)
+            self.assertEqual("NO_MATCHES", json.loads(result.stdout)[0]["state"])
+            service.return_value.discover.assert_not_called()
+            gpu.assert_not_called()
+
+    def test_all_requires_explicit_handlers_pool_and_component_before_connecting(self) -> None:
+        for enabled in ((), ("active-hc", "active-hc"), ("unknown",)):
+            with self.subTest(enabled=enabled), self.assertRaises(BenchmarkError):
+                ordered_service_handlers(enabled)
+        self.assertEqual(("update-metadata", "multi-node-hc"), ordered_service_handlers(("multi-node-hc", "update-metadata")))
+        with patch(MODULE + "CliState.service") as service:
+            for args in (
+                ["--pool", "gpu-pool", "--checks", "nccl"],
+                ["--enable", "active-hc", "--checks", "nccl"],
+                ["--enable", "active-hc", "--pool", "gpu-pool", "--nodes", "gpu-01", "--checks", "nccl"],
+                ["--enable", "update-metadata", "--enable", "active-hc", "--pool", "gpu-pool", "--yes"],
+                ["--enable", "active-hc", "--enable", "active-hc", "--pool", "gpu-pool", "--checks", "nccl"],
+            ):
+                result = CliRunner().invoke(cli, ["services", "all", *args], standalone_mode=False)
+                self.assertNotEqual(0, result.exit_code, result.output)
+            service.assert_not_called()
+
+    def test_all_wait_stops_after_nonpassing_active_run(self) -> None:
+        result, select = self.invoke("all", ("--enable", "active-hc", "--enable", "multi-node-hc", "--wait", "--yes"))
+        self.assertEqual(3, result.return_value, result.exception)
+        self.assertEqual(1, select.call_count)
+        self.workflow.submit.assert_called_once()
+        self.assertEqual("NOT_RUN", json.loads(result.stdout)[-1]["state"])
+
+    def test_all_keeps_completed_rows_when_later_handler_errors(self) -> None:
+        with patch(MODULE + "run_healthcheck_pass", side_effect=[
+            ([{"record_type": "run", "run_id": RUN}], 0), BenchmarkError("Kubernetes history read denied"),
+        ]) as run:
+            result = CliRunner(mix_stderr=False).invoke(cli, ["services", "all", "--enable", "active-hc",
+                "--enable", "multi-node-hc", "--pool", "gpu-pool", "--checks", "nccl", "--yes", "--format", "json"],
+                standalone_mode=False)
+            self.assertNotEqual(0, result.exit_code)
+            rows = json.loads(result.stdout)
+            self.assertEqual(RUN, rows[0]["run_id"])
+            self.assertEqual("multi-node-hc", rows[-1]["service"])
+            self.assertEqual("ERROR", rows[-1]["state"])
+            self.assertEqual(2, run.call_count)
+
+    def test_all_metadata_bound_failure_prevents_gpu_submission(self) -> None:
+        self.backend.list_runs.return_value = (self.checkpoint, self.checkpoint)
+        result, select = self.invoke("all", ("--enable", "update-metadata", "--enable", "active-hc", "--max-runs", "1", "--yes"))
+        self.assertNotEqual(0, result.exit_code)
+        self.assertEqual("ERROR", json.loads(result.stdout)[0]["state"])
+        select.assert_not_called()
+        self.workflow.submit.assert_not_called()
+
+    def test_all_help_documents_explicit_enable_without_connecting(self) -> None:
+        with patch(MODULE + "CliState.service") as service:
+            result = CliRunner().invoke(cli, ["services", "all", "--help"])
+            self.assertEqual(0, result.exit_code, result.output)
+            self.assertIn("--enable", result.output)
+            self.assertIn("--max-runs", result.output)
+            service.assert_not_called()

@@ -247,7 +247,7 @@ def node_healthchecks(
 @output_option
 @pass_state
 def health_profiles(state: CliState, output_override: str | None) -> int:
-    rows = [{**asdict(profile), "networks": ["local", "host", "vf"] if profile.host_hcas else ["local"],
+    rows = [{**asdict(profile), "networks": list(profile.networks),
              "vf_count": profile.vf_count} for profile in PROFILES]
     print_records(rows, resolve_output(state, output_override), ["shape", "gpu_count", "networks", "max_bytes", "source_revision"])
     return SUCCESS

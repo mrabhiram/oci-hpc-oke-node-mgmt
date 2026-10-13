@@ -173,6 +173,7 @@ Command groups:
 | `status` | Show concise cluster capacity and health. |
 | `health run` | Run deterministic health checks by category or pool. |
 | `health profiles\|list\|get\|results\|logs` | Inspect NCCL profiles, recorded runs, verdicts, and owned logs without submitting workloads. |
+| `services all --enable <handler> --pool <pool>` | Run explicitly enabled metadata/NCCL services once in their documented order. |
 | `health wait\|cancel\|cleanup <run-id>` | Advance an existing NCCL run, cancel owned workloads, or verify evidence and clean up terminal resources. |
 | `services update-metadata` | Refresh recorded healthcheck evidence once without submitting, cancelling, or deleting workloads. |
 | `services active-hc\|multi-node-hc` | Run a bounded NCCL service pass over explicitly selected idle, overdue nodes; no recurring schedule is installed. |

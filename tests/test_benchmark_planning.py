@@ -278,7 +278,37 @@ class BenchmarkProfileTests(unittest.TestCase):
             self.assertEqual("1", profile_environment(profile, "local")["NCCL_IB_DISABLE"])
             if profile.host_hcas:
                 self.assertTrue(profile_environment(profile, "host")["NCCL_IB_HCA"].startswith("="))
+            if profile.vf_count:
                 self.assertEqual("mlx5", profile_environment(profile, "vf")["NCCL_IB_HCA"])
+
+    def test_rtxpro_host_settings_and_transport_boundary(self) -> None:
+        profile = get_profile("BM.GPU.RTXPRO.8")
+        self.assertEqual(("local", "host"), profile.networks)
+        self.assertEqual(0, profile.vf_count)
+        self.assertEqual(2 * REPORT_BYTES, profile.max_bytes)
+        env = profile_environment(profile, "host")
+        for key, value in {
+            "NCCL_ALGO": "Tree", "NCCL_MIN_NCHANNELS": "8", "NCCL_IB_QPS_PER_CONNECTION": "1",
+            "NCCL_NET_PLUGIN": "none", "NCCL_CUMEM_ENABLE": "0", "NCCL_IB_GID_INDEX": "3",
+            "NCCL_IB_HCA": "=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_6,mlx5_7,mlx5_8,mlx5_9",
+        }.items():
+            self.assertEqual(value, env[key])
+        self.assertNotIn("NCCL_ALGO", profile_environment(profile, "local"))
+        with self.assertRaisesRegex(BenchmarkError, "no reviewed vf"):
+            profile_environment(profile, "vf")
+
+    def test_rtxpro_auto_does_not_invent_vf_support_or_fall_back(self) -> None:
+        snapshot = inventory(2)
+        for node in snapshot.nodes:
+            node.shape = "BM.GPU.RTXPRO.8"
+        self.assertEqual("host", plan_healthchecks(snapshot, request()).cases[0].network)
+        self.assertEqual("local", plan_healthchecks(snapshot, request(check_type="active")).cases[0].network)
+        for node in snapshot.nodes:
+            node.allocatable["nvidia.com/rdma-vf"] = "8"
+        for network in ("auto", "vf"):
+            with self.subTest(network=network), self.assertRaisesRegex(BenchmarkError, "no reviewed vf"):
+                plan_healthchecks(snapshot, request(network=network))
+        self.assertEqual("host", plan_healthchecks(snapshot, request(network="host")).cases[0].network)
 
     def test_environment_validation_preserves_values_without_shell_interpretation(self) -> None:
         profile = get_profile("BM.GPU.B200.8")

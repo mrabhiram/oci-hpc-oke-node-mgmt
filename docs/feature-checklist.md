@@ -205,10 +205,12 @@ the complete delivery requirements.
 | Ownership-bound logs, Kueue status, events, immutable private exports | Preview implemented | Automated identity, bounds, failure, and cleanup tests |
 | `services update-metadata` observation-only pass | Preview implemented | Automated selection, identity, confirmation, and no-workload-mutation tests; live evidence refresh |
 | `services active-hc` / `multi-node-hc` bounded NCCL passes | Preview implemented | Automated freshness, boot/profile identity, idle allocation, cooldown, alternate-partner, CLI, and submission-race tests |
-| Full Slurm diagnostic parity and combined service orchestration | In progress | NCCL alone does not cover passive host diagnostics, stress/SDC, separate IB tests, or `services all` |
+| `services all` enabled-handler orchestration | Preview implemented | Explicit enablement, metadata/active/multi-node ordering, fresh stage reads, wait failure propagation, and partial-result tests |
+| Full Slurm diagnostic parity | In progress | NCCL alone does not cover passive host diagnostics, stress/SDC, or separate IB tests |
 | RCCL, Slinky reservations, specialized transports, periodic execution | Not yet implemented | Requests requiring these adapters are rejected |
 | Live single-node NCCL success | Validated on BM.GPU4.8 | Eight A100 ranks; correctness and coverage PASS; local transport; performance UNGRADED |
-| Live multi-node, whole-pool, local-block, and cross-block success | Incomplete | Single-node success does not establish RDMA or complete validation coverage |
+| Live two-node whole-pool host-network NCCL success | Validated on BM.GPU4.8 | Sixteen A100 ranks across two local blocks; correctness/coverage PASS, RDMA_OBSERVED, performance UNGRADED |
+| Default-pair, per-local-block, VF, and specialized live acceptance | Incomplete | Whole-pool success does not establish every selection mode, transport, shape, or adapter |
 
 The [profile coverage matrix](nccl-profile-coverage.md) lists upstream shapes and
 transport variants that still need implementation or live validation.

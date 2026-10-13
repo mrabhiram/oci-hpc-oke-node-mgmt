@@ -17,6 +17,7 @@ ROLE_LABEL = "mgmt-oke.oraclecloud.com/healthcheck-role"
 MPI_GROUP = "kubeflow.org"
 MPI_VERSION = "v2beta1"
 MPI_PLURAL = "mpijobs"
+MAX_RANK_DIAGNOSTIC_BYTES = 1024 * 1024
 RANK_SCRIPT = "\n".join([
     "set -euo pipefail",
     "source /tmp/mgmt-worker-identity",
@@ -30,7 +31,7 @@ RANK_SCRIPT = "\n".join([
     "exit_code=0",
     '"$@" || exit_code=$?',
     "printf '\\nMGMT_NCCL_DEBUG_BEGIN\\t%s\\n' \"$OMPI_COMM_WORLD_RANK\"",
-    'if test -s "$NCCL_DEBUG_FILE" && test "$(wc -c < "$NCCL_DEBUG_FILE")" -le 1048576; then',
+    f'if test -s "$NCCL_DEBUG_FILE" && test "$(wc -c < "$NCCL_DEBUG_FILE")" -le {MAX_RANK_DIAGNOSTIC_BYTES}; then',
     '  cat "$NCCL_DEBUG_FILE" || exit_code=1',
     "else",
     '  echo "NCCL diagnostic log is missing, empty, or exceeds the per-rank evidence limit" >&2',
@@ -175,6 +176,8 @@ def launcher_script(
         "--bind-to", "numa", "-mca", "coll", "^hcoll",
         "-mca", "coll_hcoll_enable", "0", "-mca", "plm_rsh_args", ssh_options,
     ]
+    if profile.family == "rtxpro" and case.network == "host":
+        command.extend(["-mca", "pml", "ucx"])
     for key, value in sorted(environment.items()):
         command.extend(["-x", f"{key}={value}"])
     command.extend(["/bin/bash", "/tmp/mgmt-nccl-rank", *nccl_argv(request)])
@@ -202,7 +205,8 @@ def launcher_script(
         "  done",
         '  if [[ " $addresses " == *" $address "* ]]; then echo "Workers resolved to a duplicate address" >&2; exit 1; fi',
         '  addresses+=" $address"',
-        "  printf 'Host %s\\n  HostName %s\\n  HostKeyAlias %s\\n' \"$host\" \"$address\" \"$address\" >> /tmp/mgmt-ssh-config",
+        '  key_alias="$address"' if port == 22 else f'  key_alias="[$address]:{port}"',
+        "  printf 'Host %s\\n  HostName %s\\n  HostKeyAlias %s\\n' \"$host\" \"$address\" \"$key_alias\" >> /tmp/mgmt-ssh-config",
         "  printf 'MGMT_MPI_WORKER_ADDRESS\\t%s\\t%s\\n' \"$host\" \"$address\"",
         f'  until ssh-keyscan -T 5 -p {port} "$address" > /tmp/mgmt-host-key 2>/dev/null '
         "&& test -s /tmp/mgmt-host-key; do",

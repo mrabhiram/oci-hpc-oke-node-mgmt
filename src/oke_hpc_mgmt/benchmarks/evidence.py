@@ -9,7 +9,7 @@ from urllib3.exceptions import HTTPError
 
 from oke_hpc_mgmt.benchmarks.diagnostics import SchedulingCollector, SchedulingEvidence
 from oke_hpc_mgmt.benchmarks.manifests import (
-    CASE_LABEL, MPI_GROUP, MPI_VERSION, ROLE_LABEL, RUN_LABEL, case_name,
+    CASE_LABEL, MAX_RANK_DIAGNOSTIC_BYTES, MPI_GROUP, MPI_VERSION, ROLE_LABEL, RUN_LABEL, case_name,
 )
 from oke_hpc_mgmt.benchmarks.models import BenchmarkCase, BenchmarkError
 from oke_hpc_mgmt.benchmarks.records import RunRecord
@@ -150,7 +150,10 @@ class EvidenceCollector:
         warnings: list[str] = []
         log = ""
         complete = False
-        limit = min(MAX_LOG_BYTES, log_budget)
+        # Launcher output aggregates every rank's bounded diagnostic file.
+        # Workers retain their smaller limit; the case budget still caps all reads.
+        allowance = MAX_LOG_BYTES + case.ranks * MAX_RANK_DIAGNOSTIC_BYTES if role == "launcher" else MAX_LOG_BYTES
+        limit = min(allowance, log_budget)
         if status.get("containerID") and limit > 0:
             try:
                 response = self.core.read_namespaced_pod_log(

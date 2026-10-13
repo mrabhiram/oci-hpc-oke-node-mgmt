@@ -379,7 +379,8 @@ class CapabilityPreflight:
                 if plan.request.scheduler == "direct" or not plan.request.queue:
                     raise BenchmarkError("Kueue is installed; select an existing --queue. Direct execution cannot bypass it.")
                 kueue_version = served_version(kueue, ("v1beta2", "v1beta1"), namespaced=True)
-                self._permissions(namespace_name, (Permission(KUEUE_GROUP, "workloads", "list", namespace_name),))
+                self._permissions(namespace_name, tuple(Permission(KUEUE_GROUP, "workloads", verb, namespace_name)
+                                                        for verb in ("list", "patch")))
                 versions.append(self._identity(kueue, "CRD"))
                 for plural, namespaced in (("clusterqueues", False), ("resourceflavors", False), ("workloads", True)):
                     crd = self._crd(f"{plural}.{KUEUE_GROUP}")

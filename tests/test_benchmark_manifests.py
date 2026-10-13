@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from typing import Literal
 
 from oke_hpc_mgmt.benchmarks.manifests import (
     CASE_LABEL, ExecutionOptions, RANK_SCRIPT, ROLE_LABEL, RUN_LABEL, case_name, launcher_script,
@@ -86,7 +87,7 @@ class BenchmarkManifestTests(unittest.TestCase):
         container = host["Worker"]["template"]["spec"]["containers"][0]
         self.assertEqual(2222, container["ports"][0]["hostPort"])
         for profile in PROFILES:
-            if profile.host_hcas is None:
+            if not profile.vf_count:
                 continue
             with self.subTest(shape=profile.shape):
                 nodes = tuple(replace(node, shape=profile.shape) for node in self.case.nodes)
@@ -99,6 +100,22 @@ class BenchmarkManifestTests(unittest.TestCase):
                 resources = worker["spec"]["containers"][0]["resources"]
                 self.assertEqual(expected, resources["limits"]["nvidia.com/rdma-vf"])
                 self.assertEqual(expected, resources["requests"]["nvidia.com/rdma-vf"])
+
+    def test_rtxpro_preserves_ucx_and_tree_without_advertising_vf(self) -> None:
+        nodes = tuple(replace(node, shape="BM.GPU.RTXPRO.8") for node in self.case.nodes)
+        schedulers: tuple[tuple[Literal["direct", "kueue"], str | None], ...] = (("direct", None), ("kueue", "gpu-validation"))
+        for scheduler, queue in schedulers:
+            self.request = replace(self.request, scheduler=scheduler, queue=queue)
+            job = self.render(nodes=nodes)
+            replicas = job["spec"]["mpiReplicaSpecs"]
+            command = shlex.split(replicas["Launcher"]["template"]["spec"]["containers"][0]["command"][-1].splitlines()[-1])
+            self.assertEqual("ucx", command[command.index("pml") + 1])
+            self.assertIn("NCCL_ALGO=Tree", command)
+            worker = replicas["Worker"]["template"]["spec"]
+            self.assertTrue(worker["hostNetwork"])
+            self.assertEqual(8, worker["containers"][0]["resources"]["limits"]["nvidia.com/gpu"])
+            with self.assertRaisesRegex(BenchmarkError, "no reviewed vf"):
+                self.render(nodes=nodes, network="vf")
 
     def test_local_has_no_rdma_mount_privilege_or_host_network(self) -> None:
         self.request = request(check_type="active")
@@ -192,6 +209,13 @@ class BenchmarkManifestTests(unittest.TestCase):
         self.assertEqual(RUN, worker_labels[RUN_LABEL])
 
     def test_launcher_retries_transient_readiness_with_pinned_key_and_bounded_deadline(self) -> None:
+        self._exercise_launcher_keys(self.case.network)
+
+    def test_host_network_launcher_matches_port_qualified_keyscan_entries(self) -> None:
+        self._exercise_launcher_keys("host")
+
+    def _exercise_launcher_keys(self, network: Literal["local", "host", "vf"]) -> None:
+        self.case = replace(self.case, network=network)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             hostfile = root / "hostfile"
@@ -201,8 +225,14 @@ class BenchmarkManifestTests(unittest.TestCase):
                 "getent": "#!/bin/sh\n[ \"$DNS_FAIL\" != 1 ] || exit 2\n"
                           "case \"$2\" in worker-0) echo \"${ADDRESS_0:-192.0.2.1} STREAM worker-0\";;\n"
                           "worker-1) echo '2001:db8::2 STREAM worker-1';; *) exit 2;; esac\n",
-                "ssh-keyscan": "#!/bin/sh\necho 'worker ssh-ed25519 synthetic-public-key'\n",
-                "ssh": "#!/bin/sh\nn=0\n[ ! -f \"$COUNT_FILE\" ] || n=$(cat \"$COUNT_FILE\")\n"
+                "ssh-keyscan": "#!/bin/sh\nhost=$5\n[ \"$4\" = 22 ] || host=\"[$5]:$4\"\n"
+                               "echo \"$host ssh-ed25519 synthetic-public-key\"\n",
+                "ssh": "#!/bin/sh\n"
+                       "known=${2%mgmt-ssh-config}mgmt-known-hosts\n"
+                       "awk '$1 == \"HostKeyAlias\" {print $2}' \"$2\" | while read -r alias; do\n"
+                       "awk -v alias=\"$alias\" '$1 == alias {found=1} END {exit !found}' \"$known\" || exit 1\n"
+                       "done || exit 1\n"
+                       "n=0\n[ ! -f \"$COUNT_FILE\" ] || n=$(cat \"$COUNT_FILE\")\n"
                        "n=$((n+1))\necho $n > \"$COUNT_FILE\"\n[ \"$FAIL_ALWAYS\" != 1 ] && [ $n -gt 2 ]\n",
                 "timeout": "#!/bin/sh\n"
                            "if [ \"$1\" = 5s ]; then shift; exec \"$@\"; fi\n"
@@ -231,8 +261,9 @@ class BenchmarkManifestTests(unittest.TestCase):
                              [line for line in result.stdout.splitlines() if line.startswith("MGMT_MPI_SSH_READY")])
             self.assertTrue((root / "executed").exists())
             config = (root / "mgmt-ssh-config").read_text()
-            self.assertEqual("Host worker-0\n  HostName 192.0.2.1\n  HostKeyAlias 192.0.2.1\n"
-                             "Host worker-1\n  HostName 2001:db8::2\n  HostKeyAlias 2001:db8::2\n", config)
+            aliases = ("[192.0.2.1]:2222", "[2001:db8::2]:2222") if network == "host" else ("192.0.2.1", "2001:db8::2")
+            self.assertEqual(f"Host worker-0\n  HostName 192.0.2.1\n  HostKeyAlias {aliases[0]}\n"
+                             f"Host worker-1\n  HostName 2001:db8::2\n  HostKeyAlias {aliases[1]}\n", config)
             self.assertEqual(1, script.count("ssh-keyscan"))
             self.assertIn("StrictHostKeyChecking=yes", script)
             (root / "executed").unlink()

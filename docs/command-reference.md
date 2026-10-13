@@ -780,6 +780,18 @@ requires confirmation or `--yes`. Use `--wait` to advance/grade the submitted ru
 No eligible work returns 0 with skip reasons, not a passing health verdict.
 See [service semantics](nccl-healthchecks.md#eligibility-based-service-passes).
 
+```bash
+mgmt-oke services all --pool <pool-name> --checks nccl \
+  --enable update-metadata --enable active-hc --enable multi-node-hc \
+  --queue <local-queue> --dry-run
+```
+
+`services all` requires explicit `--enable` options and a pool. Enabled handlers
+run once in metadata/active/multi-node order, with fresh eligibility per stage.
+`--max-runs` bounds metadata inventory. A nonpassing waited stage prevents later
+submissions. See [combined passes](nccl-healthchecks.md#run-enabled-services-once)
+for cooldown and partial-completion behavior.
+
 ## Exit Status
 
 | Status | Meaning |

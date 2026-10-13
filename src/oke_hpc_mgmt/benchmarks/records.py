@@ -74,6 +74,7 @@ class CaseRecord:
     submitted_at: str | None = None
     admitted_at: str | None = None
     snapshots: tuple[EvidenceSnapshot, ...] = ()
+    cancellation_delete_requested: bool = False
 
 
 @dataclass(frozen=True)
@@ -116,11 +117,15 @@ class RunRecord:
         if self.state == "CLEANED" or state not in transitions.get(current.state, {current.state}):
             raise BenchmarkError(f"Invalid case transition {current.state} -> {state}.")
         if any(name not in {"job_uid", "created_at", "started_at", "completed_at", "result", "error", "evidence_sha256",
-                            "submitted_at", "admitted_at", "snapshots"}
+                            "submitted_at", "admitted_at", "snapshots", "cancellation_delete_requested"}
                for name in changes):
             raise BenchmarkError("A checkpoint update cannot change case identity or its plan.")
         if current.job_uid and changes.get("job_uid", current.job_uid) != current.job_uid:
             raise BenchmarkError("A replacement MPIJob must be recorded as a new attempt, not adopted.")
+        if current.cancellation_delete_requested and changes.get("cancellation_delete_requested", True) is not True:
+            raise BenchmarkError("Cancellation deletion intent cannot be cleared.")
+        if changes.get("cancellation_delete_requested") is True and self.state != "CANCELLING":
+            raise BenchmarkError("Persist cancellation before recording job deletion intent.")
         updated = replace(current, state=state, **changes)
         if updated.snapshots[:len(current.snapshots)] != current.snapshots:
             raise BenchmarkError("Previously exported evidence snapshots are append-only.")
@@ -261,6 +266,10 @@ def _validate_success(case: CaseRecord) -> None:
 
 def _validate_case(case: CaseRecord) -> None:
     _validate_success(case)
+    if type(case.cancellation_delete_requested) is not bool or case.cancellation_delete_requested and (
+        not case.job_uid or not re.fullmatch(r"[a-f0-9]{64}", case.evidence_sha256 or "")
+    ):
+        raise BenchmarkError("Cancellation deletion intent requires a boolean, recorded job UID, and exported evidence.")
     for value in (case.submitted_at, case.created_at, case.admitted_at, case.started_at, case.completed_at):
         if value is not None:
             timestamp(value)

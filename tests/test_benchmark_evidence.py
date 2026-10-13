@@ -10,8 +10,10 @@ from kubernetes.client import ApiClient
 from kubernetes.client.exceptions import ApiException
 
 from oke_hpc_mgmt.benchmarks.backend import BenchmarkBackend
-from oke_hpc_mgmt.benchmarks.evidence import MAX_LOG_BYTES, CaseEvidence, EvidenceCollector, assess_case
-from oke_hpc_mgmt.benchmarks.manifests import CASE_LABEL, ROLE_LABEL, case_name, owned_labels, render_mpijob
+from oke_hpc_mgmt.benchmarks.evidence import MAX_CASE_LOG_BYTES, MAX_LOG_BYTES, CaseEvidence, EvidenceCollector, assess_case
+from oke_hpc_mgmt.benchmarks.manifests import (
+    CASE_LABEL, MAX_RANK_DIAGNOSTIC_BYTES, ROLE_LABEL, case_name, owned_labels, render_mpijob,
+)
 from oke_hpc_mgmt.benchmarks.models import BenchmarkError
 from test_benchmark_records import record
 
@@ -278,6 +280,38 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(1, self.core.read_namespaced_pod_log.call_count)
         self.assertEqual("launcher-pod", self.core.read_namespaced_pod_log.call_args.args[0])
         self.assertFalse(result.coverage_complete)
+
+    def test_launcher_budget_scales_with_ranks_without_expanding_worker_limit(self) -> None:
+        self.case = replace(self.case, nodes=(replace(self.case.nodes[0], gpu_count=16),))
+        self.checkpoint = replace(self.checkpoint, plan=replace(self.checkpoint.plan, cases=(self.case, *self.checkpoint.plan.cases[1:])))
+        output = b"diagnostic\n" * (MAX_LOG_BYTES // 10 + 1)
+
+        def log_stream(name: str, namespace: str, **_: Any) -> Mock:
+            stream = Mock()
+            stream.read.side_effect = lambda limit: (output if name == "launcher-pod" else b"worker\n")[:limit]
+            return stream
+
+        self.core.read_namespaced_pod_log.side_effect = log_stream
+        result = self.collect()
+        self.assertTrue(result.coverage_complete)
+        self.assertEqual(output.decode(), result.pods[1].log)
+        self.assertGreater(len(result.pods[1].log), MAX_LOG_BYTES)
+        calls = self.core.read_namespaced_pod_log.call_args_list
+        self.assertEqual(MAX_LOG_BYTES + 16 * MAX_RANK_DIAGNOSTIC_BYTES + 1, calls[0].kwargs["limit_bytes"])
+        self.assertEqual(MAX_LOG_BYTES + 1, calls[1].kwargs["limit_bytes"])
+
+    def test_large_rank_count_cannot_exceed_case_budget_or_prove_truncated_success(self) -> None:
+        self.case = replace(self.case, nodes=(replace(self.case.nodes[0], gpu_count=4096),))
+        self.checkpoint = replace(self.checkpoint, plan=replace(self.checkpoint.plan, cases=(self.case, *self.checkpoint.plan.cases[1:])))
+        with patch("oke_hpc_mgmt.benchmarks.evidence.MAX_CASE_LOG_BYTES", 32):
+            self.stream.read.return_value = b"x" * 33
+            result = self.collect()
+        self.assertEqual(33, self.core.read_namespaced_pod_log.call_args.kwargs["limit_bytes"])
+        self.assertEqual(32, sum(len(pod.log.encode()) for pod in result.pods))
+        self.assertFalse(result.pods[1].log_complete)
+        self.assertFalse(result.coverage_complete)
+        self.assertEqual("INCOMPLETE", assess_case(self.case, result).status)
+        self.assertLess(MAX_CASE_LOG_BYTES, MAX_LOG_BYTES + self.case.ranks * MAX_RANK_DIAGNOSTIC_BYTES)
 
     def test_late_pod_creation_or_restart_invalidates_snapshot(self) -> None:
         changed = copy.deepcopy(self.pods)

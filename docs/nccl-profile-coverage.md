@@ -26,7 +26,7 @@ logic rather than maintaining one copied YAML per scheduler and shape.
 
 | Shape | Implemented profiles | Live validation in this project |
 | --- | --- | --- |
-| `BM.GPU4.8` | Local, host-network, VF | Local eight-A100 correctness/coverage pass; multi-node and VF not yet validated |
+| `BM.GPU4.8` | Local, host-network, VF | Local eight-rank and two-worker whole-pool sixteen-rank host-network correctness/coverage passes; RDMA observed in the latter; VF not yet validated |
 | `BM.GPU.A100-v2.8` | Local, host-network, VF | Not yet validated |
 | `BM.GPU.B4.8` | Local, host-network, VF | Not yet validated |
 | `BM.GPU.H100.8` | Local, host-network, VF | Not yet validated |
@@ -34,13 +34,19 @@ logic rather than maintaining one copied YAML per scheduler and shape.
 | `BM.GPU.B200.8` | Local, host-network, VF | Not yet validated |
 | `BM.GPU.B300.8` | Local, host-network, VF | Not yet validated |
 | `VM.GPU.A10.1`, `VM.GPU.A10.2` | Local-only extensions | Not yet validated |
-| `BM.GPU.RTXPRO.8` | Not yet implemented | Not yet validated |
+| `BM.GPU.RTXPRO.8` | Local, host-network; VF rejected | Not yet validated |
 | `BM.GPU.GB200.4`, `BM.GPU.GB200-v2.4`, `BM.GPU.GB200-v3.4` | Not yet implemented; specialized ComputeDomain/resource-claim and MNNVL handling required | Not yet validated |
 | `BM.GPU.GB300.4` | Not yet implemented; specialized transport handling required | Not yet validated |
 
 Dranet execution is not yet implemented, including its upstream A100 example.
 The existence of a standard A100 host/VF profile does not imply Dranet support.
 Unsupported requests fail instead of substituting another shape or transport.
+
+The RTXPRO host profile preserves the upstream Tree algorithm, minimum eight
+channels, one QP per connection, exact eight-HCA list, and UCX MPI selection.
+The pinned source provides no RTXPRO VF manifest, so the tool does not infer VF
+support from the number of HCAs. Automatic VF selection is refused for this
+shape; explicitly selecting `--network host` uses the reviewed host profile.
 
 ## AMD Coverage
 
@@ -56,8 +62,10 @@ NCCL tests cannot be used as proof of AMD support.
   not that GPU communication or RDMA worked.
 - The recorded local A100 pass proves eight-rank participation and correctness
   for that execution only. Its performance remains ungraded without a threshold.
-- Multi-node, whole-pool, local-block, cross-block, VF, and specialized adapter
-  success remain separate live acceptance requirements.
+- A fresh two-worker whole-pool A100 execution covered two different local
+  blocks, all sixteen ranks, and observed RDMA channels. This does not establish
+  default-pair or per-local-block execution, VF support, larger pool scaling,
+  specialized adapters, or other shapes. Those remain separate live requirements.
 
 See [NCCL Healthchecks](nccl-healthchecks.md) for current commands and fresh
 sanitized examples, and [the upstream source tree](https://github.com/oracle-quickstart/oci-hpc-oke/tree/6c94a4201d9ec6887f37eceeca325ec18b03b703/manifests/nccl-tests)

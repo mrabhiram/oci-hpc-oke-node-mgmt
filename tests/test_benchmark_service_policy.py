@@ -117,7 +117,10 @@ class ServicePolicyTests(unittest.TestCase):
                         result={"status": "FAIL"}, completed_at=(NOW - timedelta(seconds=700)).isoformat())
         run = replace(run, plan=replace(run.plan, cases=(*run.plan.cases, case)), cases=(*run.cases, saved))
         target = node_target(self.snapshot.nodes[0])
-        prior = latest_assessment(target, "active", run.plan.cases[0].profile_fingerprint, (run,), NOW)
+        fingerprint = run.plan.cases[0].profile_fingerprint
+        assert fingerprint is not None
+        prior = latest_assessment(target, "active", fingerprint, (run,), NOW)
+        assert prior is not None
         self.assertEqual("FAIL", prior.status)
 
     def test_missing_correctness_or_completion_never_establishes_pass(self) -> None:

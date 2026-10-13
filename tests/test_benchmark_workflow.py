@@ -130,9 +130,13 @@ class WorkflowTests(unittest.TestCase):
         self.events.append("cancel:" + case.case_id)
         self.jobs[case.case_id]["spec"]["runPolicy"]["suspend"] = True
 
-    def delete_job(self, run: RunRecord, case: BenchmarkCase, *, evidence_resource_version: str) -> None:
+    def delete_job(self, run: RunRecord, case: BenchmarkCase, *, evidence_resource_version: str, cancelling: bool = False) -> None:
         self.assert_held()
         saved = next(item for item in run.cases if item.case_id == case.case_id)
+        if cancelling:
+            self.assertEqual("CANCELLING", run.state)
+            self.assertTrue(saved.cancellation_delete_requested)
+            self.assertTrue(self.jobs[case.case_id]["spec"]["runPolicy"]["suspend"])
         self.store.verify(run, case, saved.evidence_sha256 or "")
         self.assertEqual(self.jobs[case.case_id]["metadata"]["resourceVersion"], evidence_resource_version)
         self.events.append("delete:" + case.case_id)
@@ -428,6 +432,46 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual("CANCELLED", final.state)
         self.assertEqual(1, self.backend.cancel_job.call_count)
         self.assertEqual(1, self.backend.create_job.call_count)
+
+    def test_kueue_cancel_deactivates_even_suspended_jobs_before_completing(self) -> None:
+        self.initial = replace(self.initial, plan=replace(self.plan,
+            request=replace(self.plan.request, queue="gpu-queue")))
+        self.submit()
+        self.backend.cancel_job.side_effect = [True, False]
+        first = self.workflow.cancel("default", RUN)
+        self.assertEqual("CANCELLING", first.state)
+        self.backend.cancel_job.assert_called_once()
+        final = self.workflow.cancel("default", RUN)
+        self.assertEqual("CANCELLED", final.state)
+        self.assertEqual(2, self.backend.cancel_job.call_count)
+
+    def test_cancellation_gc_intent_recovers_lost_response_and_waits_for_owned_pods(self) -> None:
+        self.submit()
+        self.workflow.cancel("default", RUN)
+        self.backend.case_pods_absent.return_value = False
+        def lost(run, case, **kwargs):
+            self.delete_job(run, case, **kwargs)
+            raise BenchmarkError("delete response lost")
+        self.backend.delete_job.side_effect = lost
+        with self.assertRaisesRegex(BenchmarkError, "response lost"):
+            self.workflow.cancel("default", RUN)
+        assert self.current is not None
+        self.assertTrue(self.current.cases[0].cancellation_delete_requested)
+        self.assertEqual("CANCELLING", self.workflow.cancel("default", RUN).state)
+        self.backend.case_pods_absent.return_value = True
+        self.assertEqual("CANCELLED", self.workflow.cancel("default", RUN).state)
+        self.assertEqual(1, self.backend.create_job.call_count)
+        self.assertEqual(1, self.backend.delete_job.call_count)
+
+    def test_cancellation_gc_verifies_all_historical_exports_before_delete(self) -> None:
+        self.submit()
+        first = self.workflow.cancel("default", RUN)
+        digest = first.cases[0].snapshots[0].sha256
+        (Path(self.temporary.name) / RUN / f"case-0001-{digest}.json").unlink()
+        self.backend.case_pods_absent.return_value = False
+        with self.assertRaisesRegex(BenchmarkError, "unavailable"):
+            self.workflow.cancel("default", RUN)
+        self.backend.delete_job.assert_not_called()
 
     def test_cancel_reads_all_started_logs_or_refuses_suspension(self) -> None:
         self.submit()

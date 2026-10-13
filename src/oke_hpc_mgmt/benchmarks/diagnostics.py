@@ -33,7 +33,8 @@ class SchedulingEvidence:
     def signature(self) -> str:
         # Repeated event counts and resource versions do not constitute another
         # scheduling decision. Preserve them in exports without snapshot churn.
-        workloads = [{"uid": item["metadata"]["uid"], "status": item["status"]} for item in self.workloads]
+        workloads = [{"uid": item["metadata"]["uid"], "active": item.get("active", True), "status": item["status"]}
+                     for item in self.workloads]
         events = [{key: item.get(key) for key in ("involvedObject", "reason", "message", "type")}
                   for item in self.events]
         for event in events:
@@ -58,7 +59,7 @@ class SchedulingCollector:
             raise BenchmarkError("Scheduling diagnostics exceed collection limits; retain resources for inspection.")
         return items
 
-    def _workloads(self, run: RunRecord, case: BenchmarkCase, job_uid: str) -> list[dict[str, Any]]:
+    def owned_workloads(self, run: RunRecord, case: BenchmarkCase, job_uid: str) -> list[dict[str, Any]]:
         if not run.plan.request.queue:
             return []
         crd = self.backend._object(self.backend.client.ApiextensionsV1Api().read_custom_resource_definition(
@@ -84,11 +85,11 @@ class SchedulingCollector:
                 raise BenchmarkError("Cannot verify Kueue Workload ownership and queue; retain resources.")
             identities.add(metadata["uid"])
             status = item.get("status") or {}
-            if not isinstance(status, dict):
+            if not isinstance(status, dict) or type(spec.get("active", True)) is not bool:
                 raise BenchmarkError("Invalid Kueue Workload status in scheduling diagnostics.")
             result.append({"apiVersion": f"{KUEUE_GROUP}/{version}", "kind": "Workload",
                            "metadata": {key: metadata[key] for key in ("name", "namespace", "uid", "resourceVersion")},
-                           "queue_name": spec["queueName"], "status": copy.deepcopy(status)})
+                           "queue_name": spec["queueName"], "active": spec.get("active", True), "status": copy.deepcopy(status)})
         return sorted(result, key=lambda item: item["metadata"]["uid"])
 
     def collect(
@@ -100,7 +101,7 @@ class SchedulingCollector:
             raise BenchmarkError("Scheduling diagnostics require the recorded MPIJob UID.")
         namespace = run.plan.request.namespace
         try:
-            workloads = self._workloads(run, case, job_uid)
+            workloads = self.owned_workloads(run, case, job_uid)
             objects = [("MPIJob", case_name(run.run_id, case), job_uid),
                        *(("Pod", name, uid) for name, uid in pods),
                        *(("Workload", item["metadata"]["name"], item["metadata"]["uid"]) for item in workloads)]

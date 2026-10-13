@@ -244,6 +244,9 @@ def resolve_network(
         network: Literal["host", "vf"] = "vf" if all(has_vfs) else "host"
     else:
         network = request.network
+    for node in nodes:
+        if network not in get_profile(node.shape or "unknown").networks:
+            raise BenchmarkError(f"{node.shape} has no reviewed {network} execution profile.")
     if network == "vf":
         for node in nodes:
             try:

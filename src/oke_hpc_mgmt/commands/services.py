@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import click
 
@@ -56,6 +56,27 @@ def select_refresh_runs(
     return tuple(sorted(selected, key=lambda run: (run.created_at, run.run_id)))
 
 
+SERVICE_ORDER = ("update-metadata", "active-hc", "multi-node-hc")
+
+
+def ordered_service_handlers(enabled: tuple[str, ...]) -> tuple[str, ...]:
+    if not enabled or len(enabled) != len(set(enabled)) or any(name not in SERVICE_ORDER for name in enabled):
+        raise BenchmarkError("Explicitly enable unique supported service handlers; no services run by default.")
+    return tuple(name for name in SERVICE_ORDER if name in enabled)
+
+
+def refresh_metadata_pass(
+    backend: BenchmarkBackend, namespace: str, run_ids: tuple[str, ...], pool: str | None, max_runs: int,
+    output_dir: Path, dry_run: bool, yes: bool,
+) -> tuple[RunRecord, ...]:
+    runs = select_refresh_runs(backend, namespace, run_ids, pool, max_runs)
+    if runs and not dry_run:
+        confirm_plans([OperationPlan("healthcheck-metadata", run.run_id) for run in runs], namespace, yes)
+        workflow = BenchmarkWorkflow(backend, EvidenceStore(output_dir))
+        runs = tuple(workflow.refresh(namespace, run.run_id, expected_uid=run.uid or "") for run in runs)
+    return runs
+
+
 @services.command("update-metadata", help="Observe recorded healthchecks once. Never submit, cancel, or delete workloads; exit 0 means refresh completed, not benchmark success.")
 @namespace_option
 @click.option("--run-id", "run_ids", multiple=True, help="Refresh these recorded runs only; repeat for multiple IDs.")
@@ -71,20 +92,56 @@ def update_metadata(
     output_dir: Path, dry_run: bool, yes: bool, output_override: str | None,
 ) -> int:
     backend = BenchmarkBackend(state.service().kubernetes_backend())
-    runs = select_refresh_runs(backend, namespace, run_ids, pool, max_runs)
-    if runs and not dry_run:
-        confirm_plans([OperationPlan("healthcheck-metadata", run.run_id) for run in runs], namespace, yes)
-        workflow = BenchmarkWorkflow(backend, EvidenceStore(output_dir))
-        runs = tuple(workflow.refresh(namespace, run.run_id, expected_uid=run.uid or "") for run in runs)
+    runs = refresh_metadata_pass(backend, namespace, run_ids, pool, max_runs, output_dir, dry_run, yes)
     print_records([run_summary(run) for run in runs], resolve_output(state, output_override), RUN_COLUMNS)
     return SUCCESS
 
 
-def healthcheck_service(name: str, category: Literal["active", "multi-node"]) -> click.Command:
+def run_healthcheck_pass(
+    state: CliState, requested: HealthcheckRequest, policy: ServicePolicy, options: ExecutionOptions,
+    output_dir: Path, dry_run: bool, yes: bool, wait: bool, observation_timeout: int,
+) -> tuple[list[dict[str, Any]], int]:
+    service = state.service()
+    snapshot = service.discover()
+    print_discovery_warnings(snapshot.warnings)
+    selected = select_healthcheck_nodes(snapshot, requested)
+    pools = {node.pool_name for node in selected}
+    candidates = tuple(node for node in snapshot.nodes if node.pool_name in pools) if requested.nodes and requested.check_type == "multi-node" else selected
+    backend = BenchmarkBackend(service.kubernetes_backend())
+    nodes, pods = backend.read_allocation_inventory(tuple(node.k8s_name for node in candidates))
+    selection = select_service_plan(snapshot, requested, policy, nodes, pods, backend.list_runs(None), datetime.now(timezone.utc))
+    rows: list[dict[str, Any]] = [{"record_type": "eligibility", **asdict(decision)} for decision in selection.decisions]
+    if selection.plan is None:
+        return rows, SUCCESS
+    workflow = BenchmarkWorkflow(backend, EvidenceStore(output_dir))
+    prepared = workflow.prepare(selection.plan, options)
+    operation = OperationPlan("healthcheck-service", prepared.record.run_id, warnings=tuple([
+        *selection.plan.warnings, *prepared.capabilities.warnings,
+        "Each selected test allocates all GPUs; host/VF RDMA profiles are privileged.",
+        "Submission is not a pass. Use health wait to advance pending cases and enforce deadlines.",
+    ]))
+    if dry_run:
+        print_plan_warnings([operation])
+        rows.extend({"record_type": "planned-case", **row} for row in case_rows(prepared.record))
+        return rows, SUCCESS
+    for decision in selection.decisions:
+        click.echo(f"{decision.node}: {decision.state}: {decision.reason}", err=True)
+    for case in selection.plan.cases:
+        click.echo(f"{case.case_id}: {', '.join(node.name for node in case.nodes)}", err=True)
+    confirm_plans([operation], prepared.record.run_id, yes)
+    run = workflow.submit(prepared)
+    click.echo(f"Recorded service run: {run.run_id}; reconnect with health wait {run.run_id}.", err=True)
+    if wait:
+        run = workflow.wait(requested.namespace, run.run_id, observation_timeout=observation_timeout)
+    rows.append({"record_type": "run", **run_summary(run)})
+    return rows, benchmark_exit_code(run) if wait else SUCCESS
+
+
+def healthcheck_service(name: str, category: Literal["active", "multi-node"] | None) -> click.Command:
     @click.command(name, help="Run one bounded eligibility-based NCCL service pass. No recurring schedule is installed; ineligible nodes are reported, never forced.")
     @node_selector_options
     @click.option("--pool", help="Bound candidates to this worker pool.")
-    @click.option("--checks", required=True, type=click.Choice(["nccl"]), help="Explicit diagnostic subset; full host suites are not yet available.")
+    @click.option("--checks", required=category is not None, type=click.Choice(["nccl"]), help="Required for GPU handlers; full host suites are not yet available.")
     @namespace_option
     @click.option("--queue", help="Existing Kueue LocalQueue.")
     @click.option("--scheduler", type=click.Choice(["auto", "direct", "kueue"]), default="auto", show_default=True)
@@ -109,61 +166,73 @@ def healthcheck_service(name: str, category: Literal["active", "multi-node"]) ->
     @output_option
     @pass_state
     def command(
-        state: CliState, node_values: tuple[str, ...], fields: str | None, pool: str | None, checks: str,
+        state: CliState, node_values: tuple[str, ...], fields: str | None, pool: str | None, checks: str | None,
         namespace: str, queue: str | None, scheduler: str, network: str, network_attachment: str,
         image: str | None, environment: tuple[str, ...], iterations: int, warmup_iterations: int,
         min_bus_bandwidth: float | None, interval_hours: int, retry_seconds: int, max_cases: int,
         queue_timeout: int, startup_timeout: int, timeout: int, wait: bool, observation_timeout: int,
         output_dir: Path, dry_run: bool, yes: bool, output_override: str | None,
+        enabled: tuple[str, ...] = (), max_runs: int = 32,
     ) -> int:
-        requested = HealthcheckRequest(nodes=node_values, fields=fields, pool=pool, check_type=category, checks=(checks,),
-                                       namespace=namespace, queue=queue, scheduler=cast(Scheduler, scheduler), network=cast(Network, network),
-                                       image=image, environment=environment, parameters=BenchmarkParameters(iterations=iterations,
-                                       warmup_iterations=warmup_iterations, min_bus_bandwidth=min_bus_bandwidth))
-        requested.validate()
+        handlers = ordered_service_handlers(enabled) if category is None else ("active-hc" if category == "active" else "multi-node-hc",)
+        if category is None and (not pool or node_values or fields):
+            raise BenchmarkError("services all requires --pool; use individual services for --nodes or --fields.")
+        requests: dict[str, HealthcheckRequest] = {}
+        for handler in handlers:
+            if handler == "update-metadata":
+                continue
+            stage = "active" if handler == "active-hc" else "multi-node"
+            requested = HealthcheckRequest(nodes=node_values, fields=fields, pool=pool, check_type=cast(Literal["active", "multi-node"], stage),
+                                           checks=(checks,) if checks else (), namespace=namespace, queue=queue, scheduler=cast(Scheduler, scheduler),
+                                           network="local" if category is None and stage == "active" else cast(Network, network),
+                                           image=image, environment=environment, parameters=BenchmarkParameters(iterations=iterations,
+                                           warmup_iterations=warmup_iterations, min_bus_bandwidth=min_bus_bandwidth))
+            requested.validate()
+            requests[handler] = requested
         policy = ServicePolicy(interval_seconds=interval_hours * 3600, retry_seconds=retry_seconds, max_cases=max_cases)
         policy.validate()
-        service = state.service()
-        snapshot = service.discover()
-        print_discovery_warnings(snapshot.warnings)
-        selected = select_healthcheck_nodes(snapshot, requested)
-        pools = {node.pool_name for node in selected}
-        candidates = tuple(node for node in snapshot.nodes if node.pool_name in pools) if node_values and category == "multi-node" else selected
-        backend = BenchmarkBackend(service.kubernetes_backend())
-        nodes, pods = backend.read_allocation_inventory(tuple(node.k8s_name for node in candidates))
-        selection = select_service_plan(snapshot, requested, policy, nodes, pods, backend.list_runs(None), datetime.now(timezone.utc))
-        rows = [{"record_type": "eligibility", **asdict(decision)} for decision in selection.decisions]
+        options = ExecutionOptions(1, queue_timeout, startup_timeout, timeout, network_attachment)
+        options.validate()
         output = resolve_output(state, output_override)
-        if selection.plan is None:
-            print_records(rows, output, ["node", "state", "reason", "prior_run", "partner"])
-            return SUCCESS
-        workflow = BenchmarkWorkflow(backend, EvidenceStore(output_dir))
-        prepared = workflow.prepare(selection.plan, ExecutionOptions(1, queue_timeout, startup_timeout, timeout, network_attachment))
-        operation = OperationPlan("healthcheck-service", prepared.record.run_id, warnings=tuple([
-            *selection.plan.warnings, *prepared.capabilities.warnings,
-            "Each selected test allocates all GPUs; host/VF RDMA profiles are privileged.",
-            "Submission is not a pass. Use health wait to advance pending cases and enforce deadlines.",
-        ]))
-        if dry_run:
-            print_plan_warnings([operation])
-            rows.extend({"record_type": "planned-case", **row} for row in case_rows(prepared.record))
-            print_records(rows, output, ["record_type", "node", "case", "state", "nodes", "reason"])
-            return SUCCESS
-        for decision in selection.decisions:
-            click.echo(f"{decision.node}: {decision.state}: {decision.reason}", err=True)
-        for case in selection.plan.cases:
-            click.echo(f"{case.case_id}: {', '.join(node.name for node in case.nodes)}", err=True)
-        confirm_plans([operation], prepared.record.run_id, yes)
-        run = workflow.submit(prepared)
-        click.echo(f"Recorded service run: {run.run_id}; reconnect with health wait {run.run_id}.", err=True)
-        if wait:
-            run = workflow.wait(namespace, run.run_id, observation_timeout=observation_timeout)
-        rows.append({"record_type": "run", **run_summary(run)})
-        print_records(rows, output, ["record_type", "node", "run_id", "state", "outcome", "reason"])
-        return benchmark_exit_code(run) if wait else SUCCESS
+        rows: list[dict[str, Any]] = []
+        code = SUCCESS
+        try:
+            for handler in handlers:
+                if code != SUCCESS:
+                    rows.append({"service": handler, "record_type": "service", "state": "NOT_RUN",
+                                 "reason": "An earlier waited handler did not succeed; no further submissions."})
+                    continue
+                if handler == "update-metadata":
+                    backend = BenchmarkBackend(state.service().kubernetes_backend())
+                    runs = refresh_metadata_pass(backend, namespace, (), pool, max_runs, output_dir, dry_run, yes)
+                    current: list[dict[str, Any]] = [{"record_type": "metadata", **run_summary(run)} for run in runs] or [
+                        {"record_type": "service", "state": "NO_MATCHES", "reason": "No nonterminal recorded runs match this pool and namespace."},
+                    ]
+                else:
+                    current, code = run_healthcheck_pass(state, requests[handler], policy, options, output_dir,
+                                                        dry_run, yes, wait, observation_timeout)
+                rows.extend({"service": handler, **row} if category is None else row for row in current)
+        except BenchmarkError as exc:
+            if category is None:
+                rows.append({"service": handler, "record_type": "service", "state": "ERROR", "reason": str(exc)})
+            raise
+        finally:
+            print_records(rows, output, (["service"] if category is None else []) + [
+                "record_type", "node", "run_id", "case", "state", "outcome", "reason",
+            ])
+        return code
 
+    if category is None:
+        command.help = "Run explicitly enabled handlers once in metadata, active, multi-node order. Requires --pool; no schedule or cooldown sleep is installed."
+        command.params.extend([
+            click.Option(["--enable", "enabled"], type=click.Choice(SERVICE_ORDER), multiple=True, required=True,
+                         help="Enable only this handler; repeat for additional handlers."),
+            click.Option(["--max-runs"], type=click.IntRange(1, 128), default=32, show_default=True,
+                         help="Bound the metadata handler's matching checkpoints."),
+        ])
     return command
 
 
 services.add_command(healthcheck_service("active-hc", "active"))
 services.add_command(healthcheck_service("multi-node-hc", "multi-node"))
+services.add_command(healthcheck_service("all", None))

@@ -335,12 +335,26 @@ class BenchmarkWorkflow:
                     continue
                 run = self._snapshot(run, case, evidence, lease, cancelling=True)
                 lease.renew()
-                if not evidence.suspended:
-                    self.backend.cancel_job(run, case, evidence_resource_version=evidence.job_resource_version)
-                    continue
+                if not evidence.suspended or run.plan.request.queue:
+                    changed = self.backend.cancel_job(run, case, evidence_resource_version=evidence.job_resource_version)
+                    if changed or not evidence.suspended:
+                        continue
                 if not self.backend.case_pods_absent(run, case):
+                    saved = _saved(run, case)
+                    for digest in {saved.evidence_sha256, *(snapshot.sha256 for snapshot in saved.snapshots)}:
+                        if not digest:
+                            raise BenchmarkError("Cancellation deletion requires verified exported evidence.")
+                        self.store.verify(run, case, digest)
+                    if not saved.cancellation_delete_requested:
+                        lease.renew()
+                        run = self.backend.save_run(run.update_case(case.case_id, saved.state,
+                                                                   cancellation_delete_requested=True))
+                    lease.renew()
+                    self.backend.delete_job(run, case, evidence_resource_version=evidence.job_resource_version, cancelling=True)
                     continue
             elif not self.backend.case_pods_absent(run, case):
+                if saved.cancellation_delete_requested:
+                    continue
                 raise BenchmarkError("MPIJob disappeared but Pods remain; cannot confirm cancellation.")
             saved = _saved(run, case)
             if saved.job_uid and not saved.evidence_sha256:

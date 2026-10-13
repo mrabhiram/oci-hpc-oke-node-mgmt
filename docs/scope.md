@@ -135,9 +135,9 @@ Management Tool.
 - [`kubernetes-upgrades.md`](kubernetes-upgrades.md)
 
 The NCCL preview includes one-shot `services update-metadata` observations and
-bounded eligibility-based `services active-hc` / `multi-node-hc` passes.
-Combined `services all`, full diagnostic coverage, and recurring scheduling
-remain unfinished. See [profile coverage](nccl-profile-coverage.md) for shape
+bounded eligibility-based `services active-hc` / `multi-node-hc` passes, with
+explicitly enabled `services all` orchestration. Full diagnostic coverage and
+recurring scheduling remain unfinished. See [profile coverage](nccl-profile-coverage.md) for shape
 and transport implementation versus live validation.
 
 ## Not Implemented Yet

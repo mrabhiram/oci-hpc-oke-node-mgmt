@@ -23,6 +23,26 @@ def record() -> RunRecord:
 
 
 class BenchmarkRecordTests(unittest.TestCase):
+    def test_cancellation_deletion_intent_roundtrips_and_cannot_be_forged_or_cleared(self) -> None:
+        initial = record()
+        case = initial.cases[0].case_id
+        with self.assertRaisesRegex(BenchmarkError, "Persist cancellation"):
+            initial.update_case(case, "PLANNED", cancellation_delete_requested=True)
+        cancelling = mark_cancelling(initial.update_case(case, "SUBMITTING").update_case(
+            case, "QUEUED", job_uid="job-uid", evidence_sha256="a" * 64))
+        marked = cancelling.update_case(case, "QUEUED", cancellation_delete_requested=True)
+        self.assertTrue(decode_record(marked.payload(), uid="uid", resource_version="1").cases[0].cancellation_delete_requested)
+        with self.assertRaisesRegex(BenchmarkError, "cannot be cleared"):
+            marked.update_case(case, "QUEUED", cancellation_delete_requested=False)
+        old = json.loads(initial.payload())
+        for saved in old["cases"]:
+            saved.pop("cancellation_delete_requested")
+        self.assertFalse(decode_record(json.dumps(old), uid="uid", resource_version="1").cases[0].cancellation_delete_requested)
+        malformed = json.loads(marked.payload())
+        malformed["cases"][0]["cancellation_delete_requested"] = "true"
+        with self.assertRaisesRegex(BenchmarkError, "Cancellation deletion"):
+            decode_record(json.dumps(malformed), uid="uid", resource_version="1")
+
     def test_service_policy_and_profile_identity_roundtrip_with_legacy_defaults(self) -> None:
         initial = record()
         initial = replace(initial, plan=replace(initial.plan, service_policy=ServicePolicy()))

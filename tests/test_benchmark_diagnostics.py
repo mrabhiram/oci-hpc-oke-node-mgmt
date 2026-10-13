@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import unittest
 from dataclasses import asdict, replace
+from typing import Any
 from unittest.mock import Mock, patch
 
 from kubernetes.client import ApiClient
@@ -24,18 +25,18 @@ class SchedulingEvidenceTests(unittest.TestCase):
         self.collector = SchedulingCollector(self.backend)
         initial = record()
         self.case = initial.plan.cases[0]
-        self.run = replace(initial, plan=replace(initial.plan, request=replace(initial.plan.request, queue="test-queue")))
-        self.run = self.run.update_case(self.case.case_id, "SUBMITTING").update_case(self.case.case_id, "QUEUED", job_uid="job-uid")
-        self.workload = {
+        self.checkpoint = replace(initial, plan=replace(initial.plan, request=replace(initial.plan.request, queue="test-queue")))
+        self.checkpoint = self.checkpoint.update_case(self.case.case_id, "SUBMITTING").update_case(self.case.case_id, "QUEUED", job_uid="job-uid")
+        self.workload: dict[str, Any] = {
             "metadata": {"name": "test-workload", "namespace": "default", "uid": "workload-uid", "resourceVersion": "42",
                          "annotations": {"unrelated": "not exported"}, "ownerReferences": [{
                              "apiVersion": "kubeflow.org/v2beta1", "kind": "MPIJob", "controller": True,
-                             "name": case_name(self.run.run_id, self.case), "uid": "job-uid",
+                             "name": case_name(self.checkpoint.run_id, self.case), "uid": "job-uid",
                          }]},
             "spec": {"queueName": "test-queue", "podSets": ["not exported"]},
             "status": {"conditions": [{"type": "QuotaReserved", "status": "False", "reason": "Pending", "message": "untolerated GPU taint"}]},
         }
-        self.event = {
+        self.event: dict[str, Any] = {
             "metadata": {"name": "test-event", "namespace": "default", "uid": "event-uid", "resourceVersion": "43"},
             "involvedObject": {"kind": "Workload", "name": "test-workload", "namespace": "default", "uid": "workload-uid"},
             "reason": "Pending", "message": "could not assign launcher flavor", "type": "Warning", "count": 1,
@@ -47,7 +48,7 @@ class SchedulingEvidenceTests(unittest.TestCase):
         }
 
     def collect(self) -> SchedulingEvidence:
-        return self.collector.collect(self.run, self.case, "job-uid", (("worker", "pod-uid"),))
+        return self.collector.collect(self.checkpoint, self.case, "job-uid", (("worker", "pod-uid"),))
 
     def test_uid_owned_workload_conditions_and_events_are_exportable(self) -> None:
         value = self.collect()
@@ -56,6 +57,7 @@ class SchedulingEvidenceTests(unittest.TestCase):
         self.assertNotIn("spec", value.workloads[0])
         self.assertNotIn("annotations", value.workloads[0]["metadata"])
         self.assertEqual(64, len(value.signature()))
+        self.assertTrue(value.workloads[0]["active"])
         self.assertEqual(f"{JOB_UID_LABEL}=job-uid", self.backend.custom.list_namespaced_custom_object.call_args.kwargs["label_selector"])
         self.assertEqual("v1beta2", self.backend.custom.list_namespaced_custom_object.call_args.args[1])
         self.assertEqual(3, self.backend.core.list_namespaced_event.call_count)
@@ -63,8 +65,18 @@ class SchedulingEvidenceTests(unittest.TestCase):
         for call in self.backend.custom.mock_calls + self.backend.core.mock_calls:
             self.assertTrue(str(call).startswith("call.list_"))
 
+    def test_active_state_is_preserved_and_changes_scheduling_signature(self) -> None:
+        active = self.collect()
+        self.workload["spec"]["active"] = False
+        inactive = self.collect()
+        self.assertFalse(inactive.workloads[0]["active"])
+        self.assertNotEqual(active.signature(), inactive.signature())
+        self.workload["spec"]["active"] = "false"
+        with self.assertRaisesRegex(BenchmarkError, "Invalid Kueue"):
+            self.collect()
+
     def test_direct_execution_collects_events_without_querying_kueue(self) -> None:
-        self.run = replace(self.run, plan=replace(self.run.plan, request=replace(self.run.plan.request, queue=None)))
+        self.checkpoint = replace(self.checkpoint, plan=replace(self.checkpoint.plan, request=replace(self.checkpoint.plan.request, queue=None)))
         self.assertEqual((), self.collect().workloads)
         self.backend.custom.list_namespaced_custom_object.assert_not_called()
         self.backend.client.ApiextensionsV1Api().read_custom_resource_definition.assert_not_called()
@@ -149,4 +161,4 @@ class SchedulingEvidenceTests(unittest.TestCase):
 
     def test_unrecorded_job_is_not_accepted(self) -> None:
         with self.assertRaisesRegex(BenchmarkError, "recorded MPIJob UID"):
-            self.collector.collect(self.run, self.case, "foreign-job", ())
+            self.collector.collect(self.checkpoint, self.case, "foreign-job", ())
