@@ -279,6 +279,12 @@ Before either managed or self-managed termination, the default workflow:
 `--no-drain` bypasses steps 2, 5, and 6 and requires `--allow-workloads` when
 ordinary workload pods remain.
 
+Post-submission waiting distinguishes removal from replacement. Decrementing
+termination verifies selected Kubernetes/OCI membership absence, original pool
+identity, and reduced desired/active OCI counts. Surviving worker readiness is
+informational. `--keep-size` retains the full replacement GPU/RDMA/Ready gate.
+Incomplete discovery and known failed work requests cannot establish success.
+
 ### Customer-Reported Unhealthy Host Tagging
 
 Node termination accepts `--tag unhealthy` or `--tag none`. When the option is

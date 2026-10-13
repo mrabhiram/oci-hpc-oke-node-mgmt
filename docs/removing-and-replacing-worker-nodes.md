@@ -203,6 +203,19 @@ Ready count, and applicable GPU, RDMA topology, and RDMA VF counts to converge.
 When OCI returns work-request identifiers, the waiter monitors each request and
 reports a failed or canceled operation immediately.
 
+Without `--keep-size`, the wait instead confirms that selected workers are
+absent from Kubernetes and observed OCI pool membership, and that desired
+capacity and active OCI count match the reduced target. It does not wait for
+surviving workers to register, become Ready, or advertise GPU/RDMA resources.
+Their readiness remains visible in progress output; mismatches are reported
+separately and do not change a completed removal into a replacement wait.
+Unknown OCI counts, incomplete discovery, changed pool identity, and failed
+work requests still prevent verified completion.
+
+`--no-wait` returns after submission; it does not certify deletion completion.
+Interrupting a post-submission wait stops observation without rolling back the
+OCI operation. Do not rerun termination on a worker already removed.
+
 ## Managed OKE Eviction Options
 
 Managed OKE deletion uses a default eviction grace duration of `PT10M`.

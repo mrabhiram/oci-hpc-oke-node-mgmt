@@ -244,6 +244,31 @@ Use `--tag none` only when the removal is not reporting an unhealthy host. In
 noninteractive use, provide either `--tag unhealthy` or `--tag none`; `--yes`
 does not answer the health question.
 
+## Node Termination Wait Does Not Exit
+
+Check the last progress line. If the selected node is absent and desired and
+active OCI counts match the reduced target, an older waiter can still remain
+blocked by a surviving worker's GPU/RDMA or Ready-count mismatch. It used the
+same full-pool readiness gate for removal and replacement.
+
+The corrected non-replacement wait checks deletion and reduced capacity,
+while reporting unrelated worker readiness separately. `--keep-size` still
+waits for replacement readiness. Kubernetes registration and readiness counts
+are shown independently in progress output.
+
+If deletion is already confirmed, Ctrl+C stops local observation without
+rolling back OCI termination. Do not resubmit termination for that node.
+Inspect the remaining pool and its GPU readiness independently:
+
+```bash
+mgmt-oke --auth instance_principal pools get <pool-name>
+mgmt-oke --auth instance_principal health run --type gpu --pool <pool-name>
+```
+
+For future operations, `--no-wait` returns after submission, not verified
+completion. Discovery errors, unknown OCI counts, changed pool identity, and
+failed work requests still require inspection; do not treat them as success.
+
 ## Mutation Lease Is Held
 
 Every mutation uses `kube-system/mgmt-oke-mutation` by default. An error naming

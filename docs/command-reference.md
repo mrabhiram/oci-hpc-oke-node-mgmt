@@ -480,6 +480,12 @@ mgmt-oke nodes terminate <node-name-or-ip> --tag none --dry-run
 mgmt-oke nodes terminate <node-name-or-ip> --tag none --wait
 ```
 
+For removal without replacement, `--wait` verifies selected-worker absence and
+reduced OCI capacity. Surviving worker GPU, RDMA, and Kubernetes readiness is
+reported but does not gate removal completion. With `--keep-size`, replacement
+readiness remains required. See [Removing and Replacing Worker
+Nodes](removing-and-replacing-worker-nodes.md#step-5-verify-the-result).
+
 Report an unhealthy host, then terminate and replace it while preserving
 desired capacity:
 

@@ -1234,6 +1234,7 @@ def execute_node_removal(
                 ),
                 work_request_watches=work_request_watches,
                 progress=progress,
+                require_replacement_ready=not prepared.decrement_size,
             )
             status = "removed"
 
@@ -1985,6 +1986,8 @@ def wait_for_nodes_removed(
     work_request_ids: tuple[str, ...] = (),
     work_request_watches: tuple[ResourceWorkRequestWatch, ...] = (),
     progress: Callable[[str], None] | None = None,
+    *,
+    require_replacement_ready: bool = True,
 ) -> dict[str, WorkerPoolInfo]:
     deadline = time.monotonic() + timeout_seconds
     last_status = ""
@@ -1996,34 +1999,63 @@ def wait_for_nodes_removed(
             work_request_watches,
         )
         snapshot = service.discover()
+        if not snapshot.oci_discovery_enabled or not snapshot.kubernetes_discovery_enabled or snapshot.warnings:
+            raise WorkflowError(
+                "Cannot verify node removal with incomplete OCI/Kubernetes discovery. "
+                "The submitted deletion is not rolled back; inspect its state before retrying. "
+                + "; ".join(snapshot.warnings)
+            )
         present = [
             node.k8s_name
             for node in nodes
             if snapshot.node_by_identifier(node.k8s_name)
             or snapshot.node_by_identifier(node.instance_ocid or "")
+            or (node.instance_ocid is not None and any(
+                node.instance_ocid in pool.oci_instance_ids for pool in snapshot.pools
+            ))
         ]
         observed: dict[str, WorkerPoolInfo] = {}
         pool_states: list[str] = []
+        readiness_mismatches: list[str] = []
         ready = True
         for pool_name, target_size in target_sizes.items():
             pool = snapshot.pool_by_name(pool_name)
             if pool is None:
                 raise WorkflowError(f"Pool disappeared while waiting: {pool_name}")
+            original = original_pools[pool_name]
+            if pool.kind != original.kind or pool.backing_id != original.backing_id:
+                raise WorkflowError(f"Owning pool identity changed while waiting: {pool_name}")
             pool.rdma_vf_required = (
                 pool.rdma_vf_required or original_pools[pool_name].rdma_vf_required
             )
             readiness = pool_resource_readiness(snapshot, pool)
+            registered = sum(node.pool_name == pool.name for node in snapshot.nodes)
             observed[pool_name] = pool
             pool_states.append(
                 f"{pool_name}[desired={pool.desired_size},oci_active={pool.active_oci_instances},"
-                f"k8s_ready={pool.ready_k8s_nodes}{readiness_status(readiness)}]"
+                f"k8s_registered={registered},k8s_ready={pool.ready_k8s_nodes}{readiness_status(readiness)}]"
             )
-            ready = ready and _pool_matches_target(pool, readiness, target_size)
+            if require_replacement_ready:
+                pool_ready = _pool_matches_target(pool, readiness, target_size)
+            else:
+                # Removal verifies capacity and membership, not the health of surviving workers.
+                pool_ready = (
+                    pool.desired_size == target_size
+                    and pool.active_oci_instances == target_size
+                )
+                if pool.ready_k8s_nodes != target_size or not resource_counts_match(readiness, target_size):
+                    readiness_mismatches.append(pool_name)
+            ready = ready and pool_ready
         status = f"nodes_present={','.join(present) or '-'} " + " ".join(pool_states)
         if progress and status != last_status:
             progress(status)
             last_status = status
         if not present and ready:
+            if progress and readiness_mismatches:
+                progress(
+                    "Removal and reduced capacity converged; remaining worker readiness "
+                    "differs from target in " + ", ".join(readiness_mismatches) + ". Check health separately."
+                )
             return observed
         if time.monotonic() >= deadline:
             raise TimeoutError(
