@@ -81,6 +81,16 @@ class NcclResultTests(unittest.TestCase):
         self.assertEqual("INCOMPLETE", verdict(disabled).status)
         self.assertEqual("INCOMPLETE", verdict(SYNTHETIC_OUTPUT.replace("201 42.0 42.0 0", "201")).status)
 
+    def test_debug_interleaved_into_a_measurement_is_not_silently_reconstructed(self) -> None:
+        output = SYNTHETIC_OUTPUT.replace(
+            "1073741824 float sum -1 100",
+            "1073741824 float sum -1gpu-a:100:100 [0] NCCL INFO Symmetric VA size=40GB\n100",
+        )
+        result = verdict(output)
+        self.assertEqual("INCOMPLETE", result.status)
+        self.assertEqual("UNVERIFIED", result.correctness)
+        self.assertIn("Truncated or unsupported NCCL measurement row.", result.reasons)
+
     def test_node_replacement_missing_extra_or_duplicate_worker_invalidates_coverage(self) -> None:
         for observed in (NODES[:1], (*NODES, NODES[0]), (("gpu-a", "new-uid"), NODES[1])):
             with self.subTest(observed=observed):

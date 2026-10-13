@@ -217,7 +217,7 @@ def node_healthchecks(
     prepared = workflow.prepare(plan, options)
     warnings = [*plan.warnings, *prepared.capabilities.warnings,
                 "Active NCCL tests allocate every GPU on each displayed participant; host/VF RDMA workers are privileged.",
-                "Submission is not a passed benchmark. Pending cases and queue deadlines need an active health wait/service caller."]
+                "Submission is not a passed benchmark. Pending cases and queue deadlines need an active health wait caller."]
     if check_type == "all":
         warnings.append("The passive stage currently covers API readiness only; this is an NCCL subset, not full Slurm diagnostic parity.")
     operation = OperationPlan("healthcheck-submit", prepared.record.run_id, warnings=tuple(warnings))

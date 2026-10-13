@@ -14,6 +14,9 @@
 - An initial submission can leave planned cases pending. `health logs --follow`
   only reads logs. Use `health wait <run-id>` to advance the recorded run and
   enforce client-side queue deadlines.
+- `services update-metadata` only exports observations and updates checkpoints.
+  It does not start pending cases, enforce deadlines, or clean up resources.
+  A successful refresh is not a successful benchmark; inspect the case verdicts.
 - After a lost response, inspect or wait on the same run ID. Do not create a
   second run merely because the first invocation lost its connection.
 - Evidence-export failures retain workloads. Verify operator storage and use
@@ -25,6 +28,18 @@
 - Worker DNS or SSH startup failures are retried only within the startup deadline.
   Persistent failures remain failed/incomplete tests; the launcher never disables
   strict host-key checking or replaces its pinned key to make a connection succeed.
+- Each worker address is resolved once and recorded as `MGMT_MPI_WORKER_ADDRESS`
+  before SSH readiness. MPI uses a run-local SSH mapping to that address. Duplicate
+  worker addresses are rejected. A replaced worker or changed host key is not
+  silently adopted; retain the run and inspect its ownership and coverage evidence.
+- A truncated measurement row is incomplete evidence even if another row and the
+  average bandwidth are present. Per-rank NCCL diagnostics are retained separately
+  during execution and emitted after the rank exits, avoiding table interleaving.
+  A missing, empty, or oversized diagnostic file fails execution; historical torn
+  rows are not repaired or reclassified as passing results.
+- A job that finishes during evidence collection is observed again before grading.
+  Keep `health wait` running, or repeat the metadata refresh, to collect the stable
+  final snapshot. A completion condition without the launcher exit is insufficient.
 - `--keep-resources` retains workers that can block later overlapping cases.
   Resume `health wait` without that flag to release completed resources and
   continue. `health cleanup` requires all cases to be terminal.

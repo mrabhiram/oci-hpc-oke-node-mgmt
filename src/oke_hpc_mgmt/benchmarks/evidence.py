@@ -53,10 +53,20 @@ class CaseEvidence:
     pods: tuple[PodEvidence, ...]
     warnings: tuple[str, ...]
     scheduling: SchedulingEvidence = SchedulingEvidence()
+    observation_stable: bool = True
 
     @property
     def coverage_complete(self) -> bool:
         return not self.warnings and bool(self.pods) and all(not pod.warnings for pod in self.pods)
+
+    @property
+    def terminal_observation_ready(self) -> bool:
+        if not self.observation_stable:
+            return False
+        if self.failed:
+            return True
+        launchers = [pod for pod in self.pods if pod.role == "launcher"]
+        return self.succeeded and len(launchers) == 1 and launchers[0].exit_code is not None
 
 
 def _controller(metadata: dict[str, Any], kind: str, api_version: str) -> dict[str, Any]:
@@ -259,7 +269,8 @@ class EvidenceCollector:
         if final is None or final["metadata"]["uid"] != saved.job_uid:
             raise BenchmarkError("MPIJob disappeared or was replaced during evidence collection.")
         warnings: list[str] = []
-        if final.get("status") != job.get("status") or final.get("spec") != job.get("spec"):
+        stable = final.get("status") == job.get("status") and final.get("spec") == job.get("spec")
+        if not stable:
             warnings.append("MPIJob changed during collection; refresh before assessing success.")
         workers = [pod for pod in evidence if pod.role == "worker"]
         launchers = [pod for pod in evidence if pod.role == "launcher"]
@@ -278,7 +289,7 @@ class EvidenceCollector:
         if suspended:
             warnings.append("MPIJob is suspended; historical conditions do not prove this attempt completed.")
         return CaseEvidence(case.case_id, saved.job_uid, final["metadata"]["resourceVersion"], succeeded, failed, suspended,
-                            evidence, tuple(warnings), scheduling)
+                            evidence, tuple(warnings), scheduling, stable)
 
 
 def assess_case(

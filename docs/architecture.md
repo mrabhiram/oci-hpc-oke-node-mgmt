@@ -703,6 +703,10 @@ identities, complete logs, rank placement, correctness, and transport. Private
 content-addressed exports are verified before suspension or deletion. Cleanup
 uses UID/resource-version preconditions and confirms MPIJob/Pod absence; the
 original result digest is not overwritten by later cleanup observations.
+Terminal results require an unchanged MPIJob specification/status across evidence
+collection and an observed launcher exit for successful jobs. A completion that
+races with log collection is exported as an intermediate snapshot and observed
+again before grading. Cleanup also refuses a changing observation.
 Scheduling evidence includes bounded Kueue Workload status and events selected
 by verified object UID. Workload labels narrow discovery but never substitute
 for controller ownership checks. Admission changes produce distinct snapshots;
@@ -713,3 +717,22 @@ holding the Lease between polls. Read-only commands never submit tests. No
 background controller is installed; service scheduling and the remaining
 diagnostic adapters are still under development. See
 [NCCL Healthchecks](nccl-healthchecks.md) for operational behavior and limitations.
+
+`services update-metadata` uses a separate observation-only workflow under the
+same Lease. It rechecks the selected checkpoint UID, recovers verified accepted
+submissions, and exports/assesses existing attempts. It never calls workload
+creation, cancellation, deletion, or deadline enforcement. Unsubmitted cases and
+cancellation intent are left for their explicit execution workflows.
+
+The launcher resolves each worker within its bounded startup interval, then
+records a run-local SSH address mapping and pins its host keys. Subsequent SSH
+launches use that address instead of depending on another DNS lookup during
+CoreDNS negative-cache propagation. FQDN preservation and direct launcher SSH
+spawning are configured for both ORTE and PRRTE; keys are not redistributed to
+workers. MPI hostfile names and identity/coverage validation remain unchanged.
+
+Each MPI rank directs NCCL diagnostics to a private, unique container-local file,
+then emits that file after its benchmark process exits. This prevents initialization
+messages from interrupting partially printed measurement rows. Per-rank diagnostic
+exports are limited to 1 MiB; missing/oversized diagnostics fail the rank rather
+than silently dropping evidence. The parser continues to reject torn rows.

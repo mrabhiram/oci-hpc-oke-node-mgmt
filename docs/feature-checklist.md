@@ -200,12 +200,14 @@ the complete delivery requirements.
 | --- | --- | --- |
 | `nodes healthchecks` selection, passive default, explicit NCCL subset | Preview implemented | Automated CLI/parser tests; live submission |
 | Single-node, anchor-pair, exact-set, whole-pool, local-block planning | Preview implemented | Automated planning and manifest tests; live selected-node API preflight |
-| MPI Operator and existing Kueue admission | Preview implemented | Live admission exposed and verified a launcher-toleration fix; GPU execution validation remains separate |
+| MPI Operator and existing Kueue admission | Preview implemented | Live single-A100 execution through an existing topology-aware queue; no queue-policy changes |
 | `health profiles/list/get/results/logs/wait/cancel/cleanup` | Preview implemented | Automated CLI/workflow tests; live deadline handling and cleanup |
 | Ownership-bound logs, Kueue status, events, immutable private exports | Preview implemented | Automated identity, bounds, failure, and cleanup tests |
-| Full Slurm diagnostic parity and service handlers | In progress | NCCL alone does not cover passive host diagnostics, stress/SDC, or separate IB tests |
+| `services update-metadata` observation-only pass | Preview implemented | Automated selection, identity, confirmation, and no-workload-mutation tests; live evidence refresh |
+| Full Slurm diagnostic parity and eligibility-based service handlers | In progress | NCCL alone does not cover passive host diagnostics, stress/SDC, or separate IB tests |
 | RCCL, Slinky reservations, specialized transports, periodic execution | Not yet implemented | Requests requiring these adapters are rejected |
-| Live single-node, multi-node, whole-pool, local-block, and cross-block success | Incomplete | Submission/admission is not proof of benchmark completion |
+| Live single-node NCCL success | Validated on BM.GPU4.8 | Eight A100 ranks; correctness and coverage PASS; local transport; performance UNGRADED |
+| Live multi-node, whole-pool, local-block, and cross-block success | Incomplete | Single-node success does not establish RDMA or complete validation coverage |
 
 ## Proposed
 

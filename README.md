@@ -174,6 +174,7 @@ Command groups:
 | `health run` | Run deterministic health checks by category or pool. |
 | `health profiles\|list\|get\|results\|logs` | Inspect NCCL profiles, recorded runs, verdicts, and owned logs without submitting workloads. |
 | `health wait\|cancel\|cleanup <run-id>` | Advance an existing NCCL run, cancel owned workloads, or verify evidence and clean up terminal resources. |
+| `services update-metadata` | Refresh recorded healthcheck evidence once without submitting, cancelling, or deleting workloads. |
 | `recommendations list` | Show actionable warnings and failures. |
 | `reconcile` | Show a full discovery snapshot. |
 | `upgrades status [--to <version>]` | Show current and target versions, add-on compatibility, scheduler state, and supported strategies. |
@@ -726,6 +727,10 @@ participant is retained; tests allocate all its physical GPUs. Submission alone
 does not establish a passing benchmark. Without `--wait`, use `health wait` to
 advance pending cases and collect evidence. Existing MPI Operator/Kueue resources
 are required; the tool does not install operators or change shared queues.
+
+Use `services update-metadata --run-id <run-id> --yes` for an observation-only
+pass. It updates checkpoints and private evidence, but does not advance pending
+cases, enforce deadlines, or clean up workloads. `health wait` handles those steps.
 
 See [NCCL Healthchecks](docs/nccl-healthchecks.md) for selection, profiles,
 permissions, result interpretation, cancellation, and evidence-preserving cleanup.

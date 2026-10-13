@@ -134,6 +134,10 @@ Management Tool.
 - [`replacing-worker-boot-volumes.md`](replacing-worker-boot-volumes.md)
 - [`kubernetes-upgrades.md`](kubernetes-upgrades.md)
 
+The NCCL preview includes one-shot `services update-metadata` observations.
+Automatic eligibility-based active/multi-node services and recurring scheduling
+remain separate, unfinished work.
+
 ## Not Implemented Yet
 
 - full Slurm diagnostic-suite parity, including passive host setup evidence,

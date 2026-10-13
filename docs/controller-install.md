@@ -460,6 +460,9 @@ mgmt-oke nodes list --format csv
 ## NCCL Preview Prerequisites
 
 The CLI includes `nodes healthchecks` and the `health` run-management commands.
+It also includes `services update-metadata` for a bounded observation-only pass
+over existing runs. This requires checkpoint writes and evidence-export storage,
+but never launches or cleans up a benchmark. It does not install a scheduler.
 Installation does not deploy MPI Operator, Kueue queues, SR-IOV attachments, or
 recurring diagnostic services. Benchmark admission uses existing cluster resources.
 

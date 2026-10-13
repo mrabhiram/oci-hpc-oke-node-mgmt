@@ -747,6 +747,8 @@ mgmt-oke health logs <run-id> --follow
 mgmt-oke health wait <run-id>
 mgmt-oke health cancel <run-id>
 mgmt-oke health cleanup <run-id>
+mgmt-oke services update-metadata --run-id <run-id> --dry-run
+mgmt-oke services update-metadata --pool <pool-name> --namespace <namespace> --yes
 ```
 
 Exactly one primary selector is required. Passive defaults to API readiness and
@@ -755,6 +757,15 @@ supported component, currently `--checks nccl`. Pairwise mode records selected
 anchors and additional eligible partners; `all-nodes` means one exact collective.
 No smaller ready subset is substituted. See [NCCL Healthchecks](nccl-healthchecks.md)
 for options, admission/RBAC requirements, asynchronous behavior, and evidence paths.
+
+`services update-metadata` observes existing runs once. Without a selector, it
+selects nonterminal, non-cancelling runs in `--namespace` (default `default`).
+Use repeatable `--run-id` or `--pool`, not both. The pass refuses more than
+`--max-runs` matches (default 32, maximum 128) instead of silently truncating.
+`--dry-run` only lists checkpoints. Execution requires confirmation or `--yes`.
+Exit status 0 means the refresh completed, not that benchmarks passed. The
+command writes checkpoints/exports but never submits, cancels, or deletes
+workloads; pending cases and deadlines still require `health wait`.
 
 ## Exit Status
 

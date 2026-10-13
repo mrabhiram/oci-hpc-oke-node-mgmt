@@ -236,6 +236,8 @@ class EvidenceTests(unittest.TestCase):
         self.backend.custom.get_namespaced_custom_object.side_effect = [self.job, changed]
         result = self.collect()
         self.assertFalse(result.coverage_complete)
+        self.assertFalse(result.observation_stable)
+        self.assertFalse(result.terminal_observation_ready)
         self.assertTrue(result.suspended)
         self.assertTrue(result.failed)
         for fragment in ("changed", "conflicting", "suspended"):

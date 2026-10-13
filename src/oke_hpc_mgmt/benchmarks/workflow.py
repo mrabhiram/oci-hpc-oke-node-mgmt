@@ -163,6 +163,8 @@ class BenchmarkWorkflow:
     def _complete_case(self, run: RunRecord, case: BenchmarkCase, evidence: CaseEvidence, lease: SubmissionLease) -> RunRecord:
         # A transient log read or a just-completed container must not cause
         # automatic deletion of the only complete evidence copy.
+        if not evidence.terminal_observation_ready:
+            raise BenchmarkError("Terminal observation changed during collection; refresh before assigning a result.")
         if _log_loss_risk(evidence):
             raise BenchmarkError("Final logs are incomplete; retain resources and refresh this run.")
         result = assess_case(case, evidence, min_bus_bandwidth=run.plan.request.parameters.min_bus_bandwidth)
@@ -176,6 +178,8 @@ class BenchmarkWorkflow:
         saved = _saved(run, case)
         phase = _phase(evidence)
         if phase == "TERMINAL":
+            if not evidence.terminal_observation_ready:
+                return run
             return self._complete_case(run, case, evidence, lease)
         admitted = saved.admitted_at
         started = saved.started_at
@@ -211,6 +215,8 @@ class BenchmarkWorkflow:
                 raise BenchmarkError("An unrecorded job exists for a terminal case; do not delete it.")
             if not job["metadata"].get("deletionTimestamp"):
                 evidence = self.collector.collect(run, case)
+                if not evidence.observation_stable:
+                    raise BenchmarkError("Workload changed during cleanup observation; retain resources and refresh.")
                 if _log_loss_risk(evidence):
                     raise BenchmarkError("Cleanup would discard unread logs; collect complete evidence first.")
                 if _phase(evidence) != "TERMINAL" and not (evidence.suspended and not evidence.pods):
@@ -271,6 +277,30 @@ class BenchmarkWorkflow:
                 run = self.backend.save_run(cancelling)
             return self._cancel(run, lease) if run.state == "CANCELLING" else run
 
+    def refresh(self, namespace: str, run_id: str, *, expected_uid: str) -> RunRecord:
+        """Observe recorded attempts without submitting or changing workloads."""
+        if not expected_uid:
+            raise BenchmarkError("Metadata refresh requires the selected checkpoint UID.")
+        with self.lease_factory() as lease:
+            run = self.backend.get_run(namespace, run_id)
+            if run.uid != expected_uid:
+                raise BenchmarkError("Checkpoint identity changed after selection; refuse replacement metadata.")
+            if run.state in {"CLEANED", "CANCELLING"}:
+                return run
+            for case in run.plan.cases:
+                saved = _saved(run, case)
+                if saved.state == "SUBMITTING":
+                    lease.renew()
+                    job = self.backend.get_job(run, case)
+                    if job is None:
+                        continue
+                    # Recover only a verified accepted POST, never retry it.
+                    run = self.backend.record_job_uid(run, case, job)
+                if _saved(run, case).state in {"QUEUED", "RUNNING"}:
+                    lease.renew()
+                    run = self._observe(run, case, lease)
+            return run
+
     def _cancel(self, run: RunRecord, lease: SubmissionLease) -> RunRecord:
         for case in run.plan.cases:
             saved = _saved(run, case)
@@ -288,7 +318,8 @@ class BenchmarkWorkflow:
                     raise BenchmarkError("Cancellation would discard unread logs; retry evidence collection first.")
                 if _phase(evidence) == "TERMINAL":
                     run = self._snapshot(run, case, evidence, lease)
-                    run = self._complete_case(run, case, evidence, lease)
+                    if evidence.terminal_observation_ready:
+                        run = self._complete_case(run, case, evidence, lease)
                     continue
                 run = self._snapshot(run, case, evidence, lease, cancelling=True)
                 lease.renew()

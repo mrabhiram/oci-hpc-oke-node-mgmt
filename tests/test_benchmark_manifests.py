@@ -10,7 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from oke_hpc_mgmt.benchmarks.manifests import (
-    CASE_LABEL, ExecutionOptions, ROLE_LABEL, RUN_LABEL, case_name, launcher_script,
+    CASE_LABEL, ExecutionOptions, RANK_SCRIPT, ROLE_LABEL, RUN_LABEL, case_name, launcher_script,
     gpu_preflight_script, nccl_argv, owned_labels, render_mpijob, validate_run_id, worker_script,
 )
 from oke_hpc_mgmt.benchmarks.models import BenchmarkError
@@ -191,10 +191,20 @@ class BenchmarkManifestTests(unittest.TestCase):
             hostfile.write_text("worker-0 slots=8\nworker-1 slots=8\n")
             scripts = {
                 "mpirun": "#!/bin/sh\necho 'Open MPI test fixture'\n",
+                "getent": "#!/bin/sh\n[ \"$DNS_FAIL\" != 1 ] || exit 2\n"
+                          "case \"$2\" in worker-0) echo \"${ADDRESS_0:-192.0.2.1} STREAM worker-0\";;\n"
+                          "worker-1) echo '2001:db8::2 STREAM worker-1';; *) exit 2;; esac\n",
                 "ssh-keyscan": "#!/bin/sh\necho 'worker ssh-ed25519 synthetic-public-key'\n",
                 "ssh": "#!/bin/sh\nn=0\n[ ! -f \"$COUNT_FILE\" ] || n=$(cat \"$COUNT_FILE\")\n"
                        "n=$((n+1))\necho $n > \"$COUNT_FILE\"\n[ \"$FAIL_ALWAYS\" != 1 ] && [ $n -gt 2 ]\n",
-                "timeout": "#!/bin/sh\necho executed > \"$EXECUTED_FILE\"\n",
+                "timeout": "#!/bin/sh\n"
+                           "if [ \"$1\" = 5s ]; then shift; exec \"$@\"; fi\n"
+                           "test \"$OMPI_MCA_orte_keep_fqdn_hostnames\" = 1 || exit 11\n"
+                           "test \"$PRTE_MCA_prte_keep_fqdn_hostnames\" = 1 || exit 12\n"
+                           "test \"$OMPI_MCA_plm_rsh_no_tree_spawn\" = 1 || exit 13\n"
+                           "test \"$PRTE_MCA_plm_ssh_no_tree_spawn\" = 1 || exit 14\n"
+                           "case \"$PRTE_MCA_plm_ssh_args\" in *StrictHostKeyChecking=yes*) ;; *) exit 15;; esac\n"
+                           "echo executed > \"$EXECUTED_FILE\"\n",
                 "sleep": "#!/bin/sh\n/bin/sleep 0.2\n",
             }
             for name, body in scripts.items():
@@ -210,7 +220,12 @@ class BenchmarkManifestTests(unittest.TestCase):
             result = subprocess.run(["bash", "-c", script], env=env, text=True, capture_output=True, timeout=10, check=False)
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertEqual("4", (root / "count").read_text().strip())
+            self.assertEqual(["MGMT_MPI_SSH_READY\tworker-0", "MGMT_MPI_SSH_READY\tworker-1"],
+                             [line for line in result.stdout.splitlines() if line.startswith("MGMT_MPI_SSH_READY")])
             self.assertTrue((root / "executed").exists())
+            config = (root / "mgmt-ssh-config").read_text()
+            self.assertEqual("Host worker-0\n  HostName 192.0.2.1\n  HostKeyAlias 192.0.2.1\n"
+                             "Host worker-1\n  HostName 2001:db8::2\n  HostKeyAlias 2001:db8::2\n", config)
             self.assertEqual(1, script.count("ssh-keyscan"))
             self.assertIn("StrictHostKeyChecking=yes", script)
             (root / "executed").unlink()
@@ -219,6 +234,17 @@ class BenchmarkManifestTests(unittest.TestCase):
             self.assertNotEqual(0, result.returncode)
             self.assertIn("readiness timed out", result.stderr)
             self.assertFalse((root / "executed").exists())
+            result = subprocess.run(["bash", "-c", script], env={**env, "DNS_FAIL": "1"},
+                                    text=True, capture_output=True, timeout=10, check=False)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("DNS startup timed out", result.stderr)
+            self.assertFalse((root / "executed").exists())
+            for address in ("2001:db8::2", "bad;command"):
+                result = subprocess.run(["bash", "-c", script], env={**env, "ADDRESS_0": address},
+                                        text=True, capture_output=True, timeout=10, check=False)
+                with self.subTest(address=address):
+                    self.assertNotEqual(0, result.returncode)
+                    self.assertFalse((root / "executed").exists())
 
     def test_runtime_gpu_validation_rejects_mig_duplicate_missing_or_unknown_devices(self) -> None:
         uuid = "GPU-00000000-0000-0000-0000-000000000001"
@@ -246,3 +272,30 @@ class BenchmarkManifestTests(unittest.TestCase):
         for count in (0, True, 7, 16):
             with self.assertRaises(BenchmarkError):
                 gpu_preflight_script(count)
+
+    def test_rank_keeps_diagnostics_out_of_partial_rows_and_preserves_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity = root / "identity"
+            identity.write_text("export MGMT_NODE_NAME=gpu-01\nexport MGMT_POD_UID=pod-uid\n")
+            script = RANK_SCRIPT.replace("/tmp/mgmt-worker-identity", shlex.quote(str(identity)))
+            script = script.replace("/tmp/mgmt-nccl-debug.XXXXXXXX", shlex.quote(str(root / "debug.XXXXXXXX")))
+            env = {**os.environ, "OMPI_COMM_WORLD_RANK": "0", "OMPI_COMM_WORLD_LOCAL_RANK": "0"}
+            program = "printf '8589934592 2147483648 float sum -1 '; " \
+                      "printf 'NCCL INFO diagnostic during measurement\\n' > \"$NCCL_DEBUG_FILE\"; " \
+                      "printf '200 43 43 0 201 42 42 0\\n'; exit 0"
+            result = subprocess.run(["bash", "-c", script, "rank", "bash", "-c", program],
+                                    env=env, text=True, capture_output=True, check=False)
+            self.assertEqual(0, result.returncode, result.stderr)
+            row = "8589934592 2147483648 float sum -1 200 43 43 0 201 42 42 0\n"
+            self.assertIn(row, result.stdout)
+            self.assertLess(result.stdout.index(row), result.stdout.index("NCCL INFO diagnostic"))
+            self.assertIn("MGMT_NCCL_DEBUG_END\t0", result.stdout)
+            for program, expected in (("exit 17", 17), ("true", 1),
+                                      ("printf debug > \"$NCCL_DEBUG_FILE\"; exit 19", 19),
+                                      ("head -c 1048577 /dev/zero > \"$NCCL_DEBUG_FILE\"", 1)):
+                result = subprocess.run(["bash", "-c", script, "rank", "bash", "-c", program],
+                                        env=env, text=True, capture_output=True, check=False)
+                with self.subTest(program=program):
+                    self.assertEqual(expected, result.returncode)
+                    self.assertLess(len(result.stdout), 1024)

@@ -161,6 +161,136 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual([], self.events)
         self.lease.__enter__.assert_not_called()
 
+    def test_metadata_refresh_assesses_evidence_without_submitting_pending_cases_or_cleanup(self) -> None:
+        self.submit()
+        self.complete(self.plan.cases[0])
+        self.backend.create_job.reset_mock()
+        run = self.workflow.refresh("default", RUN, expected_uid="run-uid")
+        self.assertEqual(["SUCCEEDED", "PLANNED"], [case.state for case in run.cases])
+        self.assertIsNotNone(run.cases[0].evidence_sha256)
+        self.backend.create_job.assert_not_called()
+        self.backend.delete_job.assert_not_called()
+        self.backend.cancel_job.assert_not_called()
+        self.assertFalse(self.held)
+
+    def test_metadata_refresh_never_enforces_deadlines_or_changes_cancellation_intent(self) -> None:
+        self.submit()
+        self.clock += timedelta(hours=1)
+        run = self.workflow.refresh("default", RUN, expected_uid="run-uid")
+        self.assertEqual("QUEUED", run.cases[0].state)
+        self.backend.cancel_job.assert_not_called()
+        self.current = mark_cancelling(run)
+        self.collector.collect.reset_mock()
+        self.assertEqual(self.current, self.workflow.refresh("default", RUN, expected_uid="run-uid"))
+        self.collector.collect.assert_not_called()
+
+    def test_metadata_refresh_recovers_an_accepted_post_but_never_retries_a_missing_one(self) -> None:
+        def lost(run: RunRecord, case: BenchmarkCase) -> dict[str, Any]:
+            self.create_job(run, case)
+            raise BenchmarkError("response lost")
+
+        self.backend.create_job.side_effect = lost
+        with self.assertRaises(BenchmarkError):
+            self.submit()
+        job = self.jobs.pop("case-0001")
+        self.backend.create_job.reset_mock()
+        unchanged = self.workflow.refresh("default", RUN, expected_uid="run-uid")
+        self.assertEqual("SUBMITTING", unchanged.cases[0].state)
+        self.collector.collect.assert_not_called()
+        self.jobs["case-0001"] = job
+        recovered = self.workflow.refresh("default", RUN, expected_uid="run-uid")
+        self.assertEqual("QUEUED", recovered.cases[0].state)
+        self.backend.create_job.assert_not_called()
+        self.backend.delete_job.assert_not_called()
+        self.backend.cancel_job.assert_not_called()
+
+    def test_metadata_refresh_rejects_missing_or_replaced_checkpoint_identity(self) -> None:
+        self.submit()
+        self.collector.collect.reset_mock()
+        for uid in ("", "replacement-uid"):
+            with self.subTest(uid=uid), self.assertRaises(BenchmarkError):
+                self.workflow.refresh("default", RUN, expected_uid=uid)
+        self.collector.collect.assert_not_called()
+        self.assertFalse(self.held)
+
+    def test_metadata_refresh_keeps_resources_on_read_failure_and_skips_cleaned_runs(self) -> None:
+        self.submit()
+        self.collector.collect.side_effect = BenchmarkError("API unavailable")
+        with self.assertRaisesRegex(BenchmarkError, "API unavailable"):
+            self.workflow.refresh("default", RUN, expected_uid="run-uid")
+        self.backend.delete_job.assert_not_called()
+        self.backend.cancel_job.assert_not_called()
+        self.assertFalse(self.held)
+        assert self.current is not None
+        self.current = replace(self.current, state="CLEANED")
+        self.collector.collect.reset_mock()
+        self.assertEqual(self.current, self.workflow.refresh("default", RUN, expected_uid="run-uid"))
+        self.collector.collect.assert_not_called()
+
+    def test_completion_during_collection_waits_for_a_stable_final_observation(self) -> None:
+        self.submit()
+        case = self.plan.cases[0]
+        self.complete(case)
+        final = self.observations[case.case_id]
+        self.observations[case.case_id] = replace(final, observation_stable=False,
+                                                 warnings=("MPIJob changed during collection; refresh before assessing success.",))
+        waiting = self.workflow.advance("default", RUN, keep_resources=True)
+        self.assertEqual("QUEUED", waiting.cases[0].state)
+        self.assertIsNone(waiting.cases[0].result)
+        self.backend.delete_job.assert_not_called()
+        self.observations[case.case_id] = final
+        completed = self.workflow.advance("default", RUN, keep_resources=True)
+        self.assertEqual("SUCCEEDED", completed.cases[0].state)
+        self.assertEqual(2, len(completed.cases[0].snapshots))
+
+    def test_success_condition_before_launcher_exit_requires_refetch_not_final_incomplete(self) -> None:
+        self.submit()
+        case = self.plan.cases[0]
+        self.complete(case)
+        final = self.observations[case.case_id]
+        self.observations[case.case_id] = replace(final, pods=tuple(
+            replace(pod, exit_code=None, phase="Running") if pod.role == "launcher" else pod for pod in final.pods
+        ))
+        waiting = self.workflow.refresh("default", RUN, expected_uid="run-uid")
+        self.assertIsNone(waiting.cases[0].result)
+        self.observations[case.case_id] = final
+        completed = self.workflow.refresh("default", RUN, expected_uid="run-uid")
+        self.assertEqual("SUCCEEDED", completed.cases[0].state)
+
+    def test_cancel_observes_completion_race_without_finalizing_or_destroying_it(self) -> None:
+        self.submit()
+        case = self.plan.cases[0]
+        self.complete(case)
+        final = self.observations[case.case_id]
+        self.observations[case.case_id] = replace(final, observation_stable=False)
+        waiting = self.workflow.cancel("default", RUN)
+        self.assertEqual("CANCELLING", waiting.state)
+        self.assertIsNone(waiting.cases[0].result)
+        self.backend.cancel_job.assert_not_called()
+        self.observations[case.case_id] = final
+        completed = self.workflow.cancel("default", RUN)
+        self.assertEqual("SUCCEEDED", completed.cases[0].state)
+        self.assertEqual("CANCELLED", completed.cases[1].state)
+
+    def test_cleanup_rejects_a_job_changed_during_collection(self) -> None:
+        self.submit()
+        case = self.plan.cases[0]
+        self.complete(case)
+        self.workflow.advance("default", RUN, keep_resources=True)
+        self.observations[case.case_id] = replace(self.observations[case.case_id], observation_stable=False)
+        with self.assertRaisesRegex(BenchmarkError, "changed during cleanup"):
+            self.workflow.advance("default", RUN)
+        self.backend.delete_job.assert_not_called()
+
+    def test_terminal_readiness_covers_missing_launcher_failure_and_running(self) -> None:
+        evidence = CaseEvidence("case-0001", "job", "1", False, False, False, (), ())
+        self.assertFalse(evidence.terminal_observation_ready)
+        self.assertFalse(replace(evidence, succeeded=True).terminal_observation_ready)
+        self.assertTrue(replace(evidence, failed=True).terminal_observation_ready)
+        self.assertFalse(replace(evidence, failed=True, observation_stable=False).terminal_observation_ready)
+        with self.assertRaisesRegex(BenchmarkError, "Terminal observation"):
+            self.workflow._complete_case(self.initial, self.plan.cases[0], evidence, self.lease)
+
     def test_submission_persists_intent_before_one_disjoint_batch(self) -> None:
         submitted = self.submit()
         self.assertEqual(["QUEUED", "PLANNED"], [case.state for case in submitted.cases])

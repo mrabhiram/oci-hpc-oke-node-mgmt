@@ -2,7 +2,8 @@
 
 Status: implementation in progress. The NCCL subset now exposes
 `nodes healthchecks` and the `health` run-management commands, backed by tested
-planning, preflight, checkpoint, evidence, and execution workflows. Services,
+planning, preflight, checkpoint, evidence, and execution workflows. An observation-only
+`services update-metadata` pass is available. Eligibility-based services,
 full diagnostic coverage, additional adapters, and the full live validation
 matrix remain incomplete. Existing `mgmt-oke health run` behavior is unchanged.
 See [NCCL Healthchecks](nccl-healthchecks.md) for the executable preview interface.
@@ -200,6 +201,9 @@ cancellation. Cleanup uses UID/resource-version preconditions, refuses changed
 execution attempts, and waits for observed MPIJob and Pod removal. A completed
 case's assessment remains tied to its original evidence digest even when later
 cleanup snapshots are exported.
+Completion during evidence collection requires a fresh, stable observation;
+successful jobs also require a recorded launcher exit. An earlier partial log
+cannot become a terminal verdict merely because the final job read has completed.
 
 These workflow methods do not install a background controller. Advancement and
 client-enforced queue deadlines currently require an active caller; stopping a
@@ -207,6 +211,9 @@ wait does not restart or automatically cancel the run. Retaining resources can
 prevent later overlapping cases from starting until those resources are released.
 The public CLI now uses these workflows. Service-driven advancement remains a
 delivery item; `health wait` drives the currently executable multi-case workflow.
+`services update-metadata` now refreshes already submitted attempts without
+advancing pending cases or cancelling/deleting workloads. It does not enforce
+deadlines or install a recurring schedule.
 
 ## Execution Architecture
 

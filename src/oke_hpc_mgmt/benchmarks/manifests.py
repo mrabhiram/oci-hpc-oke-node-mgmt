@@ -23,7 +23,21 @@ RANK_SCRIPT = "\n".join([
     "printf 'MGMT_NCCL_RANK\\t%s\\t%s\\t%s\\t%s\\n' "
     '"${OMPI_COMM_WORLD_RANK:?}" "${OMPI_COMM_WORLD_LOCAL_RANK:?}" '
     '"$MGMT_NODE_NAME" "$MGMT_POD_UID"',
-    'exec "$@"',
+    # NCCL can log during a partially printed nccl-tests table row. Retain
+    # diagnostics separately, then emit them only after that rank has exited.
+    'NCCL_DEBUG_FILE=$(mktemp /tmp/mgmt-nccl-debug.XXXXXXXX)',
+    "export NCCL_DEBUG_FILE",
+    "exit_code=0",
+    '"$@" || exit_code=$?',
+    "printf '\\nMGMT_NCCL_DEBUG_BEGIN\\t%s\\n' \"$OMPI_COMM_WORLD_RANK\"",
+    'if test -s "$NCCL_DEBUG_FILE" && test "$(wc -c < "$NCCL_DEBUG_FILE")" -le 1048576; then',
+    '  cat "$NCCL_DEBUG_FILE" || exit_code=1',
+    "else",
+    '  echo "NCCL diagnostic log is missing, empty, or exceeds the per-rank evidence limit" >&2',
+    '  if test "$exit_code" -eq 0; then exit_code=1; fi',
+    "fi",
+    "printf '\\nMGMT_NCCL_DEBUG_END\\t%s\\n' \"$OMPI_COMM_WORLD_RANK\"",
+    'exit "$exit_code"',
 ])
 
 
@@ -152,7 +166,7 @@ def launcher_script(
     port = 2222 if case.network == "host" else 22
     # SSH is confined to this ephemeral MPIJob. Keep an explicit per-run host-key
     # file so an upstream image's global StrictHostKeyChecking=no is not inherited.
-    ssh_options = f"-p {port} -o BatchMode=yes -o ConnectTimeout=5 " + (
+    ssh_options = f"-F /tmp/mgmt-ssh-config -p {port} -o BatchMode=yes -o ConnectTimeout=5 " + (
         "-o StrictHostKeyChecking=yes -o UserKnownHostsFile=/tmp/mgmt-known-hosts"
     )
     command = [
@@ -172,11 +186,25 @@ def launcher_script(
         "hosts=()",
         "while IFS= read -r host; do hosts+=(\"$host\"); done < <(awk 'NF && $1 !~ /^#/ {print $1}' /etc/mpi/hostfile)",
         'test "${#hosts[@]}" -eq "$expected_hosts"',
+        'test "$(printf \'%s\\n\' "${hosts[@]}" | sort -u | wc -l)" -eq "$expected_hosts"',
         ": > /tmp/mgmt-known-hosts",
+        ": > /tmp/mgmt-ssh-config",
+        "addresses=''",
         f"deadline=$((SECONDS + {options.startup_timeout}))",
         'for host in "${hosts[@]}"; do',
         '  [[ "$host" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || exit 1',
-        f'  until ssh-keyscan -T 5 -p {port} "$host" > /tmp/mgmt-host-key 2>/dev/null '
+        # Independent CoreDNS negative caches can outlive the first successful
+        # lookup. Freeze each run-owned worker address before SSH/MPI starts.
+        "  until address=$(timeout 5s getent ahosts \"$host\" | awk '$2 == \"STREAM\" && !address {address=$1} END {print address}') "
+        '&& [[ "$address" =~ ^[0-9a-fA-F:.]+$ ]]; do',
+        '    if (( SECONDS >= deadline )); then echo "Worker DNS startup timed out" >&2; exit 1; fi',
+        "    sleep 2",
+        "  done",
+        '  if [[ " $addresses " == *" $address "* ]]; then echo "Workers resolved to a duplicate address" >&2; exit 1; fi',
+        '  addresses+=" $address"',
+        "  printf 'Host %s\\n  HostName %s\\n  HostKeyAlias %s\\n' \"$host\" \"$address\" \"$address\" >> /tmp/mgmt-ssh-config",
+        "  printf 'MGMT_MPI_WORKER_ADDRESS\\t%s\\t%s\\n' \"$host\" \"$address\"",
+        f'  until ssh-keyscan -T 5 -p {port} "$address" > /tmp/mgmt-host-key 2>/dev/null '
         "&& test -s /tmp/mgmt-host-key; do",
         '    if (( SECONDS >= deadline )); then echo "Worker SSH startup timed out" >&2; exit 1; fi',
         "    sleep 2",
@@ -186,7 +214,15 @@ def launcher_script(
         '    if (( SECONDS >= deadline )); then echo "Worker SSH readiness timed out" >&2; exit 1; fi',
         "    sleep 2",
         "  done",
+        "  printf 'MGMT_MPI_SSH_READY\\t%s\\n' \"$host\"",
         "done",
+        # MPI Operator injects ORTE settings, which PRRTE does not inherit.
+        # Keep the hostfile names pinned by SSH and launch from this container:
+        # worker-to-worker tree spawning would not have its known-hosts file.
+        "export OMPI_MCA_orte_keep_fqdn_hostnames=1",
+        "export PRTE_MCA_prte_keep_fqdn_hostnames=1",
+        "export OMPI_MCA_plm_rsh_no_tree_spawn=1",
+        "export PRTE_MCA_plm_ssh_no_tree_spawn=1",
         "export PRTE_MCA_plm_ssh_args=" + shlex.quote(ssh_options),
         "exec timeout --signal=TERM --kill-after=30s " + str(options.timeout) + "s " + shlex.join(command),
     ])

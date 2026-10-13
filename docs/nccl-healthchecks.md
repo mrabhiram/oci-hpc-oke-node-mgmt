@@ -4,6 +4,8 @@ NCCL healthchecks submit run-owned MPIJobs against explicitly selected NVIDIA
 workers. The command terminology follows OCI HPC Slurm: `nodes healthchecks`
 selects the diagnostic category, while `health` manages recorded runs.
 
+`services update-metadata` provides a single observation-only service pass.
+
 This feature is a preview. The executable diagnostic component is NCCL. Full
 host diagnostics, GPU stress/SDC, separate InfiniBand bandwidth/latency checks,
 RCCL, Slurm reservations, specialized transports, and periodic services remain
@@ -131,6 +133,27 @@ Runs are persisted as namespaced ConfigMaps. Resuming uses the existing run ID,
 job ownership, and object UIDs; it does not create a replacement run. A short
 Lease serializes submission/checkpoint transactions, not the entire test.
 
+### Refresh Metadata Only
+
+```bash
+mgmt-oke services update-metadata --run-id <run-id> --dry-run
+mgmt-oke services update-metadata --run-id <run-id> --yes
+mgmt-oke services update-metadata --pool <pool-name> --namespace <namespace> --yes
+```
+
+This service exports observations and updates checkpoints for already submitted
+cases. It can recover an accepted MPIJob whose POST response was lost, but never
+retries a missing POST, submits a planned case, cancels a workload, or deletes
+resources. Cancelling and cleaned runs remain unchanged. `health wait` is still
+needed to advance pending cases, enforce client-side deadlines, and clean up.
+
+Without `--run-id` or `--pool`, only nonterminal, non-cancelling runs in the
+selected namespace are considered. Repeat `--run-id` for specific runs; it cannot
+be combined with `--pool`. More than `--max-runs` matches (default 32, maximum 128)
+is an error, not a partial selection. Dry-run performs checkpoint reads only.
+Execution requires confirmation or `--yes`; success means the refresh completed,
+not that its observed benchmarks passed. No recurring service is installed.
+
 ### Example Submission Output
 
 Fresh CLI submission of a single A100 worker with eight GPUs produced the
@@ -188,6 +211,56 @@ scheduling diagnostics retained. No NCCL measurement was produced. `LOCAL`
 identifies the requested local-only profile; it does not override failure or
 certify a successful transport test.
 
+### Example Successful Local Result
+
+A fresh single-worker BM.GPU4.8 execution on 2026-10-13 UTC used eight A100
+40-GB GPUs. The command below retains the executed options, with the node,
+queue, and run identifiers replaced for publication.
+
+```bash
+mgmt-oke nodes healthchecks --nodes gpu-01 \
+  --type active --checks nccl --queue <local-queue> \
+  --iterations 3 --warmup-iterations 1 \
+  --queue-timeout 300 --startup-timeout 600 --timeout 180 \
+  --wait --keep-resources --observation-timeout 1200 --yes --format table
+```
+
+The command exited with status `0`:
+
+```text
+case       type    state      nodes   ranks  network  job                                correctness  performance  transport  coverage
+---------  ------  ---------  ------  -----  -------  ---------------------------------  -----------  -----------  ---------  --------
+case-0001  active  SUCCEEDED  gpu-01  8      local    hc-0123456789abcdefabcd-case-0001  PASS         UNGRADED     LOCAL      PASS
+```
+
+The launcher log contained these complete measurement rows and summaries:
+
+```text
+  4294967296    1073741824     float     sum      -1  32413.9  132.50  231.88       0  32393.6  132.59  232.03       0
+  8589934592    2147483648     float     sum      -1  64471.8  133.24  233.16       0  64620.5  132.93  232.63       0
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 232.424
+```
+
+After size/count/type/operator/root, each row reports out-of-place and in-place
+time (microseconds), algorithm bandwidth (GB/s), bus bandwidth (GB/s), and wrong
+result count. At 8 GiB, bus bandwidth was 233.16 GB/s out-of-place and
+232.63 GB/s in-place, with zero errors. These are short-run observations, not
+a performance baseline or a multi-node/RDMA certification. Performance remains
+`UNGRADED` because no minimum threshold was configured.
+
+The collector retained an intermediate completion observation and fetched a
+stable final snapshot before recording success. All eight rank identities and
+diagnostic completion markers were present. Earlier incomplete runs were not
+regraded or used as the evidence for this result.
+
+Inspect the recorded result and release retained resources with:
+
+```bash
+mgmt-oke health results hc-0123456789abcdefabcd --format json
+mgmt-oke health cleanup hc-0123456789abcdefabcd --yes
+```
+
 ## Settings
 
 | Option | Meaning |
@@ -228,6 +301,9 @@ request/options, runtime identities, logs, Kueue Workload status, and events tie
 to verified MPIJob, Pod, and Workload UIDs. Each run directory is private.
 Observed requeues and Pod/container changes have distinct snapshots; logs from
 different attempts are never combined into one passing assessment.
+If completion occurs while evidence is being collected, the workflow reads a
+new stable snapshot before assigning the terminal verdict. Success also requires
+an observed launcher exit, not merely an MPIJob completion condition.
 Changed scheduling decisions also produce snapshots, including when no Pod has
 started. Repeated event counts alone do not create another snapshot. Events may
 expire before observation; an empty event list is not proof that no event occurred.
