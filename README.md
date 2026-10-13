@@ -159,6 +159,7 @@ Command groups:
 | `pools upgrade <pool> --to <version> --strategy <strategy>` | Upgrade one externally prepared worker pool and wait for complete convergence. |
 | `nodes list` | List and filter Kubernetes nodes. |
 | `nodes get <identifier...>` | Get nodes by Kubernetes name, Slurm name, internal IP, provider ID, or instance OCID. |
+| `nodes healthchecks --nodes <nodes> --type <type>` | Preview: passive API readiness or explicit `--checks nccl` workloads on selected NVIDIA workers. |
 | `nodes terminate <identifier...>` | Drain and terminate selected managed or self-managed workers, with an optional verified unhealthy-host tag. |
 | `nodes remove <identifier...>` | Compatibility alias for `nodes terminate`. |
 | `nodes boot-volume-replace <identifier...>` | Replace selected managed or self-managed worker boot volumes while preserving the current image and configuration. |
@@ -171,6 +172,8 @@ Command groups:
 | `addons validate` | Validate NFD, GPU Operator, Network Operator, GPU, and RDMA readiness. |
 | `status` | Show concise cluster capacity and health. |
 | `health run` | Run deterministic health checks by category or pool. |
+| `health profiles\|list\|get\|results\|logs` | Inspect NCCL profiles, recorded runs, verdicts, and owned logs without submitting workloads. |
+| `health wait\|cancel\|cleanup <run-id>` | Advance an existing NCCL run, cancel owned workloads, or verify evidence and clean up terminal resources. |
 | `recommendations list` | Show actionable warnings and failures. |
 | `reconcile` | Show a full discovery snapshot. |
 | `upgrades status [--to <version>]` | Show current and target versions, add-on compatibility, scheduler state, and supported strategies. |
@@ -703,11 +706,30 @@ overall  pools  nodes  ready  not_ready  gpu_nodes  rdma_nodes  addons_active  a
 HEALTHY  4      6      6      0          3          2           7              7             0                 0             2
 ```
 
-Health checks are deterministic evaluations of the discovered control-plane
+`health run` checks are deterministic evaluations of the discovered control-plane
 and node state. They do not run arbitrary commands on workers. `status`,
 `health run`, and `addons validate` return `0` when healthy, `1` when degraded,
 and `2` when a check fails or the command cannot complete. A partial OCI or
 Kubernetes discovery is degraded rather than being presented as healthy.
+
+### NCCL healthchecks (preview)
+
+```bash
+mgmt-oke health profiles
+mgmt-oke nodes healthchecks --pool <pool-name> \
+  --type multi-node --mode all-nodes --checks nccl \
+  --queue <local-queue> --dry-run
+```
+
+Replace `--dry-run` with `--wait` to execute after confirmation. Every selected
+participant is retained; tests allocate all its physical GPUs. Submission alone
+does not establish a passing benchmark. Without `--wait`, use `health wait` to
+advance pending cases and collect evidence. Existing MPI Operator/Kueue resources
+are required; the tool does not install operators or change shared queues.
+
+See [NCCL Healthchecks](docs/nccl-healthchecks.md) for selection, profiles,
+permissions, result interpretation, cancellation, and evidence-preserving cleanup.
+Full Slurm diagnostic suites and service scheduling remain under development.
 
 ### RDMA topology
 

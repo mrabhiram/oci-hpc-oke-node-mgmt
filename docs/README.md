@@ -37,6 +37,9 @@ capacity naturally vary by deployment.
 - [Verifying GPU and RDMA Readiness](./verifying-gpu-and-rdma-readiness.md):
   Check GPU allocation, RDMA topology, Network Operator virtual functions, and
   deterministic health and add-on validation.
+- [NCCL Healthchecks](./nccl-healthchecks.md): Preview explicit NVIDIA collective
+  tests, recorded runs, results, logs, and evidence-preserving cleanup through
+  existing MPI Operator and Kueue resources.
 - [Using JSON and CSV Output](./using-json-and-csv-output.md): Consume inventory
   safely from scripts, `jq`, spreadsheets, and monitoring workflows.
 

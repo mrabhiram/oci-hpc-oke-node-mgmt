@@ -1,11 +1,11 @@
 # Slurm-Compatible NCCL Healthchecks
 
-Status: implementation in progress. The planning, manifest, preflight,
-checkpoint, workload-evidence, result-validation, and execution-workflow components
-have initial implementations and unit tests. The proposed public commands below
-are not yet available; CLI integration, additional adapters, and live benchmark
-validation remain incomplete. Existing `mgmt-oke health run`
-behavior is unchanged.
+Status: implementation in progress. The NCCL subset now exposes
+`nodes healthchecks` and the `health` run-management commands, backed by tested
+planning, preflight, checkpoint, evidence, and execution workflows. Services,
+full diagnostic coverage, additional adapters, and the full live validation
+matrix remain incomplete. Existing `mgmt-oke health run` behavior is unchanged.
+See [NCCL Healthchecks](nccl-healthchecks.md) for the executable preview interface.
 
 ## Objective
 
@@ -205,7 +205,8 @@ These workflow methods do not install a background controller. Advancement and
 client-enforced queue deadlines currently require an active caller; stopping a
 wait does not restart or automatically cancel the run. Retaining resources can
 prevent later overlapping cases from starting until those resources are released.
-Public command integration and service-driven advancement remain delivery items.
+The public CLI now uses these workflows. Service-driven advancement remains a
+delivery item; `health wait` drives the currently executable multi-case workflow.
 
 ## Execution Architecture
 

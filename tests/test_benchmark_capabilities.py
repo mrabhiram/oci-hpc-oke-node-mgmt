@@ -296,6 +296,16 @@ class CapabilityTests(unittest.TestCase):
         self.assertNotIn(("pods", "eviction", "create"), verbs)
         self.assertNotIn(("nodes", "", "patch"), verbs)
         self.assertIn(("pods", "log", "get"), verbs)
+        self.assertIn(("events", "", "list"), verbs)
+
+    def test_kueue_workload_diagnostics_permission_is_required_only_for_queued_runs(self) -> None:
+        self.checker.authorization.create_self_subject_access_review.side_effect = lambda body, **_: {
+            "status": {"allowed": body["spec"]["resourceAttributes"]["resource"] != "workloads"},
+        }
+        self.check()
+        self.queue()
+        with self.assertRaisesRegex(BenchmarkError, "list workloads"):
+            self.check()
 
     def test_operator_version_availability_and_ambiguity_are_verified(self) -> None:
         pristine = copy.deepcopy(self.controller)

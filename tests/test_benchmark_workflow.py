@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, Mock, patch
 from oke_hpc_mgmt.benchmarks.artifacts import EvidenceStore
 from oke_hpc_mgmt.benchmarks.backend import BenchmarkBackend
 from oke_hpc_mgmt.benchmarks.capabilities import CapabilityEvidence, CapabilityPreflight
+from oke_hpc_mgmt.benchmarks.diagnostics import SchedulingEvidence
 from oke_hpc_mgmt.benchmarks.evidence import CaseEvidence, EvidenceCollector, PodEvidence
 from oke_hpc_mgmt.benchmarks.lease import SubmissionLease
 from oke_hpc_mgmt.benchmarks.manifests import ExecutionOptions, render_mpijob
@@ -523,6 +524,24 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(BenchmarkError, "placement is no longer valid"):
             self.workflow.advance("default", RUN)
         self.assertEqual(1, self.backend.create_job.call_count)
+
+    def test_queue_diagnostic_changes_export_even_without_pod_or_phase_change(self) -> None:
+        run = self.submit()
+        case = run.plan.cases[0]
+        evidence = self.collect(run, case)
+        self.collector.collect.side_effect = None
+        self.collector.collect.return_value = evidence
+        first = self.workflow.advance("default", run.run_id, keep_resources=True)
+        events = ({"metadata": {"uid": "event-uid"}, "involvedObject": {"uid": "job-uid"},
+                   "reason": "Pending", "message": "launcher taint", "type": "Warning"},)
+        self.collector.collect.return_value = replace(evidence, scheduling=SchedulingEvidence(events=events))
+        changed = self.workflow.advance("default", run.run_id, keep_resources=True)
+        self.assertGreater(len(changed.cases[0].snapshots), len(first.cases[0].snapshots))
+        latest = changed.cases[0].snapshots[-1]
+        payload = self.store.verify(changed, case, latest.sha256)
+        self.assertEqual("launcher taint", payload["evidence"]["scheduling"]["events"][0]["message"])
+        repeated = self.workflow.advance("default", run.run_id, keep_resources=True)
+        self.assertEqual(changed.cases[0].snapshots, repeated.cases[0].snapshots)
 
     def test_snapshot_limit_and_unrecorded_terminal_job_block_mutations(self) -> None:
         self.submit()

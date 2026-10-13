@@ -10,6 +10,7 @@ from oke_hpc_mgmt.benchmarks.planning import plan_healthchecks
 from oke_hpc_mgmt.benchmarks.records import (
     EvidenceSnapshot, RunRecord, assert_no_overlap, decode_record, mark_cancelling, next_cases, payload_digest, timestamp,
 )
+from oke_hpc_mgmt.models import HealthResult
 from test_benchmark_planning import inventory, request
 
 
@@ -52,6 +53,27 @@ class BenchmarkRecordTests(unittest.TestCase):
         plan = plan_healthchecks(inventory(1), HealthcheckRequest(pool="gpu-pool"))
         with self.assertRaisesRegex(BenchmarkError, "Passive"):
             RunRecord.create(RUN, plan, ExecutionOptions())
+
+    def test_passive_observations_and_optional_scheduling_digest_roundtrip(self) -> None:
+        initial = record()
+        initial = replace(initial, plan=replace(initial.plan, passive_checks=(
+            HealthResult("host-coverage", "node", "WARN", "Unavailable"),
+        )))
+        initial = initial.update_case(initial.cases[0].case_id, "SUBMITTING").update_case(
+            initial.cases[0].case_id, "QUEUED", job_uid="job-uid", snapshots=(
+                EvidenceSnapshot(initial.created_at, "QUEUED", (), "a" * 64, "b" * 64),
+            ),
+        )
+        decoded = decode_record(initial.payload(), uid="run-uid", resource_version="1")
+        self.assertEqual(initial, decoded)
+        self.assertIsInstance(decoded.plan.passive_checks[0], HealthResult)
+        self.assertEqual("b" * 64, decoded.cases[0].snapshots[0].scheduling_sha256)
+        payload = json.loads(initial.payload())
+        payload["cases"][0]["snapshots"][0].pop("scheduling_sha256")
+        legacy = decode_record(json.dumps(payload), uid="run-uid", resource_version="1")
+        self.assertIsNone(legacy.cases[0].snapshots[0].scheduling_sha256)
+        with self.assertRaisesRegex(BenchmarkError, "scheduling diagnostics digest"):
+            EvidenceSnapshot(initial.created_at, "QUEUED", (), "a" * 64, "invalid").validate()
 
     def test_transitions_require_intent_and_job_identity(self) -> None:
         initial = record()

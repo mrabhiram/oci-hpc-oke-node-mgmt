@@ -135,9 +135,12 @@ class BenchmarkManifestTests(unittest.TestCase):
     def test_taint_tolerations_are_exact_not_wildcards(self) -> None:
         nodes = tuple(replace(node, tolerations=("nvidia.com/gpu=present:NoSchedule",))
                       for node in self.case.nodes)
-        pod = self.render(nodes=nodes)["spec"]["mpiReplicaSpecs"]["Worker"]["template"]["spec"]
-        self.assertEqual([{"key": "nvidia.com/gpu", "value": "present", "operator": "Equal", "effect": "NoSchedule"}],
-                         pod["tolerations"])
+        replicas = self.render(nodes=nodes)["spec"]["mpiReplicaSpecs"]
+        for role in ("Worker", "Launcher"):
+            pod = replicas[role]["template"]["spec"]
+            self.assertEqual([{"key": "nvidia.com/gpu", "value": "present", "operator": "Equal", "effect": "NoSchedule"}],
+                             pod["tolerations"])
+        self.assertNotIn("nvidia.com/gpu", replicas["Launcher"]["template"]["spec"]["containers"][0]["resources"]["requests"])
         for taint in ("maintenance:NoSchedule", "nvidia.com/gpu:NoExecute", "anything"):
             with self.subTest(taint=taint), self.assertRaises(BenchmarkError):
                 self.render(nodes=tuple(replace(node, tolerations=(taint,)) for node in self.case.nodes))
@@ -180,6 +183,42 @@ class BenchmarkManifestTests(unittest.TestCase):
         self.assertEqual(RUN, second["metadata"]["labels"][RUN_LABEL])
         worker_labels = first["spec"]["mpiReplicaSpecs"]["Worker"]["template"]["metadata"]["labels"]
         self.assertEqual(RUN, worker_labels[RUN_LABEL])
+
+    def test_launcher_retries_transient_readiness_with_pinned_key_and_bounded_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            hostfile = root / "hostfile"
+            hostfile.write_text("worker-0 slots=8\nworker-1 slots=8\n")
+            scripts = {
+                "mpirun": "#!/bin/sh\necho 'Open MPI test fixture'\n",
+                "ssh-keyscan": "#!/bin/sh\necho 'worker ssh-ed25519 synthetic-public-key'\n",
+                "ssh": "#!/bin/sh\nn=0\n[ ! -f \"$COUNT_FILE\" ] || n=$(cat \"$COUNT_FILE\")\n"
+                       "n=$((n+1))\necho $n > \"$COUNT_FILE\"\n[ \"$FAIL_ALWAYS\" != 1 ] && [ $n -gt 2 ]\n",
+                "timeout": "#!/bin/sh\necho executed > \"$EXECUTED_FILE\"\n",
+                "sleep": "#!/bin/sh\n/bin/sleep 0.2\n",
+            }
+            for name, body in scripts.items():
+                tool = root / name
+                tool.write_text(body)
+                tool.chmod(0o700)
+            script = launcher_script(self.case, self.request, replace(self.options, startup_timeout=3))
+            script = script.replace("/etc/mpi/hostfile", shlex.quote(str(hostfile)))
+            # Keep even the launcher's ephemeral files inside the fixture.
+            script = script.replace("/tmp/mgmt-", str(root / "mgmt-"))
+            env = {**os.environ, "PATH": directory + os.pathsep + os.environ["PATH"],
+                   "COUNT_FILE": str(root / "count"), "EXECUTED_FILE": str(root / "executed"), "FAIL_ALWAYS": "0"}
+            result = subprocess.run(["bash", "-c", script], env=env, text=True, capture_output=True, timeout=10, check=False)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("4", (root / "count").read_text().strip())
+            self.assertTrue((root / "executed").exists())
+            self.assertEqual(1, script.count("ssh-keyscan"))
+            self.assertIn("StrictHostKeyChecking=yes", script)
+            (root / "executed").unlink()
+            result = subprocess.run(["bash", "-c", script], env={**env, "FAIL_ALWAYS": "1"},
+                                    text=True, capture_output=True, timeout=10, check=False)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("readiness timed out", result.stderr)
+            self.assertFalse((root / "executed").exists())
 
     def test_runtime_gpu_validation_rejects_mig_duplicate_missing_or_unknown_devices(self) -> None:
         uuid = "GPU-00000000-0000-0000-0000-000000000001"

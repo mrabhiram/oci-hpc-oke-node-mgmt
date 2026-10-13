@@ -143,15 +143,16 @@ class BenchmarkWorkflow:
         saved = _saved(run, case)
         phase: SnapshotPhase = "CANCELLING" if cancelling else _phase(evidence)
         identities = tuple(sorted((pod.name, pod.uid, pod.container_id, pod.restart_count) for pod in evidence.pods))
+        scheduling_digest = evidence.scheduling.signature()
         if saved.snapshots and saved.snapshots[-1].phase == phase and saved.snapshots[-1].pod_identities == identities and (
             phase not in {"TERMINAL", "CANCELLING"}
-        ):
+        ) and saved.snapshots[-1].scheduling_sha256 == scheduling_digest:
             return run
         if len(saved.snapshots) >= MAX_SNAPSHOTS:
             raise BenchmarkError("Snapshot history limit reached; retain workloads for manual inspection.")
         receipt = self.store.export(run, case, evidence)
         self.store.verify(run, case, receipt.sha256)
-        snapshot = EvidenceSnapshot(self.now().isoformat(), phase, identities, receipt.sha256)
+        snapshot = EvidenceSnapshot(self.now().isoformat(), phase, identities, receipt.sha256, scheduling_digest)
         lease.renew()
         state: CaseState = "QUEUED" if saved.state == "RUNNING" and phase == "QUEUED" else saved.state
         return self.backend.save_run(run.update_case(case.case_id, state,

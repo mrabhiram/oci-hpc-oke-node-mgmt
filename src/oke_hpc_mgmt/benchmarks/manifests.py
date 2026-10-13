@@ -169,7 +169,8 @@ def launcher_script(
         "umask 077",
         "mpirun --version",
         f"expected_hosts={len(case.nodes)}",
-        "mapfile -t hosts < <(awk 'NF && $1 !~ /^#/ {print $1}' /etc/mpi/hostfile)",
+        "hosts=()",
+        "while IFS= read -r host; do hosts+=(\"$host\"); done < <(awk 'NF && $1 !~ /^#/ {print $1}' /etc/mpi/hostfile)",
         'test "${#hosts[@]}" -eq "$expected_hosts"',
         ": > /tmp/mgmt-known-hosts",
         f"deadline=$((SECONDS + {options.startup_timeout}))",
@@ -181,7 +182,10 @@ def launcher_script(
         "    sleep 2",
         "  done",
         "  cat /tmp/mgmt-host-key >> /tmp/mgmt-known-hosts",
-        f'  ssh {ssh_options} "$host" test -s /tmp/mgmt-worker-identity',
+        f'  until ssh {ssh_options} "$host" test -s /tmp/mgmt-worker-identity; do',
+        '    if (( SECONDS >= deadline )); then echo "Worker SSH readiness timed out" >&2; exit 1; fi',
+        "    sleep 2",
+        "  done",
         "done",
         "export PRTE_MCA_plm_ssh_args=" + shlex.quote(ssh_options),
         "exec timeout --signal=TERM --kill-after=30s " + str(options.timeout) + "s " + shlex.join(command),
@@ -291,6 +295,9 @@ def render_mpijob(
         "metadata": {"labels": {**labels, ROLE_LABEL: "launcher"}},
         "spec": {
             "restartPolicy": "Never", "automountServiceAccountToken": False,
+            # Some existing queues offer only a GPU-node flavor for both PodSets.
+            # Permit its known GPU taint without requesting a GPU for the launcher.
+            "tolerations": _tolerations(case),
             "activeDeadlineSeconds": options.startup_timeout + options.timeout + 30,
             "terminationGracePeriodSeconds": 30,
             "containers": [{

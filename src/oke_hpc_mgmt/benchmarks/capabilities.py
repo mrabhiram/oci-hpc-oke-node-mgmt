@@ -129,6 +129,7 @@ def required_permissions(namespace: str) -> tuple[Permission, ...]:
         Permission("", "nodes", "list"), Permission("", "nodes", "get"),
         Permission("", "pods", "list"), Permission("", "pods", "get", namespace),
         Permission("", "pods", "get", namespace, "log"),
+        Permission("", "events", "list", namespace),
         Permission("", "pods", "create", namespace),  # Server-side dry-run admission probes only.
         Permission("", "configmaps", "list"), Permission("batch", "jobs", "get", namespace),
         Permission("apps", "deployments", "list"),
@@ -202,9 +203,9 @@ class CapabilityPreflight:
                 return None
             raise BenchmarkError(f"Cannot verify CRD {name} (Kubernetes HTTP {exc.status}).") from exc
 
-    def _permissions(self, namespace: str) -> None:
+    def _permissions(self, namespace: str, permissions: tuple[Permission, ...] | None = None) -> None:
         denied: list[str] = []
-        for permission in required_permissions(namespace):
+        for permission in required_permissions(namespace) if permissions is None else permissions:
             attributes = {"group": permission.group, "resource": permission.resource, "verb": permission.verb}
             if permission.namespace:
                 attributes["namespace"] = permission.namespace
@@ -378,6 +379,7 @@ class CapabilityPreflight:
                 if plan.request.scheduler == "direct" or not plan.request.queue:
                     raise BenchmarkError("Kueue is installed; select an existing --queue. Direct execution cannot bypass it.")
                 kueue_version = served_version(kueue, ("v1beta2", "v1beta1"), namespaced=True)
+                self._permissions(namespace_name, (Permission(KUEUE_GROUP, "workloads", "list", namespace_name),))
                 versions.append(self._identity(kueue, "CRD"))
                 for plural, namespaced in (("clusterqueues", False), ("resourceflavors", False), ("workloads", True)):
                     crd = self._crd(f"{plural}.{KUEUE_GROUP}")

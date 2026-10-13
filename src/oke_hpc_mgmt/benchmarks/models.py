@@ -5,6 +5,8 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
+from oke_hpc_mgmt.models import HealthResult
+
 
 HealthcheckType = Literal["passive", "active", "multi-node", "all"]
 TestMode = Literal["pairs", "all-nodes", "per-local-block"]
@@ -173,6 +175,7 @@ class HealthcheckPlan:
     cases: tuple[BenchmarkCase, ...]
     passive_nodes: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    passive_checks: tuple[HealthResult, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

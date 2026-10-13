@@ -5,7 +5,9 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from kubernetes.client.exceptions import ApiException
+from urllib3.exceptions import HTTPError
 
+from oke_hpc_mgmt.benchmarks.diagnostics import SchedulingCollector, SchedulingEvidence
 from oke_hpc_mgmt.benchmarks.manifests import (
     CASE_LABEL, MPI_GROUP, MPI_VERSION, ROLE_LABEL, RUN_LABEL, case_name,
 )
@@ -50,6 +52,7 @@ class CaseEvidence:
     suspended: bool
     pods: tuple[PodEvidence, ...]
     warnings: tuple[str, ...]
+    scheduling: SchedulingEvidence = SchedulingEvidence()
 
     @property
     def coverage_complete(self) -> bool:
@@ -140,19 +143,33 @@ class EvidenceCollector:
         limit = min(MAX_LOG_BYTES, log_budget)
         if status.get("containerID") and limit > 0:
             try:
-                value = self.core.read_namespaced_pod_log(
+                response = self.core.read_namespaced_pod_log(
                     name, namespace, container=container, timestamps=False,
-                    limit_bytes=limit + 1, _request_timeout=REQUEST_TIMEOUT,
+                    limit_bytes=limit + 1, _preload_content=False, _request_timeout=REQUEST_TIMEOUT,
                 )
-                if not isinstance(value, str):
-                    raise BenchmarkError("Kubernetes returned a non-text benchmark log.")
-                encoded = value.encode("utf-8")
+                # Bypass SDK str(bytes) conversion, which can escape all log
+                # newlines. Bound the raw response even if the server ignores
+                # limitBytes, and release the connection on every path.
+                try:
+                    encoded = response.read(limit + 1)
+                finally:
+                    response.close()
+                    response.release_conn()
+                if not isinstance(encoded, bytes):
+                    raise BenchmarkError("Kubernetes returned a non-byte benchmark log stream.")
                 complete = len(encoded) <= limit
-                log = encoded[:limit].decode("utf-8", errors="ignore")
-                if not complete:
+                try:
+                    log = encoded[:limit].decode("utf-8")
+                except UnicodeDecodeError:
+                    log = encoded[:limit].decode("utf-8", errors="replace")
+                    complete = False
+                    warnings.append("Log is not complete UTF-8 text; invalid bytes cannot establish success.")
+                if len(encoded) > limit:
                     warnings.append("Log reached the evidence size limit; truncated output cannot establish success.")
             except ApiException as exc:
                 warnings.append(f"Container log unavailable (Kubernetes HTTP {exc.status}).")
+            except (HTTPError, OSError):
+                warnings.append("Container log stream failed; complete runtime evidence is unavailable.")
         elif not status.get("containerID"):
             warnings.append("Container has not started; runtime evidence is unavailable.")
         else:
@@ -233,6 +250,9 @@ class EvidenceCollector:
                                    for pod in evidence}
             if (latest.get("metadata") or {}).get("continue") or latest_identities != recorded_identities:
                 raise BenchmarkError("Pod set changed during evidence collection; do not combine attempts.")
+            scheduling = SchedulingCollector(self.backend).collect(
+                run, case, saved.job_uid, tuple((pod.name, pod.uid) for pod in evidence),
+            )
             final = self.backend.get_job(run, case)
         except ApiException as exc:
             raise BenchmarkError(f"Cannot verify owned benchmark evidence (Kubernetes HTTP {exc.status}).") from exc
@@ -258,7 +278,7 @@ class EvidenceCollector:
         if suspended:
             warnings.append("MPIJob is suspended; historical conditions do not prove this attempt completed.")
         return CaseEvidence(case.case_id, saved.job_uid, final["metadata"]["resourceVersion"], succeeded, failed, suspended,
-                            evidence, tuple(warnings))
+                            evidence, tuple(warnings), scheduling)
 
 
 def assess_case(

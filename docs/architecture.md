@@ -684,3 +684,32 @@ are derived from the discovery snapshot and include:
 
 Health commands return `0` for pass or informational results, `1` when warnings
 exist, and `2` when a check fails.
+
+## NCCL Execution (Preview)
+
+The benchmark subsystem is separate from the pure inventory health engine.
+`nodes healthchecks` defaults to passive API readiness; active categories require
+an explicit supported component, currently NCCL. Typed requests and reviewed
+profiles produce exact-node MPIJobs using existing MPI Operator/Kueue resources.
+
+Run-owned ConfigMaps persist immutable participant identities, options, case
+state, and bounded observation history. A dedicated short-lived Lease protects
+submission and checkpoint transactions across namespaces. Submission intent is
+persisted before POST; reconnect verifies and adopts an already accepted owned
+job rather than creating a replacement. Resource-version conflicts halt the pass.
+
+Evidence collection validates MPIJob/Job/Pod ownership chains, node and container
+identities, complete logs, rank placement, correctness, and transport. Private
+content-addressed exports are verified before suspension or deletion. Cleanup
+uses UID/resource-version preconditions and confirms MPIJob/Pod absence; the
+original result digest is not overwritten by later cleanup observations.
+Scheduling evidence includes bounded Kueue Workload status and events selected
+by verified object UID. Workload labels narrow discovery but never substitute
+for controller ownership checks. Admission changes produce distinct snapshots;
+repeated event counts do not. Diagnostic read failures prevent destructive cleanup.
+
+`health wait` advances pending cases and enforces client-side deadlines without
+holding the Lease between polls. Read-only commands never submit tests. No
+background controller is installed; service scheduling and the remaining
+diagnostic adapters are still under development. See
+[NCCL Healthchecks](nccl-healthchecks.md) for operational behavior and limitations.

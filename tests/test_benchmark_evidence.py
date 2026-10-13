@@ -40,8 +40,10 @@ class EvidenceTests(unittest.TestCase):
         self.batch.read_namespaced_job.return_value = self.parent
         self.pods = [self.pod("worker"), self.pod("launcher")]
         self.core.list_namespaced_pod.return_value = {"items": self.pods}
+        self.core.list_namespaced_event.return_value = {"items": []}
         self.core.read_namespaced_pod.side_effect = self.read_pod
-        self.core.read_namespaced_pod_log.return_value = "synthetic test output\n"
+        self.stream = self.core.read_namespaced_pod_log.return_value
+        self.stream.read.return_value = b"synthetic test output\n"
         self.core.read_node.side_effect = lambda name, **_: {"metadata": {
             "name": name, "uid": self.case.nodes[0].uid if name == self.case.nodes[0].name else "cpu-uid",
         }}
@@ -81,6 +83,10 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual("synthetic test output\n", result.pods[1].log)
         self.assertTrue(result.pods[1].log_complete)
         self.assertEqual(MAX_LOG_BYTES + 1, self.core.read_namespaced_pod_log.call_args.kwargs["limit_bytes"])
+        self.assertFalse(self.core.read_namespaced_pod_log.call_args.kwargs["_preload_content"])
+        self.stream.read.assert_called_with(MAX_LOG_BYTES + 1)
+        self.assertEqual(2, self.stream.close.call_count)
+        self.assertEqual(2, self.stream.release_conn.call_count)
         self.assertNotIn("follow", self.core.read_namespaced_pod_log.call_args.kwargs)
         for method in self.core.mock_calls:
             self.assertTrue(str(method).startswith("call.read_") or str(method).startswith("call.list_"))
@@ -157,13 +163,13 @@ class EvidenceTests(unittest.TestCase):
         self.assertFalse(result.coverage_complete)
         self.assertIn("HTTP 403", " ".join(result.pods[0].warnings))
         self.core.read_namespaced_pod_log.side_effect = None
-        self.core.read_namespaced_pod_log.return_value = "x" * (MAX_LOG_BYTES + 1)
+        self.stream.read.return_value = b"x" * (MAX_LOG_BYTES + 1)
         result = self.collect()
         self.assertFalse(result.coverage_complete)
         self.assertEqual(MAX_LOG_BYTES, len(result.pods[0].log))
         self.assertFalse(result.pods[0].log_complete)
-        self.core.read_namespaced_pod_log.return_value = {"unexpected": "json"}
-        with self.assertRaisesRegex(BenchmarkError, "non-text"):
+        self.stream.read.return_value = {"unexpected": "json"}
+        with self.assertRaisesRegex(BenchmarkError, "non-byte"):
             self.collect()
 
     def test_pending_and_restarted_containers_are_incomplete(self) -> None:
@@ -176,6 +182,22 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(1, self.core.read_namespaced_pod_log.call_count)
         for fragment in ("not started", "restarted", "digest"):
             self.assertIn(fragment, " ".join(result.pods[0].warnings))
+
+    def test_raw_logs_preserve_newlines_and_fail_closed_on_invalid_bytes_or_stream_error(self) -> None:
+        self.stream.read.return_value = b"first\nsecond\tcolumn\n"
+        self.assertEqual("first\nsecond\tcolumn\n", self.collect().pods[1].log)
+        self.stream.read.return_value = b"invalid\xffbytes"
+        result = self.collect()
+        self.assertFalse(result.pods[1].log_complete)
+        self.assertIn("UTF-8", " ".join(result.pods[1].warnings))
+        self.stream.read.side_effect = OSError("stream disconnected")
+        self.stream.close.reset_mock()
+        self.stream.release_conn.reset_mock()
+        result = self.collect()
+        self.assertFalse(result.pods[1].log_complete)
+        self.assertIn("stream failed", " ".join(result.pods[1].warnings))
+        self.assertEqual(2, self.stream.close.call_count)
+        self.assertEqual(2, self.stream.release_conn.call_count)
 
     def test_missing_duplicate_and_replaced_node_coverage_is_incomplete(self) -> None:
         self.core.read_node.side_effect = lambda name, **_: {"metadata": {"name": name, "uid": "replacement"}}
@@ -238,7 +260,7 @@ class EvidenceTests(unittest.TestCase):
             self.collect()
 
     def test_aggregate_log_budget_prioritizes_launcher_and_bounds_memory(self) -> None:
-        self.core.read_namespaced_pod_log.return_value = "x" * 10
+        self.stream.read.return_value = b"x" * 10
         with patch("oke_hpc_mgmt.benchmarks.evidence.MAX_CASE_LOG_BYTES", 5):
             result = self.collect()
         self.assertEqual(5, sum(len(pod.log.encode()) for pod in result.pods))

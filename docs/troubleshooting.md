@@ -1,5 +1,38 @@
 # Troubleshooting
 
+## NCCL Healthcheck Preview
+
+- Start with `nodes healthchecks ... --checks nccl --dry-run`. This checks API
+  permissions, current allocation, profile prerequisites, and server admission;
+  it does not establish runtime success.
+- When Kueue is present, provide an existing `--queue` in the selected namespace.
+  The tool refuses unverified admission rather than bypassing it. Inspect queue
+  holds, quotas, ResourceFlavors, topology, and the MPI integration externally.
+- Queue/startup evidence exports include owned Kueue Workload status and UID-matched
+  events, even when no benchmark Pod starts. Resolve denied Workload/event reads
+  before cleanup; the tool retains resources when diagnostics cannot be collected.
+- An initial submission can leave planned cases pending. `health logs --follow`
+  only reads logs. Use `health wait <run-id>` to advance the recorded run and
+  enforce client-side queue deadlines.
+- After a lost response, inspect or wait on the same run ID. Do not create a
+  second run merely because the first invocation lost its connection.
+- Evidence-export failures retain workloads. Verify operator storage and use
+  the original `--output-dir`. Missing or modified files must not be treated as
+  successful exports or bypassed during cleanup.
+- Unreadable container logs block destructive cancellation/cleanup. Resolve API
+  access or worker storage first, then repeat the same operation. Incomplete
+  evidence is not a passing test.
+- Worker DNS or SSH startup failures are retried only within the startup deadline.
+  Persistent failures remain failed/incomplete tests; the launcher never disables
+  strict host-key checking or replaces its pinned key to make a connection succeed.
+- `--keep-resources` retains workers that can block later overlapping cases.
+  Resume `health wait` without that flag to release completed resources and
+  continue. `health cleanup` requires all cases to be terminal.
+- A `CLEANED` run can still contain failed or cancelled cases. Inspect
+  `health results <run-id> --format json` for the recorded outcome.
+
+See [NCCL Healthchecks](nccl-healthchecks.md) for prerequisites and result semantics.
+
 This guide covers common installation, discovery, readiness, and mutation
 problems when using `mgmt-oke` on an OCI HPC OKE operator node.
 

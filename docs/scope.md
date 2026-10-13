@@ -136,6 +136,11 @@ Management Tool.
 
 ## Not Implemented Yet
 
+- full Slurm diagnostic-suite parity, including passive host setup evidence,
+  GPU stress/SDC, separate InfiniBand bandwidth/latency, and RCCL
+- Slurm/reservation benchmark execution, specialized DRA/MNNVL/preview transports,
+  and recurring healthcheck service handlers; explicit NCCL subsets use the
+  [preview healthcheck workflow](nccl-healthchecks.md)
 - automatic Kueue `ClusterQueue` quota updates after worker-pool capacity changes
 - Cluster Autoscaler bounds updates
 - OKE add-on installation, update, or removal

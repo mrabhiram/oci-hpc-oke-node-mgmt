@@ -189,6 +189,24 @@ live-plan validated but does not yet have a publishable live mutation record.
 - [x] Terraform and OCI Resource Manager drift warnings without editing source
   configuration. `LIVE-PLAN`
 
+## NCCL Healthchecks Preview
+
+This unreleased work is not part of the production baseline above. The
+[preview guide](nccl-healthchecks.md) documents executable commands; the
+[design checklist](nccl-healthchecks-design.md#delivery-and-acceptance) tracks
+the complete delivery requirements.
+
+| Area | Implementation | Evidence |
+| --- | --- | --- |
+| `nodes healthchecks` selection, passive default, explicit NCCL subset | Preview implemented | Automated CLI/parser tests; live submission |
+| Single-node, anchor-pair, exact-set, whole-pool, local-block planning | Preview implemented | Automated planning and manifest tests; live selected-node API preflight |
+| MPI Operator and existing Kueue admission | Preview implemented | Live admission exposed and verified a launcher-toleration fix; GPU execution validation remains separate |
+| `health profiles/list/get/results/logs/wait/cancel/cleanup` | Preview implemented | Automated CLI/workflow tests; live deadline handling and cleanup |
+| Ownership-bound logs, Kueue status, events, immutable private exports | Preview implemented | Automated identity, bounds, failure, and cleanup tests |
+| Full Slurm diagnostic parity and service handlers | In progress | NCCL alone does not cover passive host diagnostics, stress/SDC, or separate IB tests |
+| RCCL, Slinky reservations, specialized transports, periodic execution | Not yet implemented | Requests requiring these adapters are rejected |
+| Live single-node, multi-node, whole-pool, local-block, and cross-block success | Incomplete | Submission/admission is not proof of benchmark completion |
+
 ## Proposed
 
 - [ ] Synchronize Kueue ClusterQueue quotas after pool capacity changes.

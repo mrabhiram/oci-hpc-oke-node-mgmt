@@ -456,3 +456,25 @@ If table output is not convenient for automation, use JSON or CSV:
 mgmt-oke reconcile --format json
 mgmt-oke nodes list --format csv
 ```
+
+## NCCL Preview Prerequisites
+
+The CLI includes `nodes healthchecks` and the `health` run-management commands.
+Installation does not deploy MPI Operator, Kueue queues, SR-IOV attachments, or
+recurring diagnostic services. Benchmark admission uses existing cluster resources.
+
+```bash
+mgmt-oke health profiles
+mgmt-oke nodes healthchecks --pool <pool-name> \
+  --type active --checks nccl --queue <local-queue> --dry-run
+```
+
+Run the dry run with the identity that will submit tests. It checks permissions,
+GPU allocation, required operators, queue compatibility, and server admission.
+Reserve operator disk space for evidence at `~/.local/state/mgmt-oke/healthchecks`
+and worker disk space for the test image. Keep the same evidence directory when
+using `health wait`, `cancel`, or `cleanup` after reconnecting.
+
+See [NCCL Healthchecks](nccl-healthchecks.md#kubernetes-permissions) for the RBAC
+surface and preview limitations. Benchmark permissions do not require node
+cordon/drain, eviction, or OCI lifecycle mutation privileges.

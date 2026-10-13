@@ -11,6 +11,7 @@ from oke_hpc_mgmt.benchmarks.manifests import ExecutionOptions, TopologyPlacemen
 from oke_hpc_mgmt.benchmarks.models import (
     BenchmarkCase, BenchmarkError, BenchmarkParameters, HealthcheckPlan, HealthcheckRequest, NodeTarget,
 )
+from oke_hpc_mgmt.models import HealthResult
 
 
 CaseState = Literal["PLANNED", "SUBMITTING", "QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "INCOMPLETE", "CANCELLED"]
@@ -27,6 +28,7 @@ class EvidenceSnapshot:
     phase: SnapshotPhase
     pod_identities: tuple[tuple[str, str, str | None, int], ...]
     sha256: str
+    scheduling_sha256: str | None = None
 
     def validate(self) -> None:
         if self.phase not in {"QUEUED", "STARTING", "RUNNING", "TERMINAL", "CANCELLING"} or not (
@@ -34,6 +36,10 @@ class EvidenceSnapshot:
         ):
             raise BenchmarkError("Invalid evidence snapshot phase or digest.")
         timestamp(self.observed_at)
+        if self.scheduling_sha256 is not None and (
+            not isinstance(self.scheduling_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", self.scheduling_sha256)
+        ):
+            raise BenchmarkError("Invalid scheduling diagnostics digest.")
         names: set[str] = set()
         for name, uid, container_id, restarts in self.pod_identities:
             if not isinstance(name, str) or not name or name in names or not isinstance(uid, str) or not uid or (
@@ -181,6 +187,7 @@ def decode_record(payload: str, *, uid: str, resource_version: str) -> RunRecord
             cases.append(BenchmarkCase(**case))
         for key in ("selected_nodes", "passive_nodes", "warnings"):
             plan[key] = tuple(plan.get(key, []))
+        plan["passive_checks"] = tuple(HealthResult(**_keys(item, HealthResult)) for item in plan.get("passive_checks", []))
         typed_plan = HealthcheckPlan(request=typed_request, cases=tuple(cases), **plan)
         option_values = _keys(value.pop("options"), ExecutionOptions)
         placements: list[TopologyPlacement] = []
