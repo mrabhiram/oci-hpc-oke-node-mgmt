@@ -8,7 +8,7 @@ from oke_hpc_mgmt.backends.kubeconfig import (
     load_oke_kubeconfig_context,
 )
 from oke_hpc_mgmt.backends.kubernetes import KubernetesBackend
-from oke_hpc_mgmt.backends.oci import OciBackend, OciDiscoveryError
+from oke_hpc_mgmt.backends.oci import OciAuthenticationError, OciBackend, OciDiscoveryError
 from oke_hpc_mgmt.models import (
     SLINKY_HOSTNAME_PREFIX_LABEL,
     AddonInfo,
@@ -176,6 +176,8 @@ class DiscoveryService:
             self.options.compartment_id = self._oci().get_cluster_compartment_id(
                 self.options.cluster_id
             )
+        except OciAuthenticationError as exc:
+            self._oci_target_error = str(exc)
         except Exception as exc:
             self._oci_target_error = (
                 "Automatic compartment discovery from the OKE cluster failed: "

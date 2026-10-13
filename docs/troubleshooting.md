@@ -92,6 +92,23 @@ mgmt-oke --context <context-name> --auth instance_principal pools list
 The compartment is not parsed from kubeconfig. The tool calls OKE `GetCluster`
 with the discovered cluster OCID and reads `cluster.compartment_id`.
 
+If an older installation reports `expected str, bytes or os.PathLike object,
+not NoneType`, it passed an omitted OCI config path to the SDK while using
+config-file authentication. On an instance-principal operator, first select the
+correct authentication method and validate a plan without changing resources:
+
+```bash
+export OCI_AUTH=instance_principal
+mgmt-oke pools list
+mgmt-oke nodes terminate <node-name-or-ip> --tag unhealthy --dry-run
+```
+
+The authentication fix uses the SDK's default config lookup when no path is
+specified. It does not automatically switch authentication methods. For
+config-file authentication, configure the default OCI SDK profile or explicitly
+set `--oci-config-file` and `--oci-profile`. An explicit compartment ID cannot
+repair missing credentials or an authentication initialization failure.
+
 Validate instance-principal access:
 
 ```bash

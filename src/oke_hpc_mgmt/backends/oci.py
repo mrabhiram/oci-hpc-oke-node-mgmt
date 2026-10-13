@@ -33,6 +33,10 @@ class OciDiscoveryError(RuntimeError):
     """Raised when OCI discovery cannot run."""
 
 
+class OciAuthenticationError(OciDiscoveryError):
+    """Raised when the selected OCI credentials cannot be loaded."""
+
+
 class BootVolumeAttachmentPending(OciDiscoveryError):
     """Raised while a BVR instance has no active boot volume attachment."""
 
@@ -100,19 +104,35 @@ class OciBackend:
                 "The oci Python package is not installed. Install the project dependencies first."
             ) from exc
 
-        self._oci = oci
         if self.auth == "none":
-            raise OciDiscoveryError("OCI auth is disabled.")
+            raise OciAuthenticationError("OCI auth is disabled.")
+        config: dict[str, Any]
+        signer: Any = None
         if self.auth == "instance_principal":
-            self._config = {"region": self.region} if self.region else {}
-            self._signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+            config = {"region": self.region} if self.region else {}
+            signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
         elif self.auth == "resource_principal":
-            self._config = {"region": self.region} if self.region else {}
-            self._signer = oci.auth.signers.get_resource_principals_signer()
+            config = {"region": self.region} if self.region else {}
+            signer = oci.auth.signers.get_resource_principals_signer()
         else:
-            self._config = oci.config.from_file(file_location=self.config_file, profile_name=self.profile)
+            try:
+                if self.config_file is None:
+                    config = oci.config.from_file(profile_name=self.profile)
+                else:
+                    config = oci.config.from_file(file_location=self.config_file, profile_name=self.profile)
+            except (oci.exceptions.ConfigFileNotFound, oci.exceptions.ProfileNotFound,
+                    oci.exceptions.InvalidConfig, OSError, ValueError) as exc:
+                raise OciAuthenticationError(
+                    f"OCI config-file authentication failed: {exc}. "
+                    "On an OKE operator using instance principals, set "
+                    "OCI_AUTH=instance_principal or pass --auth instance_principal."
+                ) from exc
             if self.region:
-                self._config["region"] = self.region
+                config["region"] = self.region
+        # Publish initialized state only after credentials or the signer load successfully.
+        self._config = config
+        self._signer = signer
+        self._oci = oci
 
     @property
     def oci(self):

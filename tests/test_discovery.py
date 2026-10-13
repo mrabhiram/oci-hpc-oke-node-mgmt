@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from oke_hpc_mgmt.backends.kubeconfig import KubeconfigDiscoveryError, OkeKubeconfigContext
-from oke_hpc_mgmt.backends.oci import OciDiscoveryError
+from oke_hpc_mgmt.backends.oci import OciAuthenticationError, OciDiscoveryError
 from oke_hpc_mgmt.discovery import DiscoveryOptions, DiscoveryService
 from oke_hpc_mgmt.models import AddonInfo, NodeInfo, WorkerPoolInfo
 
@@ -84,6 +84,16 @@ def _service(oci_backend=None, kubernetes_backend=None, **overrides):
 
 
 class DiscoveryTests(unittest.TestCase):
+    def test_authentication_failure_does_not_recommend_a_compartment_override(self) -> None:
+        message = "OCI config-file authentication failed; use --auth instance_principal."
+        service = _service(compartment_id=None, region="test-region")
+        with patch("oke_hpc_mgmt.discovery.OciBackend") as backend:
+            backend.return_value.get_cluster_compartment_id.side_effect = OciAuthenticationError(message)
+            with self.assertRaises(OciDiscoveryError) as caught:
+                service.resolve_oci_target(require_compartment=True)
+        self.assertEqual(message, str(caught.exception))
+        self.assertNotIn("--compartment-id", str(caught.exception))
+
     @patch("oke_hpc_mgmt.discovery.load_oke_kubeconfig_context")
     def test_cluster_region_and_compartment_are_discovered_automatically(self, load_context):
         load_context.return_value = OkeKubeconfigContext(

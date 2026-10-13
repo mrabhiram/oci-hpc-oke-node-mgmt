@@ -154,6 +154,11 @@ For the current shell, select instance principal authentication:
 export OCI_AUTH=instance_principal
 ```
 
+Authentication is separate from cluster and compartment discovery. Without
+`OCI_AUTH` or `--auth`, the tool selects `config_file` and uses the OCI SDK's
+default config-file lookup. A working `kubectl` configuration does not select
+instance-principal authentication for the tool's OCI API calls.
+
 With an OCI-generated kubeconfig selected, the tool automatically reads the OKE
 cluster OCID and region from kubeconfig and obtains the compartment OCID from
 the OCI OKE `GetCluster` API. No cluster-specific OCIDs need to be added to the
