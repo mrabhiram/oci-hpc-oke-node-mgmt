@@ -46,6 +46,27 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(self.checkpoint.uid, payload["run_uid"])
         self.assertEqual([path.name], [item.name for item in path.parent.iterdir()])
 
+    def test_legacy_exports_omit_only_missing_null_freshness_defaults(self) -> None:
+        case = replace(self.case, profile_fingerprint=None)
+        run = replace(self.checkpoint, plan=replace(self.checkpoint.plan, cases=(case, *self.checkpoint.plan.cases[1:])))
+        receipt = self.store.export(run, case, self.evidence)
+        path = self.root / receipt.relative_path
+        payload = json.loads(path.read_bytes())
+        payload["case"].pop("profile_fingerprint")
+        for node in payload["case"]["nodes"]:
+            node.pop("boot_id")
+        encoded = json.dumps(payload).encode()
+        digest = hashlib.sha256(encoded).hexdigest()
+        legacy = path.parent / f"{case.case_id}-{digest}.json"
+        legacy.write_bytes(encoded)
+        legacy.chmod(0o600)
+        self.assertEqual(payload, self.store.verify(run, case, digest))
+        for changed in (replace(case, profile_fingerprint="a" * 64),
+                        replace(case, nodes=(replace(case.nodes[0], boot_id="new-boot"),))):
+            altered = replace(run, plan=replace(run.plan, cases=(changed, *run.plan.cases[1:])))
+            with self.assertRaisesRegex(BenchmarkError, "identity"):
+                self.store.verify(altered, changed, digest)
+
     def test_duplicate_snapshot_can_reuse_identical_content_without_overwrite(self) -> None:
         with patch("oke_hpc_mgmt.benchmarks.artifacts.datetime") as clock:
             clock.now.return_value.isoformat.return_value = "2026-01-01T00:00:00+00:00"

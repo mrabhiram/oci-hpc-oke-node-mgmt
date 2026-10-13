@@ -101,6 +101,8 @@ def validate_runtime_nodes(
         metadata, spec, status = node["metadata"], node.get("spec") or {}, node.get("status") or {}
         if metadata.get("uid") != target.uid:
             raise BenchmarkError(f"Node {target.name} was replaced after planning; replan using its new UID.")
+        if target.boot_id and (status.get("nodeInfo") or {}).get("bootID") != target.boot_id:
+            raise BenchmarkError(f"Node {target.name} boot identity changed or is unavailable; replan the test.")
         if not metadata.get("resourceVersion"):
             raise BenchmarkError(f"Missing resource version for {target.name}.")
         if metadata.get("deletionTimestamp") or spec.get("unschedulable"):

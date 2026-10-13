@@ -17,6 +17,14 @@
 - `services update-metadata` only exports observations and updates checkpoints.
   It does not start pending cases, enforce deadlines, or clean up resources.
   A successful refresh is not a successful benchmark; inspect the case verdicts.
+- Service `INELIGIBLE` decisions can reflect application Pods, an unfinished run,
+  missing boot identity, node pressure, or insufficient Ready stability. Resolve
+  the reported condition externally; service passes never evict workloads.
+- `NEEDS_ACTIVE` requires matching passing local evidence and its cooldown;
+  a different image, iteration count, node boot, or profile does not qualify.
+  `NO_PARTNER` retains a suspect pair for investigation instead of repeating it
+  indefinitely or labelling both nodes defective. `DEFERRED` means the explicit
+  case bound was reached; a later pass can select remaining overdue nodes.
 - After a lost response, inspect or wait on the same run ID. Do not create a
   second run merely because the first invocation lost its connection.
 - Evidence-export failures retain workloads. Verify operator storage and use

@@ -5,12 +5,18 @@ workers. The command terminology follows OCI HPC Slurm: `nodes healthchecks`
 selects the diagnostic category, while `health` manages recorded runs.
 
 `services update-metadata` provides a single observation-only service pass.
+`services active-hc` and `services multi-node-hc` select eligible, overdue NCCL
+participants for a bounded execution pass.
 
 This feature is a preview. The executable diagnostic component is NCCL. Full
 host diagnostics, GPU stress/SDC, separate InfiniBand bandwidth/latency checks,
 RCCL, Slurm reservations, specialized transports, and periodic services remain
 outside the currently executable subset. A missing component is not a passing
 check. Existing `health run` remains a read-only inventory evaluation.
+
+See [Profile Coverage](nccl-profile-coverage.md) for the exact shape/transport
+matrix and the distinction between implemented profiles and live validation.
+Profiles are packaged with the CLI; manifests are not fetched from GitHub at runtime.
 
 ## Prerequisites
 
@@ -153,6 +159,92 @@ be combined with `--pool`. More than `--max-runs` matches (default 32, maximum 1
 is an error, not a partial selection. Dry-run performs checkpoint reads only.
 Execution requires confirmation or `--yes`; success means the refresh completed,
 not that its observed benchmarks passed. No recurring service is installed.
+
+### Eligibility-Based Service Passes
+
+```bash
+mgmt-oke services active-hc --pool <pool-name> --checks nccl \
+  --queue <local-queue> --dry-run
+mgmt-oke services active-hc --pool <pool-name> --checks nccl \
+  --queue <local-queue> --max-cases 1 --wait
+mgmt-oke services multi-node-hc --pool <pool-name> --checks nccl \
+  --queue <local-queue> --dry-run
+```
+
+Specify exactly one of `--nodes`, `--fields`, or `--pool`. These service commands
+intentionally select a due subset and report a decision for every candidate;
+they are not exact-set or whole-pool benchmark commands. Explicit multi-node
+anchors may select a displayed partner in the same pool. Pool/field selection
+bounds the partner set.
+
+- Default interval is 24 hours, matching Slurm mgmt; override with
+  `--interval-hours`. `--max-cases` defaults to one and is bounded to 32.
+- Eligibility requires a Ready, schedulable, exclusive-GPU worker with no
+  pressure condition, stable Ready status for at least five minutes, and no
+  application Pods or GPU/VF allocations. DaemonSet/mirror infrastructure may
+  remain only when it does not allocate tested devices. Ready stability is not
+  claimed to be measured host uptime.
+- An unfinished benchmark reserves its recorded node identities. Service
+  selection does not bypass that reservation, customer admission, or Slinky
+  ownership.
+- Freshness requires the same node UID, boot identity, and effective profile,
+  including parameters, image reference, environment, and upstream revision.
+  Older records without those fields remain readable but are not fresh passes.
+  Newer failed/incomplete evidence takes precedence over an older pass.
+- Non-passing attempts use `--retry-seconds` (default 600). No automatic retry
+  occurs within that cooldown.
+- Multi-node candidates need matching successful local active evidence less
+  than 24 hours old and at least two minutes old. A failed pair needs a different
+  compatible partner. No alternate partner means no submission, not reuse of
+  the failed pair or an automatic hardware-fault label.
+- Selected case identities and policy are checkpointed and revalidated under
+  the submission Lease. A newly busy, rebooted, replaced, or no-longer-due node
+  causes refusal; the workflow never substitutes a different node after confirmation.
+
+`--dry-run` prints eligibility and validates selected manifests without creating
+a run. `--yes` confirms only the displayed selection. Without `--wait`, the pass
+returns its run ID after initial submission; `health wait <run-id>` advances it.
+A pass with no due candidates exits successfully while reporting why each was
+skipped; this is not a cluster health verdict. `services all`, recurring service
+installation, and full diagnostic suites remain unfinished.
+
+### Example Service Eligibility Output
+
+A fresh two-A100 service dry-run returned the following output. Node, pool,
+queue, and Pod names are replaced with example identifiers; the decisions and
+reasons are from the execution.
+
+```bash
+mgmt-oke services multi-node-hc --pool gpu-rdma --checks nccl \
+  --queue gpu-rdma-queue --iterations 3 --warmup-iterations 1 \
+  --dry-run --format json
+```
+
+```json
+[
+  {
+    "node": "gpu-01",
+    "partner": null,
+    "prior_run": null,
+    "reason": "Requires recent passing active evidence and cooldown.",
+    "record_type": "eligibility",
+    "state": "NEEDS_ACTIVE"
+  },
+  {
+    "node": "gpu-02",
+    "partner": null,
+    "prior_run": null,
+    "reason": "Application Pod kube-system/example-controller prevents an idle service test.",
+    "record_type": "eligibility",
+    "state": "INELIGIBLE"
+  }
+]
+```
+
+No benchmark was submitted. The current idle policy treats Deployment-owned
+infrastructure Pods as blocking as well as user applications; it does not exempt
+an entire namespace. Missing matching evidence is not proof of a GPU failure,
+and exit 0 here does not mean the multi-node test passed.
 
 ### Example Submission Output
 

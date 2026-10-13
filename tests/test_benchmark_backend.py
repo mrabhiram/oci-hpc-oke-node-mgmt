@@ -58,6 +58,16 @@ class BenchmarkBackendTests(unittest.TestCase):
         self.assertEqual((("gpu-01", "uid-1"),), self.backend.runtime_preflight(self.case).nodes)
         self.custom.create_namespaced_custom_object.assert_not_called()
 
+    def test_allocation_inventory_is_bounded_and_requires_a_pod_list(self) -> None:
+        for names in ((), ("gpu-01", "gpu-01")):
+            with self.assertRaisesRegex(BenchmarkError, "bounded unique"):
+                self.backend.read_allocation_inventory(names)
+        self.core.read_node.assert_not_called()
+        self.core.read_node.return_value = raw_inventory()[0]
+        self.core.list_pod_for_all_namespaces.return_value = {}
+        with self.assertRaisesRegex(BenchmarkError, "verified Pod list"):
+            self.backend.read_allocation_inventory(("gpu-01",))
+
     def test_read_and_list_validate_ownership_hash_and_namespaced_identity(self) -> None:
         self.assertEqual(self.checkpoint, self.backend.get_run("default", self.checkpoint.run_id))
         self.core.list_namespaced_config_map.return_value = {"items": [configmap(self.checkpoint)]}

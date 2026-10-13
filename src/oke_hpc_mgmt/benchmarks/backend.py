@@ -11,7 +11,7 @@ from oke_hpc_mgmt.benchmarks.manifests import (
     CASE_LABEL, MANAGED_BY, MPI_GROUP, MPI_PLURAL, MPI_VERSION, RUN_LABEL, case_name, owned_labels,
     render_mpijob, validate_run_id,
 )
-from oke_hpc_mgmt.benchmarks.models import BenchmarkCase, BenchmarkError
+from oke_hpc_mgmt.benchmarks.models import MAX_SELECTED_NODES, BenchmarkCase, BenchmarkError
 from oke_hpc_mgmt.benchmarks.preflight import PreflightEvidence, validate_runtime_nodes
 from oke_hpc_mgmt.benchmarks.records import RunRecord, decode_record, payload_digest
 
@@ -37,15 +37,22 @@ class BenchmarkBackend:
         return result
 
     def runtime_preflight(self, case: BenchmarkCase) -> PreflightEvidence:
+        nodes, pods = self.read_allocation_inventory(tuple(node.name for node in case.nodes))
+        return validate_runtime_nodes(case, nodes, pods)
+
+    def read_allocation_inventory(self, names: tuple[str, ...]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if not names or len(names) > MAX_SELECTED_NODES or len(set(names)) != len(names):
+            raise BenchmarkError("Allocation inventory requires a bounded unique node selection.")
         try:
-            nodes = [self._object(self.core.read_node(node.name, _request_timeout=REQUEST_TIMEOUT))
-                     for node in case.nodes]
+            nodes = [self._object(self.core.read_node(name, _request_timeout=REQUEST_TIMEOUT)) for name in names]
             pods = self._object(self.core.list_pod_for_all_namespaces(_request_timeout=REQUEST_TIMEOUT))
         except (ApiException, HTTPError, OSError) as exc:
             raise BenchmarkError("Cannot verify current node/GPU allocations; inventory is unavailable.") from exc
         if (pods.get("metadata") or {}).get("continue"):
             raise BenchmarkError("GPU allocation inventory is incomplete; refusing submission.")
-        return validate_runtime_nodes(case, nodes, pods.get("items", []))
+        if not isinstance(pods.get("items"), list):
+            raise BenchmarkError("GPU allocation inventory has no verified Pod list.")
+        return nodes, pods["items"]
 
     def _record(self, value: Any) -> RunRecord:
         obj = self._object(value)

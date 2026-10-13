@@ -40,6 +40,8 @@ capacity naturally vary by deployment.
 - [NCCL Healthchecks](./nccl-healthchecks.md): Preview explicit NVIDIA collective
   tests, recorded runs, results, logs, and evidence-preserving cleanup through
   existing MPI Operator and Kueue resources.
+- [NCCL Profile Coverage](./nccl-profile-coverage.md): Distinguish packaged shape
+  settings, missing upstream transport adapters, and actual live validation.
 - [Using JSON and CSV Output](./using-json-and-csv-output.md): Consume inventory
   safely from scripts, `jq`, spreadsheets, and monitoring workflows.
 

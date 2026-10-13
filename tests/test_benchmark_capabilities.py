@@ -19,6 +19,7 @@ from oke_hpc_mgmt.benchmarks.capabilities import (
 from oke_hpc_mgmt.benchmarks.manifests import ExecutionOptions, TopologyPlacement, render_mpijob
 from oke_hpc_mgmt.benchmarks.models import BenchmarkError
 from oke_hpc_mgmt.benchmarks.planning import plan_healthchecks
+from oke_hpc_mgmt.benchmarks.profiles import execution_fingerprint
 from oke_hpc_mgmt.benchmarks.records import RunRecord, decode_record
 from test_benchmark_planning import inventory, request
 
@@ -230,7 +231,8 @@ class CapabilityTests(unittest.TestCase):
 
     def test_vf_can_use_separate_resource_groups_and_keeps_topology_annotation(self) -> None:
         self.queue(topology=True)
-        self.plan = replace(self.plan, cases=(replace(self.plan.cases[0], network="vf"),))
+        self.plan = replace(self.plan, cases=(replace(self.plan.cases[0], network="vf", profile_fingerprint=
+                            execution_fingerprint(self.plan.cases[0].nodes[0].shape, "vf", self.plan.request)),))
         self.cluster["spec"]["resourceGroups"].append({"coveredResources": ["nvidia.com/rdma-vf"], "flavors": [
             {"name": "gpu-flavor", "resources": [{"name": "nvidia.com/rdma-vf", "nominalQuota": 64}]},
         ]})

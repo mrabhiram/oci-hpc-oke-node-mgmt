@@ -16,7 +16,7 @@ from oke_hpc_mgmt.benchmarks.diagnostics import SchedulingEvidence
 from oke_hpc_mgmt.benchmarks.evidence import CaseEvidence, EvidenceCollector, PodEvidence
 from oke_hpc_mgmt.benchmarks.lease import SubmissionLease
 from oke_hpc_mgmt.benchmarks.manifests import ExecutionOptions, render_mpijob
-from oke_hpc_mgmt.benchmarks.models import BenchmarkCase, BenchmarkError, HealthcheckPlan
+from oke_hpc_mgmt.benchmarks.models import BenchmarkCase, BenchmarkError, HealthcheckPlan, ServicePolicy
 from oke_hpc_mgmt.benchmarks.planning import plan_healthchecks
 from oke_hpc_mgmt.benchmarks.records import RunRecord, decode_record, mark_cancelling
 from oke_hpc_mgmt.benchmarks.workflow import BenchmarkWorkflow, PreparedRun, deadline_reason
@@ -171,6 +171,33 @@ class WorkflowTests(unittest.TestCase):
         self.backend.create_job.assert_not_called()
         self.backend.delete_job.assert_not_called()
         self.backend.cancel_job.assert_not_called()
+        self.assertFalse(self.held)
+
+    def test_service_guard_is_rechecked_under_lease_and_excludes_own_checkpoint(self) -> None:
+        self.plan = replace(self.plan, service_policy=ServicePolicy())
+        self.initial = replace(self.initial, plan=self.plan)
+        self.backend.read_allocation_inventory.return_value = ([], [])
+
+        def validate(*args) -> None:
+            self.assertTrue(self.held)
+            self.assertEqual((), args[5])
+
+        with patch("oke_hpc_mgmt.benchmarks.workflow.validate_service_case", side_effect=validate) as guard:
+            self.submit()
+        self.assertEqual(3, guard.call_count)  # Two planned cases, then the first submission.
+        self.assertEqual(1, len(self.jobs))
+
+    def test_service_allocation_change_after_confirmation_prevents_workload_creation(self) -> None:
+        self.plan = replace(self.plan, service_policy=ServicePolicy())
+        self.initial = replace(self.initial, plan=self.plan)
+        self.backend.read_allocation_inventory.return_value = ([], [])
+        with patch("oke_hpc_mgmt.benchmarks.workflow.validate_service_case",
+                   side_effect=[None, None, BenchmarkError("Application Pod arrived")]):
+            with self.assertRaisesRegex(BenchmarkError, "Application Pod arrived"):
+                self.submit()
+        self.assertIsNotNone(self.current)
+        self.assertEqual({}, self.jobs)
+        self.backend.create_job.assert_not_called()
         self.assertFalse(self.held)
 
     def test_metadata_refresh_never_enforces_deadlines_or_changes_cancellation_intent(self) -> None:

@@ -749,6 +749,8 @@ mgmt-oke health cancel <run-id>
 mgmt-oke health cleanup <run-id>
 mgmt-oke services update-metadata --run-id <run-id> --dry-run
 mgmt-oke services update-metadata --pool <pool-name> --namespace <namespace> --yes
+mgmt-oke services active-hc --pool <pool-name> --checks nccl --queue <local-queue> --dry-run
+mgmt-oke services multi-node-hc --pool <pool-name> --checks nccl --queue <local-queue> --dry-run
 ```
 
 Exactly one primary selector is required. Passive defaults to API readiness and
@@ -766,6 +768,17 @@ Use repeatable `--run-id` or `--pool`, not both. The pass refuses more than
 Exit status 0 means the refresh completed, not that benchmarks passed. The
 command writes checkpoints/exports but never submits, cancels, or deletes
 workloads; pending cases and deadlines still require `health wait`.
+
+`services active-hc` and `multi-node-hc` select a bounded due subset, not an
+exact-set collective. Choose one of `--nodes`, `--fields`, or `--pool`, and
+explicitly request `--checks nccl`. Defaults are `--interval-hours 24`,
+`--retry-seconds 600`, and `--max-cases 1` (maximum 32). GPU-idle/application-idle
+state, Ready stability, boot/profile freshness, active-check prerequisites, and
+alternate-partner rules are checked before submission. Every candidate decision
+is reported. Dry-run validates selected manifests without persistence; execution
+requires confirmation or `--yes`. Use `--wait` to advance/grade the submitted run.
+No eligible work returns 0 with skip reasons, not a passing health verdict.
+See [service semantics](nccl-healthchecks.md#eligibility-based-service-passes).
 
 ## Exit Status
 

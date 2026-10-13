@@ -5,7 +5,7 @@ import unittest
 from dataclasses import replace
 
 from oke_hpc_mgmt.benchmarks.manifests import ExecutionOptions
-from oke_hpc_mgmt.benchmarks.models import BenchmarkError, HealthcheckRequest
+from oke_hpc_mgmt.benchmarks.models import BenchmarkError, HealthcheckRequest, ServicePolicy
 from oke_hpc_mgmt.benchmarks.planning import plan_healthchecks
 from oke_hpc_mgmt.benchmarks.records import (
     EvidenceSnapshot, RunRecord, assert_no_overlap, decode_record, mark_cancelling, next_cases, payload_digest, timestamp,
@@ -23,6 +23,31 @@ def record() -> RunRecord:
 
 
 class BenchmarkRecordTests(unittest.TestCase):
+    def test_service_policy_and_profile_identity_roundtrip_with_legacy_defaults(self) -> None:
+        initial = record()
+        initial = replace(initial, plan=replace(initial.plan, service_policy=ServicePolicy()))
+        decoded = decode_record(initial.payload(), uid="run-uid", resource_version="1")
+        self.assertEqual(initial, decoded)
+        self.assertIsInstance(decoded.plan.service_policy, ServicePolicy)
+        payload = json.loads(initial.payload())
+        payload["plan"].pop("service_policy")
+        for case in payload["plan"]["cases"]:
+            case.pop("profile_fingerprint")
+            for node in case["nodes"]:
+                node.pop("boot_id")
+        legacy = decode_record(json.dumps(payload), uid="run-uid", resource_version="1")
+        self.assertIsNone(legacy.plan.service_policy)
+        self.assertIsNone(legacy.plan.cases[0].profile_fingerprint)
+        for key, value in (("profile_fingerprint", "invalid"), ("profile_fingerprint", True)):
+            malformed = json.loads(initial.payload())
+            malformed["plan"]["cases"][0][key] = value
+            with self.assertRaisesRegex(BenchmarkError, "profile fingerprint"):
+                decode_record(json.dumps(malformed), uid="run-uid", resource_version="1")
+        malformed = json.loads(initial.payload())
+        malformed["plan"]["cases"][0]["nodes"][0]["boot_id"] = 1
+        with self.assertRaisesRegex(BenchmarkError, "boot identity"):
+            decode_record(json.dumps(malformed), uid="run-uid", resource_version="1")
+
     def test_overlaps_reserve_planned_and_active_nodes_across_namespaces_by_uid(self) -> None:
         current = record()
         other = replace(current, uid="other-uid", plan=replace(current.plan, request=replace(current.plan.request, namespace="other")))

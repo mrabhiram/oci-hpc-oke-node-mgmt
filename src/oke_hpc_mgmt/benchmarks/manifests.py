@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from oke_hpc_mgmt.benchmarks.models import BenchmarkCase, BenchmarkError, HealthcheckRequest
-from oke_hpc_mgmt.benchmarks.profiles import get_profile, profile_environment
+from oke_hpc_mgmt.benchmarks.profiles import execution_fingerprint, get_profile, profile_environment
 
 
 MANAGED_BY = "mgmt-oke-healthchecks"
@@ -255,6 +255,8 @@ def render_mpijob(
     if len({(node.pool, node.shape, node.gpu_count) for node in case.nodes}) != 1:
         raise BenchmarkError("MPIJob participants must share a pool and reviewed hardware profile.")
     profile = get_profile(case.nodes[0].shape)
+    if case.profile_fingerprint and case.profile_fingerprint != execution_fingerprint(profile.shape, case.network, request):
+        raise BenchmarkError("Recorded execution profile differs from this build; do not change an existing test contract.")
     if any(not node.uid or node.gpu_count != profile.gpu_count for node in case.nodes):
         raise BenchmarkError("Every participant needs a node UID and the profile's exact GPU count.")
     if request.parameters.max_bytes > profile.max_bytes:

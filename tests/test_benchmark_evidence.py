@@ -92,6 +92,13 @@ class EvidenceTests(unittest.TestCase):
             self.assertTrue(str(method).startswith("call.read_") or str(method).startswith("call.list_"))
         self.backend.custom.create_namespaced_custom_object.assert_not_called()
 
+    def test_rebooted_worker_cannot_inherit_selected_boot_evidence(self) -> None:
+        self.case = replace(self.case, nodes=(replace(self.case.nodes[0], boot_id="original-boot"),))
+        self.checkpoint = replace(self.checkpoint, plan=replace(self.checkpoint.plan, cases=(self.case, *self.checkpoint.plan.cases[1:])))
+        result = self.collect()
+        self.assertFalse(result.coverage_complete)
+        self.assertIn("Selected node boot identity changed", " ".join(result.pods[0].warnings))
+
     def test_labels_alone_do_not_authorize_log_access(self) -> None:
         self.pods[0]["metadata"]["ownerReferences"] = []
         with self.assertRaisesRegex(BenchmarkError, "controller owner"):

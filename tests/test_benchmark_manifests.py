@@ -15,7 +15,7 @@ from oke_hpc_mgmt.benchmarks.manifests import (
 )
 from oke_hpc_mgmt.benchmarks.models import BenchmarkError
 from oke_hpc_mgmt.benchmarks.planning import plan_healthchecks
-from oke_hpc_mgmt.benchmarks.profiles import PROFILES
+from oke_hpc_mgmt.benchmarks.profiles import PROFILES, execution_fingerprint
 from test_benchmark_planning import inventory, request
 
 
@@ -29,7 +29,14 @@ class BenchmarkManifestTests(unittest.TestCase):
         self.options = ExecutionOptions()
 
     def render(self, **changes):
-        return render_mpijob(RUN, replace(self.case, **changes), self.request, self.options)
+        case = replace(self.case, **changes)
+        if case.nodes:
+            case = replace(case, profile_fingerprint=execution_fingerprint(case.nodes[0].shape, case.network, self.request))
+        return render_mpijob(RUN, case, self.request, self.options)
+
+    def test_recorded_profile_cannot_be_replaced_by_new_renderer_defaults(self) -> None:
+        with self.assertRaisesRegex(BenchmarkError, "Recorded execution profile"):
+            render_mpijob(RUN, replace(self.case, profile_fingerprint="f" * 64), self.request, self.options)
 
     def test_resource_names_and_options_are_bounded(self) -> None:
         validate_run_id(RUN)

@@ -134,9 +134,11 @@ Management Tool.
 - [`replacing-worker-boot-volumes.md`](replacing-worker-boot-volumes.md)
 - [`kubernetes-upgrades.md`](kubernetes-upgrades.md)
 
-The NCCL preview includes one-shot `services update-metadata` observations.
-Automatic eligibility-based active/multi-node services and recurring scheduling
-remain separate, unfinished work.
+The NCCL preview includes one-shot `services update-metadata` observations and
+bounded eligibility-based `services active-hc` / `multi-node-hc` passes.
+Combined `services all`, full diagnostic coverage, and recurring scheduling
+remain unfinished. See [profile coverage](nccl-profile-coverage.md) for shape
+and transport implementation versus live validation.
 
 ## Not Implemented Yet
 

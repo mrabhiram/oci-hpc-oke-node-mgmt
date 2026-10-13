@@ -9,7 +9,7 @@ from typing import Any, Literal, cast
 
 from oke_hpc_mgmt.benchmarks.manifests import ExecutionOptions, TopologyPlacement, case_name, validate_run_id
 from oke_hpc_mgmt.benchmarks.models import (
-    BenchmarkCase, BenchmarkError, BenchmarkParameters, HealthcheckPlan, HealthcheckRequest, NodeTarget,
+    BenchmarkCase, BenchmarkError, BenchmarkParameters, HealthcheckPlan, HealthcheckRequest, NodeTarget, ServicePolicy,
 )
 from oke_hpc_mgmt.models import HealthResult
 
@@ -94,6 +94,8 @@ class RunRecord:
     def create(cls, run_id: str, plan: HealthcheckPlan, options: ExecutionOptions) -> RunRecord:
         validate_run_id(run_id)
         plan.request.validate()
+        if plan.service_policy:
+            plan.service_policy.validate()
         options.validate()
         if not plan.cases:
             raise BenchmarkError("Passive checks do not create persistent workload runs.")
@@ -182,12 +184,21 @@ def decode_record(payload: str, *, uid: str, resource_version: str) -> RunRecord
                 node = _keys(node_value, NodeTarget)
                 node["topology"] = tuple(node["topology"]) if node.get("topology") else None
                 node["tolerations"] = tuple(node.get("tolerations", []))
+                if node.get("boot_id") is not None and (not isinstance(node["boot_id"], str) or not node["boot_id"]):
+                    raise BenchmarkError("Invalid node boot identity in checkpoint.")
                 nodes.append(NodeTarget(**node))
             case["nodes"], case["anchors"] = tuple(nodes), tuple(case["anchors"])
+            if case.get("profile_fingerprint") is not None and (
+                not isinstance(case["profile_fingerprint"], str) or not re.fullmatch(r"[a-f0-9]{64}", case["profile_fingerprint"])
+            ):
+                raise BenchmarkError("Invalid profile fingerprint in checkpoint.")
             cases.append(BenchmarkCase(**case))
         for key in ("selected_nodes", "passive_nodes", "warnings"):
             plan[key] = tuple(plan.get(key, []))
         plan["passive_checks"] = tuple(HealthResult(**_keys(item, HealthResult)) for item in plan.get("passive_checks", []))
+        if plan.get("service_policy") is not None:
+            plan["service_policy"] = ServicePolicy(**_keys(plan["service_policy"], ServicePolicy))
+            plan["service_policy"].validate()
         typed_plan = HealthcheckPlan(request=typed_request, cases=tuple(cases), **plan)
         option_values = _keys(value.pop("options"), ExecutionOptions)
         placements: list[TopologyPlacement] = []

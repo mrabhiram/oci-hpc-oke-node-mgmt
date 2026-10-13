@@ -204,10 +204,14 @@ the complete delivery requirements.
 | `health profiles/list/get/results/logs/wait/cancel/cleanup` | Preview implemented | Automated CLI/workflow tests; live deadline handling and cleanup |
 | Ownership-bound logs, Kueue status, events, immutable private exports | Preview implemented | Automated identity, bounds, failure, and cleanup tests |
 | `services update-metadata` observation-only pass | Preview implemented | Automated selection, identity, confirmation, and no-workload-mutation tests; live evidence refresh |
-| Full Slurm diagnostic parity and eligibility-based service handlers | In progress | NCCL alone does not cover passive host diagnostics, stress/SDC, or separate IB tests |
+| `services active-hc` / `multi-node-hc` bounded NCCL passes | Preview implemented | Automated freshness, boot/profile identity, idle allocation, cooldown, alternate-partner, CLI, and submission-race tests |
+| Full Slurm diagnostic parity and combined service orchestration | In progress | NCCL alone does not cover passive host diagnostics, stress/SDC, separate IB tests, or `services all` |
 | RCCL, Slinky reservations, specialized transports, periodic execution | Not yet implemented | Requests requiring these adapters are rejected |
 | Live single-node NCCL success | Validated on BM.GPU4.8 | Eight A100 ranks; correctness and coverage PASS; local transport; performance UNGRADED |
 | Live multi-node, whole-pool, local-block, and cross-block success | Incomplete | Single-node success does not establish RDMA or complete validation coverage |
+
+The [profile coverage matrix](nccl-profile-coverage.md) lists upstream shapes and
+transport variants that still need implementation or live validation.
 
 ## Proposed
 

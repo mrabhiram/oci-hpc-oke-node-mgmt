@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Literal
 
-from oke_hpc_mgmt.benchmarks.models import BenchmarkError, REPORT_BYTES, SOURCE_REVISION
+from oke_hpc_mgmt.benchmarks.models import BenchmarkError, HealthcheckRequest, REPORT_BYTES, SOURCE_REVISION
 
 
 DEFAULT_IMAGE = (
@@ -70,6 +72,15 @@ def get_profile(shape: str) -> NcclProfile:
         if profile.shape == shape:
             return profile
     raise BenchmarkError(f"No reviewed execution profile for shape {shape}; refusing substitution.")
+
+
+def execution_fingerprint(shape: str, network: str, request: HealthcheckRequest) -> str:
+    """Version the effective test contract, independently of participant names."""
+    profile = get_profile(shape)
+    value = {"version": 1, "profile": asdict(profile), "network": network,
+             "image": request.image or profile.image, "parameters": asdict(request.parameters),
+             "environment": profile_environment(profile, network, request.environment), "checks": request.checks}
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
 def validate_exclusive_gpu_labels(labels: dict[str, str], gpu_count: int) -> None:

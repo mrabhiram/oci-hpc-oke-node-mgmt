@@ -11,10 +11,13 @@ from click.testing import CliRunner
 
 from oke_hpc_mgmt.benchmarks.backend import BenchmarkBackend
 from oke_hpc_mgmt.benchmarks.models import BenchmarkError
+from oke_hpc_mgmt.benchmarks.service_policy import ServiceDecision, ServiceSelection
+from oke_hpc_mgmt.benchmarks.workflow import PreparedRun
 from oke_hpc_mgmt.benchmarks.workflow import BenchmarkWorkflow
 from oke_hpc_mgmt.commands import cli
 from oke_hpc_mgmt.commands.services import select_refresh_runs
 from test_benchmark_records import RUN, record
+from test_benchmark_planning import inventory
 
 
 MODULE = "oke_hpc_mgmt.commands.services."
@@ -121,3 +124,73 @@ class MetadataServiceTests(unittest.TestCase):
                 self.assertIn("update-metadata", result.output)
             self.assertIn("Never submit, cancel", result.output)
             service.assert_not_called()
+
+
+class HealthcheckServiceCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.backend = Mock(spec=BenchmarkBackend)
+        self.backend.read_allocation_inventory.return_value = ([], [])
+        self.backend.list_runs.return_value = ()
+        self.run = replace(record(), uid="run-uid", resource_version="1")
+        self.selection = ServiceSelection((ServiceDecision("gpu-01", "SELECTED", "Initial validation"),), self.run.plan)
+        self.workflow = Mock(spec=BenchmarkWorkflow)
+        capabilities = Mock()
+        capabilities.warnings = ()
+        self.workflow.prepare.return_value = PreparedRun(self.run, capabilities)
+        self.workflow.submit.return_value = self.run
+        self.workflow.wait.return_value = self.run
+
+    def invoke(self, category="active-hc", options=()):
+        with patch(MODULE + "CliState.service") as service, patch(MODULE + "BenchmarkBackend", return_value=self.backend), \
+                patch(MODULE + "select_service_plan", return_value=self.selection) as select, \
+                patch(MODULE + "BenchmarkWorkflow", return_value=self.workflow):
+            service.return_value.discover.return_value = inventory(4)
+            result = CliRunner(mix_stderr=False).invoke(cli, ["services", category, "--pool", "gpu-pool", "--checks", "nccl", "--format", "json", *options],
+                                       input="no\n", standalone_mode=False)
+        return result, select
+
+    def test_service_dry_run_validates_without_submitting_and_keeps_structured_output(self) -> None:
+        for category in ("active-hc", "multi-node-hc"):
+            result, select = self.invoke(category, ("--dry-run",))
+            self.assertEqual(0, result.return_value, result.exception)
+            rows = json.loads(result.stdout)
+            self.assertEqual("eligibility", rows[0]["record_type"])
+            self.assertEqual("planned-case", rows[1]["record_type"])
+            self.assertEqual("active" if category == "active-hc" else "multi-node", select.call_args.args[1].check_type)
+            self.workflow.submit.assert_not_called()
+
+    def test_service_no_candidates_reports_decisions_without_workflow(self) -> None:
+        self.selection = ServiceSelection((ServiceDecision("gpu-01", "FRESH", "Fresh evidence"),), None)
+        result, _ = self.invoke()
+        self.assertEqual(0, result.return_value, result.exception)
+        self.assertEqual("FRESH", json.loads(result.stdout)[0]["state"])
+        self.workflow.prepare.assert_not_called()
+        self.workflow.submit.assert_not_called()
+
+    def test_yes_submits_exact_prepared_plan_and_wait_reports_nonterminal_status(self) -> None:
+        result, _ = self.invoke(options=("--yes",))
+        self.assertEqual(0, result.return_value, result.exception)
+        self.workflow.submit.assert_called_once_with(self.workflow.prepare.return_value)
+        self.workflow.wait.assert_not_called()
+        self.assertEqual("run", json.loads(result.stdout)[-1]["record_type"])
+        result, _ = self.invoke(options=("--yes", "--wait", "--observation-timeout", "120"))
+        self.assertEqual(3, result.return_value, result.exception)
+        self.workflow.wait.assert_called_once_with("default", RUN, observation_timeout=120)
+
+    def test_missing_selector_or_component_never_connects(self) -> None:
+        with patch(MODULE + "CliState.service") as service:
+            for options in (("--checks", "nccl"), ("--pool", "gpu-pool")):
+                result = CliRunner().invoke(cli, ["services", "active-hc", *options], standalone_mode=False)
+                self.assertNotEqual(0, result.exit_code)
+            service.assert_not_called()
+
+    def test_service_help_and_declined_confirmation_do_not_submit(self) -> None:
+        with patch(MODULE + "CliState.service") as service:
+            for category in ("active-hc", "multi-node-hc"):
+                result = CliRunner().invoke(cli, ["services", category, "--help"])
+                self.assertEqual(0, result.exit_code, result.output)
+                self.assertIn("--interval-hours", result.output)
+            service.assert_not_called()
+        result, _ = self.invoke()
+        self.assertNotEqual(0, result.exit_code)
+        self.workflow.submit.assert_not_called()

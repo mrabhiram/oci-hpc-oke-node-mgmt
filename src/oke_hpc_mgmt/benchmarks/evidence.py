@@ -207,6 +207,9 @@ class EvidenceCollector:
             node_uid = node_metadata.get("uid")
             if node_metadata.get("name") != identity[1] or not node_uid:
                 raise BenchmarkError("Node identity is unavailable for the observed Pod.")
+            target = next((item for item in case.nodes if item.name == identity[1]), None)
+            if target and target.boot_id and (node.get("status") or {}).get("nodeInfo", {}).get("bootID") != target.boot_id:
+                warnings.append("Selected node boot identity changed; this observation cannot establish success.")
         if role == "worker" and (identity[1], node_uid) not in {(node.name, node.uid) for node in case.nodes}:
             warnings.append("Worker is not on an originally selected node UID.")
         image_id = after_status.get("imageID")

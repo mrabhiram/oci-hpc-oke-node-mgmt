@@ -152,6 +152,7 @@ class NodeTarget:
     topology: tuple[str, str, str] | None
     instance_id: str | None
     tolerations: tuple[str, ...] = ()
+    boot_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -162,10 +163,35 @@ class BenchmarkCase:
     anchors: tuple[str, ...]
     network: Literal["local", "host", "vf"]
     repetition: int
+    profile_fingerprint: str | None = None
 
     @property
     def ranks(self) -> int:
         return sum(node.gpu_count for node in self.nodes)
+
+
+@dataclass(frozen=True)
+class ServicePolicy:
+    interval_seconds: int = 86400
+    retry_seconds: int = 600
+    min_ready_seconds: int = 300
+    active_validity_seconds: int = 86400
+    active_cooldown_seconds: int = 120
+    max_cases: int = 1
+
+    def validate(self) -> None:
+        for name, value, low, high in (
+            ("interval", self.interval_seconds, 60, 31536000),
+            ("retry interval", self.retry_seconds, 60, 86400),
+            ("Ready stability", self.min_ready_seconds, 300, 86400),
+            ("active validity", self.active_validity_seconds, 60, 31536000),
+            ("active cooldown", self.active_cooldown_seconds, 120, 86400),
+            ("max cases", self.max_cases, 1, 32),
+        ):
+            if type(value) is not int or not low <= value <= high:
+                raise BenchmarkError(f"Service {name} must be an integer in {low}..{high}.")
+        if self.active_validity_seconds <= self.active_cooldown_seconds:
+            raise BenchmarkError("Active evidence validity must exceed the multi-node cooldown.")
 
 
 @dataclass(frozen=True)
@@ -176,6 +202,7 @@ class HealthcheckPlan:
     passive_nodes: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     passive_checks: tuple[HealthResult, ...] = ()
+    service_policy: ServicePolicy | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

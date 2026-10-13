@@ -3,8 +3,9 @@
 Status: implementation in progress. The NCCL subset now exposes
 `nodes healthchecks` and the `health` run-management commands, backed by tested
 planning, preflight, checkpoint, evidence, and execution workflows. An observation-only
-`services update-metadata` pass is available. Eligibility-based services,
-full diagnostic coverage, additional adapters, and the full live validation
+`services update-metadata` pass is available. Bounded `active-hc` and `multi-node-hc`
+passes now select overdue idle participants using identity/profile freshness.
+Full diagnostic coverage, combined/periodic services, additional adapters, and the full live validation
 matrix remain incomplete. Existing `mgmt-oke health run` behavior is unchanged.
 See [NCCL Healthchecks](nccl-healthchecks.md) for the executable preview interface.
 

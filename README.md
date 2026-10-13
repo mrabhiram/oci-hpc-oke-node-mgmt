@@ -175,6 +175,7 @@ Command groups:
 | `health profiles\|list\|get\|results\|logs` | Inspect NCCL profiles, recorded runs, verdicts, and owned logs without submitting workloads. |
 | `health wait\|cancel\|cleanup <run-id>` | Advance an existing NCCL run, cancel owned workloads, or verify evidence and clean up terminal resources. |
 | `services update-metadata` | Refresh recorded healthcheck evidence once without submitting, cancelling, or deleting workloads. |
+| `services active-hc\|multi-node-hc` | Run a bounded NCCL service pass over explicitly selected idle, overdue nodes; no recurring schedule is installed. |
 | `recommendations list` | Show actionable warnings and failures. |
 | `reconcile` | Show a full discovery snapshot. |
 | `upgrades status [--to <version>]` | Show current and target versions, add-on compatibility, scheduler state, and supported strategies. |
@@ -735,6 +736,8 @@ cases, enforce deadlines, or clean up workloads. `health wait` handles those ste
 See [NCCL Healthchecks](docs/nccl-healthchecks.md) for selection, profiles,
 permissions, result interpretation, cancellation, and evidence-preserving cleanup.
 Full Slurm diagnostic suites and service scheduling remain under development.
+The [profile coverage matrix](docs/nccl-profile-coverage.md) lists implemented
+shapes, missing upstream adapters, and actual live validation separately.
 
 ### RDMA topology
 

@@ -724,6 +724,15 @@ submissions, and exports/assesses existing attempts. It never calls workload
 creation, cancellation, deletion, or deadline enforcement. Unsubmitted cases and
 cancellation intent are left for their explicit execution workflows.
 
+Eligibility-based `active-hc` and `multi-node-hc` service passes reuse the same
+workflow. A pure policy planner reports every candidate decision, selects bounded
+idle participants, and records the policy in the immutable plan. Preparation,
+confirmation-time submission, and each case's final preflight recheck current
+allocations and history. Freshness uses node UID/boot identity and a recorded
+profile fingerprint; null legacy fields never establish a fresh pass. Failed
+multi-node attempts exclude previous partners without attributing hardware fault.
+No recurring controller or `services all` orchestration is installed yet.
+
 The launcher resolves each worker within its bounded startup interval, then
 records a run-local SSH address mapping and pins its host keys. Subsequent SSH
 launches use that address instead of depending on another DNS lookup during

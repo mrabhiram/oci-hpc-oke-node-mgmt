@@ -11,7 +11,7 @@ from oke_hpc_mgmt.benchmarks.models import (
     MAX_CASES, MAX_SELECTED_NODES, BenchmarkCase, BenchmarkError,
     HealthcheckPlan, HealthcheckRequest, NodeTarget,
 )
-from oke_hpc_mgmt.benchmarks.profiles import get_profile, profile_environment, validate_exclusive_gpu_labels
+from oke_hpc_mgmt.benchmarks.profiles import execution_fingerprint, get_profile, profile_environment, validate_exclusive_gpu_labels
 from oke_hpc_mgmt.models import DiscoverySnapshot, NodeInfo, RDMA_REQUIRED_TOPOLOGY_LABEL_KEYS
 from oke_hpc_mgmt.selection import select_nodes
 
@@ -141,7 +141,7 @@ def node_target(node: NodeInfo) -> NodeTarget:
     return NodeTarget(
         name=node.k8s_name, uid=node.kubernetes_uid, pool=node.pool_name,
         shape=profile.shape, gpu_count=count, topology=topology(node),
-        instance_id=node.instance_ocid, tolerations=tuple(node.taints),
+        instance_id=node.instance_ocid, tolerations=tuple(node.taints), boot_id=node.boot_id,
     )
 
 
@@ -301,6 +301,7 @@ def plan_healthchecks(snapshot: DiscoverySnapshot, request: HealthcheckRequest) 
                 case_id=f"case-{len(cases) + 1:04d}", check_type=category,
                 nodes=tuple(node_target(node) for node in participants), anchors=anchors,
                 network=network, repetition=repetition,
+                profile_fingerprint=execution_fingerprint(profile.shape, network, request),
             ))
     warnings = list(snapshot.warnings)
     extras = sorted({node.name for case in cases for node in case.nodes} - set(names))

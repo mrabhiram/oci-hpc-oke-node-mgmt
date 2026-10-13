@@ -17,6 +17,7 @@ from oke_hpc_mgmt.benchmarks.records import (
     MAX_SNAPSHOTS, TERMINAL_CASE_STATES, CaseRecord, CaseState, EvidenceSnapshot, RunRecord, SnapshotPhase,
     assert_no_overlap, mark_cancelling, next_cases, timestamp,
 )
+from oke_hpc_mgmt.benchmarks.service_policy import validate_service_case
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,7 @@ class BenchmarkWorkflow:
         assert_no_overlap(plan, self.backend.list_runs(None))
         for case in plan.cases:
             self.backend.runtime_preflight(case)
+        self._service_preflight(plan)
         capability = self.capabilities.check(plan, options)
         run = RunRecord.create("hc-" + secrets.token_hex(10), plan, capability.execution_options)
         return PreparedRun(run, capability)
@@ -98,6 +100,7 @@ class BenchmarkWorkflow:
             for case in run.plan.cases:
                 lease.renew()
                 self.backend.runtime_preflight(case)
+            self._service_preflight(run.plan)
             lease.renew()
             run = self.backend.create_run(run)
         # Checkpoints reserve every planned participant. A failure after this
@@ -115,9 +118,18 @@ class BenchmarkWorkflow:
         if current.execution_options != options:
             raise BenchmarkError("Recorded placement is no longer valid; do not submit an altered benchmark.")
         self.backend.runtime_preflight(case)
+        self._service_preflight(plan, exclude_uid=run.uid)
         lease.renew()
         assert_no_overlap(plan, self.backend.list_runs(None), exclude_uid=run.uid)
         lease.assert_held()
+
+    def _service_preflight(self, plan: HealthcheckPlan, *, exclude_uid: str | None = None) -> None:
+        if plan.service_policy is None:
+            return
+        runs = tuple(run for run in self.backend.list_runs(None) if run.uid != exclude_uid)
+        for case in plan.cases:
+            nodes, pods = self.backend.read_allocation_inventory(tuple(target.name for target in case.nodes))
+            validate_service_case(case, plan.request, plan.service_policy, nodes, pods, runs, self.now())
 
     def _submit_case(self, run: RunRecord, case: BenchmarkCase, lease: SubmissionLease) -> RunRecord:
         saved = _saved(run, case)

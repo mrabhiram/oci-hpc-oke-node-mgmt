@@ -148,11 +148,22 @@ class EvidenceStore:
             if isinstance(exc, BenchmarkError):
                 raise
             raise BenchmarkError("Exported evidence is unavailable or unreadable; retain workload resources.") from exc
-        expected = {"schema_version": SCHEMA_VERSION, "run_id": run.run_id, "run_uid": run.uid,
+        expected: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "run_id": run.run_id, "run_uid": run.uid,
                     "namespace": run.plan.request.namespace, "case_id": case.case_id, "job_uid": saved.job_uid}
         expected.update({"case": json.loads(json.dumps(asdict(case))),
                          "request": json.loads(json.dumps(asdict(run.plan.request))),
                          "options": json.loads(json.dumps(asdict(run.options)))})
+        # Older immutable exports predate optional freshness fields. Only absent
+        # null defaults may be omitted; a recorded identity must still match.
+        if isinstance(payload, dict) and isinstance(payload.get("case"), dict):
+            old_case = payload["case"]
+            if expected["case"]["profile_fingerprint"] is None and "profile_fingerprint" not in old_case:
+                expected["case"].pop("profile_fingerprint")
+            old_nodes = old_case.get("nodes")
+            if isinstance(old_nodes, list) and len(old_nodes) == len(expected["case"]["nodes"]):
+                for old_node, node in zip(old_nodes, expected["case"]["nodes"]):
+                    if isinstance(old_node, dict) and node["boot_id"] is None and "boot_id" not in old_node:
+                        node.pop("boot_id")
         if not isinstance(payload, dict) or any(payload.get(key) != value for key, value in expected.items()):
             raise BenchmarkError("Exported evidence identity does not match this run and case.")
         return payload
